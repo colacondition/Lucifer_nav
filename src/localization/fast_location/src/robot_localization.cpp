@@ -85,6 +85,8 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<std::string>("pc_in_map_frame", "map");
     // 可选：手动指定 PCD 到 map 的平面对齐 [x, y, yaw]。
     this->declare_parameter<std::vector<double>>("pcd_to_map_pose", std::vector<double>{});
+    // Z 轴偏移补偿（仿真环境地面厚度补偿，实车为 0.0）
+    this->declare_parameter<double>("map_z_offset", 0.0);
 
     std::string map_pcd_path = this->get_parameter("map_pcd_path").as_string();
     map_voxel_size_ = this->get_parameter("map_voxel_size").as_double();
@@ -211,6 +213,7 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     map_frame_ = this->get_parameter("map_frame").as_string();
     base_frame_ = this->get_parameter("base_frame").as_string();
     pc_in_map_frame_ = this->get_parameter("pc_in_map_frame").as_string();
+    map_z_offset_ = this->get_parameter("map_z_offset").as_double();
     if (!pc_in_map_frame_.empty() && pc_in_map_frame_ != map_frame_) {
         RCLCPP_WARN(
             this->get_logger(),
@@ -1512,7 +1515,7 @@ void RobotLocalizationNode::publishMapToOdomTf()
     tf_msg.child_frame_id = base_frame_;
     tf_msg.transform.translation.x = trans.x();
     tf_msg.transform.translation.y = trans.y();
-    tf_msg.transform.translation.z = trans.z();
+    tf_msg.transform.translation.z = trans.z() + map_z_offset_;  // 应用 Z 轴偏移补偿
     tf_msg.transform.rotation.x = rot.x();
     tf_msg.transform.rotation.y = rot.y();
     tf_msg.transform.rotation.z = rot.z();

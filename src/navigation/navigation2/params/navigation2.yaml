@@ -70,21 +70,31 @@ rm_global_costmap:
     reuse_previous_grid: true
     previous_obstacle_decay: 12
 
-rm_path_smoother:
+rm_minco_path_smoother:
   ros__parameters:
     use_sim_time: true
     input_path_topic: /plan_raw
     output_path_topic: /plan
-    costmap_topic: /global_costmap/costmap
-    smoothing_iterations: 20
-    data_weight: 0.28
-    smooth_weight: 0.18
-    tolerance: 0.00001
-    use_costmap_constraints: true
-    obstacle_cost_threshold: 45
-    max_cost_increase: 0
-    preserve_turn_angle: 0.25
-    turn_smoothing_scale: 0.25
+
+    # MINCO 优化参数
+    smooth_weight: 0.1        # 平滑项权重（降低以保持原路径形状）
+    obstacle_weight: 10.0     # 障碍物惩罚权重
+    data_weight: 10.0         # 数据项权重（保持接近原路径）
+    robot_radius: 0.25        # 机器人半径（与 global_costmap 保持一致）
+    penalty_mu: 0.4           # Smoothed L1 惩罚函数的 μ 参数
+    enable_optimization: true # 是否启用优化
+
+    # 时间分配参数
+    default_velocity: 1.5     # 默认速度（用于计算段时间）
+    min_segment_time: 0.1     # 最小段时间（秒）
+
+    # RC-ESDF 参数（车体坐标系下的障碍物距离场）
+    esdf_width: 2.0           # ESDF 地图宽度（米）
+    esdf_height: 2.0          # ESDF 地图高度（米）
+    esdf_resolution: 0.05     # ESDF 分辨率（米）
+
+    # 机器人外形（多边形顶点，单位：米）
+    robot_footprint: [-0.3, -0.25, 0.3, -0.25, 0.3, 0.25, -0.3, 0.25]
 
 rm_local_costmap:
   ros__parameters:

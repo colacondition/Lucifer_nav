@@ -80,7 +80,7 @@ def generate_launch_description():
             {'yaml_filename': map_yaml}),
         nav_component('navigation2::RmGlobalCostmap', 'rm_global_costmap', start_global_costmap),
         nav_component('navigation2::RmGlobalPlanner', 'rm_global_planner', start_global_planner),
-        nav_component('navigation2::RmPathSmoother', 'rm_path_smoother', start_path_smoother),
+        nav_component('navigation2::RmMincoPathSmoother', 'rm_minco_path_smoother', start_path_smoother),
         nav_component('navigation2::RmLocalCostmap', 'rm_local_costmap', start_local_costmap),
         nav_component('navigation2::RmMpcController', 'rm_mpc_controller', start_mpc_controller),
         nav_component('navigation2::RmVelocitySmoother', 'rm_velocity_smoother',

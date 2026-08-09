@@ -82,6 +82,7 @@
 
     # ========== 坐标系配置 ==========
     map_frame: "map"             # 地图坐标系（TF父）
-    base_frame: "odom"           # 机器人/雷达坐标系（TF子）
+    base_frame: "odom"           # fast_location发布的TF子frame (map→odom)
     pc_in_map_frame: "map"       # pc_in_map统一发布到map；其他值会回退为map_frame
+    map_z_offset: 0.0            # Z轴偏移补偿（仿真地面厚度，实车为0）
     # pcd_to_map_pose 可由 launch 显式传入 [x, y, yaw]；未传入时使用单位对齐，不读取 map_start_pose

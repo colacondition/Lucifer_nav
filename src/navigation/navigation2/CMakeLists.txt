@@ -50,7 +50,7 @@ rclcpp_components_register_node(${PROJECT_NAME}
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN "navigation2::RmGlobalCostmap"    EXECUTABLE rm_global_costmap_node)
 rclcpp_components_register_node(${PROJECT_NAME}
-  PLUGIN "navigation2::RmPathSmoother"     EXECUTABLE rm_path_smoother_node)
+  PLUGIN "navigation2::RmMincoPathSmoother" EXECUTABLE rm_minco_path_smoother_node)
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN "navigation2::RmLocalCostmap"     EXECUTABLE rm_local_costmap_node)
 rclcpp_components_register_node(${PROJECT_NAME}

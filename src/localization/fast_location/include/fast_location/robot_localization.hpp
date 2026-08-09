@@ -172,6 +172,7 @@ private:
     std::string map_frame_;     // 地图坐标系
     std::string base_frame_;    // 机器人/雷达坐标系
     std::string pc_in_map_frame_;  // pc_in_map 对外统一使用 map_frame
+    double map_z_offset_{0.0};  // Z 轴偏移补偿（仿真地面厚度，实车为 0）
     Eigen::Matrix4f map_from_pcd_{Eigen::Matrix4f::Identity()};
     bool first_localization_ = true;  // 是否为首次定位（首次用多尺度）
     bool tf_ready_ = false;
