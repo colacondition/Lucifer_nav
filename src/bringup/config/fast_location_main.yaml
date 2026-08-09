@@ -1,0 +1,87 @@
+/**:
+  ros__parameters:
+    # ========== 地图与定位参数 ==========
+    map_pcd_path: "package://bringup/PCD/RMUL.pcd"
+    map_voxel_size: 0.1          # 地图体素滤波尺寸（米）
+    scan_voxel_size: 0.05        # 扫描体素滤波尺寸（米）- 降低以保留更多点
+    scan_input_frame_mode: "odom" # 源点云坐标系: odom/base
+    scan_accumulate_frames: 5     # 源点云坐标系下堆积帧数
+    scan_min_range: 0.0           # 源点云最小距离过滤（米）
+    scan_max_range: 0.0           # 源点云最大距离过滤（米，<=0关闭）
+    submap_voxel_size_first: 0.1 # 首次定位子图体素尺寸（米，建议=map_voxel_size）
+    submap_voxel_size_track: 0.15 # 跟踪子图体素尺寸（米，建议>map_voxel_size）
+    fov_far: 20.0                # 视场内最远距离（米）
+    localization_th: 0.90        # 定位匹配阈值（内点比例）
+    first_localization_th: 0.95  # 首次匹配阈值（内点比例）
+    # 可观测性阈值：GICP 平移信息矩阵 XY 子块的 λ_max/λ_min 超过此值时，判定
+    # 存在方向退化（典型是长走廊：沿走廊方向没有匹配约束）。
+    #
+    # 命中后**不丢弃整拍结果**，而是把修正投影到可观测方向：垂直走廊的那一维
+    # 照常修正，沿走廊方向交回 LIO 推算。fast_location 是本工作空间唯一的
+    # map→odom 来源，整拍拒绝会让 TF 冻结，精度完全交给 LIO 开环漂移。
+    #
+    # 开阔区域条件数约 1~5，走廊可达数百。80 是留了余量的保守取值。
+    degenerate_condition_threshold: 80.0
+    # 硬拒绝阈值：条件数超过此值说明连 yaw 都不可信（近乎完全无约束），
+    # 此时才整拍放弃、沿用上一次的 map→odom。必须 >= 上面的软阈值。
+    degenerate_hard_reject_condition: 5000.0
+    # EMA 平滑系数 α：每次接受新结果时 T_smooth = α*T_new + (1-α)*T_prev。
+    # 0.7 = 每拍吸收 70% 新结果，5Hz 下约 3 拍（0.6s）基本收敛。
+    # 值为 1.0 则直接接受，不做平滑。
+    ema_alpha: 0.7
+
+    # ========== 话题配置 ==========
+    sub_scan_topic: "/lio/cloud_world"          # 订阅点云话题
+    sub_odom_topic: "/lio/robo/odom"            # 订阅里程计话题
+    sub_init_pose_topic: "initialpose_3d"      # PoseStamped初始位姿话题
+    sub_init_pose_covariance_topic: "/initialpose"  # RViz 2D Pose Estimate 初始位姿
+
+    pub_pc_in_map_topic: "pc_in_map"           # 发布：匹配后的点云
+    pub_global_map_topic: "global_map"         # 发布：全局地图
+    pub_submap_topic: "submap"                 # 发布：局部子图
+    pub_map_to_odometry_topic: "map_to_odometry"  # 发布：map->odom变换
+    pub_scan_downsampled_topic: "scan_downsampled"  # 发布：下采样扫描
+    pub_map_downsampled_topic: "map_downsampled"    # 发布：下采样地图
+
+    # ========== 频率与队列 ==========
+    io_queue_size: 10            # 发布/订阅队列长度
+    map_publish_rate_hz: 5.0     # 全局地图发布频率（Hz）
+    localization_rate_hz: 5.0   # 定位更新频率（Hz）
+    tf_publish_rate_hz: 200.0    # map->odom TF 发布频率（Hz）
+    publish_tf: true             # 主定位模式：发布 map->odom TF
+    publish_map_to_odometry: false  # 是否发布 map_to_odometry 里程计话题
+
+    # ========== ICP 参数 ==========
+    use_fast_gicp: true              # 启用 fast_gicp（性能提升10-100倍）
+    use_cuda: false                  # 启用 GPU 加速（需要NVIDIA驱动正常，修复后改为true）
+    gicp_num_threads: 4              # CPU模式线程数（0=自动，建议4-8）
+    gicp_max_iterations_first: 100   # 首次定位 GICP 最大迭代次数
+    gicp_max_iterations_track: 70   # 跟踪阶段 GICP 最大迭代次数
+
+    # ========== 全局重定位参数 ==========
+    enable_global_search: true
+    global_search_xy_step: 2.0
+    global_search_yaw_step_deg: 30.0
+    global_search_score_distance: 0.45
+    global_search_score_stride: 4
+    global_search_top_k: 6
+    global_search_min_score: 0.20
+    global_search_min_score_margin: 0.03
+    global_search_candidate_separation: 1.0
+    global_search_candidate_yaw_separation_deg: 20.0
+    global_search_refine_radius: 12.0
+    # top-k 精细打分:只作用在入选候选(~6个)上,stride=1、距离更严。
+    global_search_refine_score_distance: 0.20
+    global_search_refine_score_stride: 1
+    # 精化 ICP 阶段用最近 N 帧堆积起来,提高稳定性;粗搜仍用主 scan。
+    global_search_refine_accumulate_frames: 3
+    # 全局搜索通过后,再用下一帧扫描做一致性校验才真正接受。对称场地建议打开。
+    global_search_enable_temporal_verification: false
+    global_search_temporal_min_score: 0.30
+    tracking_failures_before_global_search: 5
+
+    # ========== 坐标系配置 ==========
+    map_frame: "map"             # 地图坐标系（TF父）
+    base_frame: "odom"           # 机器人/雷达坐标系（TF子）
+    pc_in_map_frame: "map"       # pc_in_map统一发布到map；其他值会回退为map_frame
+    # pcd_to_map_pose 可由 launch 显式传入 [x, y, yaw]；未传入时使用单位对齐，不读取 map_start_pose

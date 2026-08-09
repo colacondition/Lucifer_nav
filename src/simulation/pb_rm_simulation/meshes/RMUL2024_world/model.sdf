@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<sdf version="1.7">
+  <model name="RMUL2024_world">
+    <static>true</static>
+    <link name="link">
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <uri>model://RMUL2024_world/meshes/RMUL_2024.stl</uri>
+            <scale>0.001 0.001 0.001</scale>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <mesh>
+            <uri>model://RMUL2024_world/meshes/RMUL_2024.stl</uri>
+            <scale>0.001 0.001 0.001</scale>
+          </mesh>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>

@@ -1,0 +1,312 @@
+rm_map_server:
+  ros__parameters:
+    use_sim_time: true
+    yaml_filename: ""
+    frame_id: map
+    map_topic: /map
+    publish_frequency: 1.0
+
+rm_global_planner:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    map_topic: /global_costmap/costmap
+    goal_topic: /goal_pose
+    path_topic: /plan_raw
+    planning_frequency: 5.0
+    allow_unknown: true
+    unknown_cost: 1.4
+    obstacle_threshold: 100
+    apply_internal_inflation: false
+    map_cost_weight: 20.0
+    map_cost_exponent: 2.0
+    planner_tolerance: 0.5
+    use_clearance_cost: true
+    clearance_desired_distance: 0.4
+    clearance_cost_weight: 3.0
+    replan_on_timer: true
+    replan_on_source_update: false
+    min_replan_distance: 0.20
+    replan_request_topic: /navigation2/replan_request
+    turn_penalty: 0.12
+    local_stitch_enabled: true
+    stitch_min_lookahead_distance: 0.8
+    stitch_max_distance: 3.0
+    path_prune_enabled: false
+    prune_segment_max_cost: 55
+    path_resample_distance: 0.18
+    # 规划失败冷却：规划失败后等待此时长再重试（s）。
+    # 防止对不可达目标以 planning_frequency 空转刷日志。
+    # 目标明显移动（> planner_tolerance）或收到明确重规划请求时忽略冷却。
+    plan_failure_cooldown: 2.0
+    # 路径发布前验收：拒绝穿越代价 >= 此阈值格子的路径。
+    path_acceptance_enabled: true
+    path_acceptance_max_cost: 85
+
+rm_global_costmap:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    map_topic: /map
+    scan_topic: /scan
+    subscribe_scan: false
+    pointcloud_topic: /segmentation/obstacle
+    subscribe_pointcloud: true
+    costmap_topic: /global_costmap/costmap
+    raw_costmap_topic: /global_costmap/costmap_raw
+    footprint_topic: /global_costmap/published_footprint
+    marked_cloud_topic: /global_costmap/voxel_marked_cloud
+    voxel_grid_topic: /global_costmap/voxel_grid
+    publish_frequency: 8.0
+    robot_radius: 0.25
+    inflation_radius: 0.65
+    inflation_cost_scaling_factor: 3.0
+    occupied_threshold: 50
+    obstacle_min_range: 0.1
+    obstacle_max_range: 3.0
+    # 障碍高度带，单位 m，相对机器人底盘（base_link）而不是 map 的 z=0 平面。
+    # 为什么不能拿绝对 z 比常数：Super-LIO 的 odom 原点锚在开机瞬间的雷达位姿上
+    # （tf_pose_utils.hpp: lidar_odom_to_base = lidar_odom_to_livox * livox_to_base），
+    # 所以 map 系的 z=0 是雷达平面，地面在 -(雷达安装高度) 处。实测 RMUL.pcd：
+    # 地面主峰在 -0.17（37287 点里 14558 个），正好是 -0.175 的安装高度；
+    # 20cm 高台的台面绝对 z 只有 +0.025，被任何 >0.025 的绝对阈值静默滤掉，而
+    # 1m 的墙在 +0.825 照常可见 —— 这就是「左边高台看不见、右边墙全看得见」。
+    # 做差之后雷达平面偏移和定位 z 漂移都被抵消。参考 rose_navigation 的
+    # bottom_z_to_robo_z / top_z_to_robo_z。
+    # 取值：底盘≈地面，所以地面≈0.0、台面≈+0.20。0.1 两头各留 0.1 m 余量，
+    # 既滤掉地面分割残留（负值会把残留变成虚假障碍把车围死），又保住 20cm 台阶。
+    obstacle_z_min_to_robo: 0.1
+    obstacle_z_max_to_robo: 2.0
+    transform_tolerance: 0.2
+    observation_timeout: 1.0
+    reuse_previous_grid: true
+    previous_obstacle_decay: 12
+
+rm_path_smoother:
+  ros__parameters:
+    use_sim_time: true
+    input_path_topic: /plan_raw
+    output_path_topic: /plan
+    costmap_topic: /global_costmap/costmap
+    smoothing_iterations: 20
+    data_weight: 0.28
+    smooth_weight: 0.18
+    tolerance: 0.00001
+    use_costmap_constraints: true
+    obstacle_cost_threshold: 45
+    max_cost_increase: 0
+    preserve_turn_angle: 0.25
+    turn_smoothing_scale: 0.25
+
+rm_local_costmap:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    scan_topic: /scan
+    pointcloud_topic: /segmentation/obstacle
+    costmap_topic: /local_costmap/costmap
+    raw_costmap_topic: /local_costmap/costmap_raw
+    footprint_topic: /local_costmap/published_footprint
+    marked_cloud_topic: /local_costmap/voxel_marked_cloud
+    subscribe_scan: false
+    subscribe_pointcloud: true
+    update_frequency: 10.0
+    publish_frequency: 10.0
+    width: 5.0
+    height: 5.0
+    resolution: 0.05
+    robot_radius: 0.25
+    inflation_radius: 0.35
+    inflation_cost_scaling_factor: 15.0
+    raytrace_max_range: 6.0
+    obstacle_min_range: 0.1
+    obstacle_max_range: 6.0
+    # map 系下判定（local_costmap_node.cpp:664，在 transformPoint 之后）。
+    # 局部图管避障，取比全局图更小的 0.05 少漏矮障碍。必须为正：负值会把地面
+    # 同 rm_global_costmap：相对底盘的高度带，语义见上面那段。局部图管避障，
+    # 下界取更小的 0.05 以少漏矮障碍，但必须为正 —— 负值会把地面分割的残留点
+    # 变成虚假障碍把车围死。
+    # 20cm 高台看不见还有第二个必要条件：segmentation 的 max_start_height 必须
+    # 小于最矮台阶高度，见 config/{simulation,reality}/segmentation_*.yaml。
+    obstacle_z_min_to_robo: 0.05
+    obstacle_z_max_to_robo: 2.0
+    transform_tolerance: 0.2
+    observation_timeout: 2.0
+    snap_origin_to_grid: true
+    use_observation_stamp_for_origin: true
+    publish_on_observation_update: false
+    use_latest_sensor_transform: false
+    fallback_to_latest_sensor_transform: false
+    update_on_new_observation_only: true
+    reuse_previous_grid: true
+    previous_obstacle_decay: 8
+
+goal_approach_controller:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    input_cmd_vel_topic: /cmd_vel_nav_raw
+    output_cmd_vel_topic: /cmd_vel_nav
+    path_topic: /plan
+    approach_enabled_topic: /goal_approach_controller/enabled
+    approach_distance: 1.5
+    approach_velocity: 0.5
+    direct_approach_distance: 0.5
+    direct_approach_kp: 1.0
+    goal_tolerance: 0.25
+
+rm_velocity_smoother:
+  ros__parameters:
+    use_sim_time: true
+    input_cmd_vel_topic: /cmd_vel_nav
+    output_cmd_vel_topic: /cmd_vel
+    smoothing_frequency: 20.0
+    velocity_timeout: 0.5
+    max_velocity: [2.0, 2.0, 3.0]
+    min_velocity: [-2.0, -2.0, -3.0]
+    max_accel: [4.0, 4.0, 6.0]
+    max_decel: [-4.0, -4.0, -6.0]
+    deadband_velocity: [0.0, 0.0, 0.0]
+
+rm_nav2_compat:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    action_name: /navigate_to_pose
+    goal_topic: /goal_pose
+    status_topic: /navigation2/status
+    feedback_frequency: 10.0
+    action_timeout: 0.0
+
+rm_mpc_controller:
+  ros__parameters:
+    use_sim_time: true
+    target_frame: map
+    path_topic: /plan
+    odom_topic: /Odometry
+    cmd_vel_topic: /cmd_vel_nav_raw
+    control_fps: 30.0
+    expected_speed: 1.5
+    # 必须 >= 下游 goal_approach_controller 的 goal_tolerance(0.25)，否则两者
+    # 之间形成死区：本节点还认为「没到」继续求解发速度，下游已无条件发零
+    # Twist 把车按住，白算一场。两者一致时死区消失。
+    goal_tolerance: 0.25
+    max_track_error: 0.5
+    blind_radius: 0.1
+    delay_time: 0.0
+    default_wz: 0.0
+    # Prediction horizon (MPC): steps * predict_dt seconds ahead.
+    predict_steps: 30
+    predict_dt: 0.1
+    max_speed: 2.0
+    max_accel: 4.0
+    turtle_max_speed: 1.0
+    # QP weights: Q=position tracking, R=control magnitude, Rd=control smoothness.
+    Q: [15.0, 15.0]
+    R: [0.1, 0.1]
+    Rd: [1.0, 0.05]
+    # Odometry delay compensation (off by default; extrapolates pose over odom->now latency).
+    delay_compensation.enable: false
+    delay_compensation.max_dt: 0.5
+    local_safety.costmap_topic: /local_costmap/costmap
+    local_safety.obstacle_threshold: 90
+    local_safety.unknown_is_obstacle: true
+    local_safety.costmap_timeout: 0.5
+    # Check 1.0 s ahead; the 5 m rolling map cannot contain the full 3.0 s horizon at max speed.
+    local_safety.check_steps: 10
+    local_safety.replan_topic: /navigation2/replan_request
+    local_safety.replan_cooldown: 0.5
+    # 弧长域速度剖面。替代全程恒定的 expected_speed，在弯道自动减速，
+    # 避免 MPC 参考轨迹本身就不可跟踪（过弯不减速 → 参考跑到弯道外 → 切角）。
+    # 关掉 speed_profile.enable 可退回原先的常数速度行为。
+    speed_profile.enable: true
+    speed_profile.max_lateral_accel: 2.0    # 侧向加速度上限（m/s²），主要调参项
+    speed_profile.max_tangential_accel: 1.5 # 切向加速度上限（m/s²）
+    speed_profile.max_tangential_decel: 2.5 # 切向减速度上限（m/s²）
+    speed_profile.min_speed: 0.3            # 速度下限（m/s），防止极小圆弧处停车
+    speed_profile.sample_spacing: 0.10      # 剖面采样间距（m）
+    speed_profile.curvature_window: 3       # 曲率平滑窗（样本数，双侧）
+    speed_profile.stop_at_goal: true        # 终点是否减速至零
+    # 指令链路反馈。本节点发布的指令会被下游改写：goal_approach_controller 会
+    # 覆写或置零，rm_velocity_smoother 会限幅、并在输入超时后归零。所以「是否
+    # 真的有指令」必须以链路末端的实测值为准，不能用自己发布的值 —— 否则 stuck
+    # 判据会被喂假数据（这正是到点反复蠕动那个 bug 的成因）。
+    # rm_velocity_smoother 以 smoothing_frequency(20 Hz) 无条件定频发布，所以
+    # 此话题静默代表它已经死了，而不是「本来就没有指令」，会单独报警。
+    feedback.executed_cmd_topic: /cmd_vel
+    feedback.executed_cmd_timeout: 0.3   # 超过此时长未收到即视为链路断开（s）
+    feedback.override_detect_time: 1.0   # 本节点发速度但末端恒为零持续多久报警（s）
+    # RC-ESDF whole-body collision check (uses robot's true rectangular footprint).
+    # Obstacle in body frame is queried; unsafe if dist-to-boundary < safety_margin.
+    esdf.enable: true
+    esdf.robot_length: 0.60   # meters, total robot length along x (code halves it internally)
+    esdf.robot_width: 0.45    # meters, total robot width along y (code halves it internally)
+    esdf.safety_margin: 0.04  # meters, flag collision when obstacle < this from boundary
+    esdf.check_steps: 5       # number of predicted horizon steps to check
+    esdf.obstacle_topic: /segmentation/obstacle
+    # 多假设弧长进度跟踪。替代原来的全路径最近点扫描：回绕路径上最近点会在
+    # 两个弧长相差很远、空间距离接近的位置间跳变，且进度可回退。
+    # 跟踪丢失沿用上面的 max_track_error，只是改为需要持续超限 lost_grace_time。
+    tracker.hypothesis_spacing: 1.0      # 初始假设沿路径的播撒间距（m）
+    tracker.search_window: 1.5           # 每帧在预测弧长附近的精修半径（m）
+    tracker.refine_step: 0.05            # 精修时的粗扫步长（m）
+    tracker.max_hypotheses: 5            # 保留的假设上限
+    tracker.position_sigma: 0.35         # 位置残差的似然尺度（m），实车主要调这个
+    tracker.direction_weight: 1.5        # 方向一致性权重，0 表示完全不看方向
+    tracker.min_speed_for_direction: 0.15  # 低于此速率时方向项取中性（m/s）
+    tracker.weight_floor: 0.02           # 归一化权重低于此值的假设被淘汰
+    tracker.merge_distance: 0.25         # 弧长相距小于此值的假设合并（m）
+    tracker.seed_prior_length: 3.0       # 播撒时偏向小弧长的先验尺度（m）
+    tracker.arc_rate_alpha: 0.3          # s_dot 的 EMA 系数
+    tracker.velocity_alpha: 0.4          # 内部速度估计的 EMA 系数
+    tracker.lost_grace_time: 0.5         # 残差持续超限多久才判丢失（s）
+    # 失效检测。判据基于世界系位移而非弧长里程碑：全局规划器每移动
+    # min_replan_distance(0.2 m) 就重规划一次、弧长原点随之重置，基于弧长的
+    # 计时器永远累计不到超时阈值。
+    # noProgress 不看指令（捕捉「MPC 一直在自己停车」的循环）；
+    # stuck 要求正在下发指令（捕捉「发着速度车没动」——顶障碍、打滑）。
+    progress.min_displacement: 0.15      # 认为「确实动了」所需的最小位移（m）
+    progress.no_progress_timeout: 2.0    # 位移不增长多久算无进展（s）
+    progress.stuck_timeout: 1.5          # 有指令但位移不增长多久算卡住（s）
+    progress.cmd_epsilon: 0.05           # 速率超过此值才算「正在下发指令」（m/s）
+    # 恢复链。车贴到障碍上后规划器的起点检查过不了，直接重规划几乎必然失败，
+    # 会陷入「停车 -> 请求重规划 -> 起点不可行 -> 继续停车」死循环。
+    # 因此先物理脱困（倒退，或采样安全点驶入）再强制重规划。
+    # 关掉 recovery.enable 即退回原行为，失效检测的日志仍保留。
+    recovery.enable: true
+    recovery.reverse_speed: 0.3          # STUCK_REVERSE 的倒退速度（m/s）
+    recovery.reverse_distance: 0.4       # 倒退距离（m）
+    recovery.max_speed: 0.4              # 驶向安全点的限速（m/s）
+    recovery.kp: 1.0                     # 驶向安全点的 P 增益
+    recovery.reach_tolerance: 0.12       # 到达安全点的判定半径（m）
+    recovery.dwell_time: 0.4             # 到点后需持续非危险多久才退出（s）
+    recovery.max_duration: 10.0          # 单次恢复的时长上限（s），超时进 FAILED
+    recovery.max_attempts: 3             # 恢复尝试次数上限，用尽进 FAILED
+    recovery.goal_change_threshold: 0.3  # 路径终点移动超过此值算新目标，清 FAILED（m）
+    # 三条「本拍无法正常跟踪」的路径（跟踪丢失 / QP 求解失败 / 预测轨迹被安全
+    # 检查否决）连续持续超过此时长，就从「停车+重规划」升级为物理脱困。单帧的
+    # 坏代价图或偶发 QP 抖动应由重规划解决，不该惊动恢复链，所以这里留 1.5 s。
+    recovery.veto_recovery_time: 1.5
+    # 距目标小于此值时关闭失效检测。必须 >= 下游 goal_approach_controller 的
+    # goal_tolerance(0.25)，否则会在两个容差之间形成死区：本节点还认为「没到」
+    # 而继续发速度，下游已经按住车不动，stuck 误触发导致到点后反复前后蠕动。
+    recovery.suppress_near_goal: 0.35
+    # 恢复期必须临时关掉 goal_approach_controller：它在距目标 goal_tolerance
+    # (0.25 m) 内无条件发零 Twist、direct_approach_distance(0.5 m) 内覆写
+    # linear.x/y，会把倒车指令吃掉。
+    recovery.approach_enabled_topic: /goal_approach_controller/enabled
+    # 危险判据与恢复期通行判据。通行只看 lethal 是必要的放宽：车已经在膨胀圈
+    # 里，用 local_safety.obstacle_threshold(50) 检查会让所有方向立即被否，
+    # 恢复永远无法启动。障碍格写 100、膨胀值严格低于 100，故 99 可区分两者。
+    recovery.hazard_cost: 80             # 当前格代价达到此值即判为危险
+    recovery.lethal_cost: 99             # 达到此值算致命障碍
+    recovery.unknown_is_hazard: true     # 未知格（-1）是否算危险
+    recovery.out_of_map_is_hazard: true  # 地图外是否算危险
+    recovery.ring_radii: [0.3, 0.6, 0.9, 1.2]  # 安全点同心环采样半径（m）
+    recovery.samples_per_ring: 12        # 每环的角度采样数
+    recovery.distance_penalty: 20.0      # 距离惩罚，同等安全时优先更近的点

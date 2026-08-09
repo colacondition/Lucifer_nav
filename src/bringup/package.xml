@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypes="xsd"?>
+<package format="3">
+  <name>bringup</name>
+  <version>1.0.0</version>
+  <description>Lucifer Navigation Bringup</description>
+  <maintainer email="lucifer@example.com">Lucifer Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>super_lio</exec_depend>
+  <exec_depend>fast_location</exec_depend>
+  <exec_depend>cpp_lidar_filter</exec_depend>
+  <exec_depend>linefit_ground_segmentation_ros</exec_depend>
+  <exec_depend>navigation2</exec_depend>
+  <exec_depend>goal_approach_controller</exec_depend>
+  <exec_depend>fake_vel_transform</exec_depend>
+  <exec_depend>waypoint_editor</exec_depend>
+  <exec_depend>serial_driver</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>pb_rm_simulation</exec_depend>
+  <exec_depend>ros2_livox_simulation</exec_depend>
+
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-numpy</test_depend>
+
+  <!-- 故意不声明 decision：decision 已经 exec_depend 了 bringup（它的路点 CSV
+       存在 bringup/config/waypoints 下），反向再声明会形成 colcon 无法拓扑排序
+       的环。real.launch.py 用 FindPackageShare 延迟解析 decision 的路径，
+       并由 use_decision 开关控制，未装 decision 时不会影响导航链启动。 -->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

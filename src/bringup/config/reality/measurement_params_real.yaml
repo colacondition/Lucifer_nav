@@ -1,0 +1,19 @@
+# 实车 URDF 外参：base_link -> livox_frame。
+#
+# 这里的 z 是**整个仓库里雷达离地高度的唯一来源**：
+#   - real.launch.py:44 把 xyz/rpy 传给 sentry_robot_real.xacro，生成静态 TF；
+#   - 代价地图的高度带是相对 base_link 的差值（obstacle_z_*_to_robo），
+#     所以它自动跟着这个外参走；
+#   - 地面分割的 sensor_height 由节点从这条 TF 查出来（sensor_height_frame:
+#     base_link），不再在 segmentation_real.yaml 里手填。
+# 改雷达安装位置只改这一行。
+#
+# 改动记录：原来 z 填 0.0（雷达和底盘重合），而 segmentation_real.yaml 写
+# sensor_height: 0.59、xacro 的 default 写 0.49，三个数互相矛盾。z=0.0 会让
+# 相对底盘的高度带退化成「相对雷达」，地面掉到 -0.49，0.05 的下界会把地面到雷达
+# 之间的所有障碍全滤掉。现按 xacro 原有 default 取 0.49。
+# 注意 x/y 保持原值 0.0 0.0：xacro 的 default 是 "0.0 0.045 0.49"，那个 y=0.045
+# 的偏置没人确认过，不跟着改。上车前用卷尺量一次 x/y/z 三个都填准。
+base_link2livox_frame:
+  xyz: "\"0.0 0.0 0.49\""
+  rpy: "\"0.7854 0.0 0.0\""

@@ -1,0 +1,52 @@
+bt_action_replacement:
+  ros__parameters:
+    loop_hz: 30.0
+    retry_interval_sec: 0.2
+    goal_frame_id: map
+
+    topics:
+      robot_status: robot_status
+      game_status: game_status
+      goal: /goal_pose
+      decision_state: /decision/state
+
+    waypoint_executor:
+      saved_waypoint_file_topic: /waypoint_editor/saved_waypoint_file
+      executor_waypoints_topic: /waypoint_editor/executor_waypoints
+      follow_status_topic: /waypoint_editor/follow_status
+      through_status_topic: /waypoint_editor/through_status
+      follow_service: start_waypoint_following
+      through_service: start_waypoint_through
+      start_delay_sec: 0.0
+
+    game:
+      progress: 4
+      lower_remain_time: 0
+      higher_remain_time: 300
+
+    hp_recovery:
+      low_threshold: 120
+      high_threshold: 400
+
+    targets:
+      enable_patrol: true
+      waypoint_map_name: ""
+      waypoint_search_root: ""
+      patrol_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/patrol.csv"
+      center_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/center.csv"
+      wait_center_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/wait_center.csv"
+      home_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/home.csv"
+      wait_home_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/wait_home.csv"
+      wait_hp_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/wait_hp.csv"
+      patrol_interval_sec: 10.0
+
+    waypoint:
+      switch_distance: 0.6
+      final_goal_tolerance: 0.35
+
+    maintain_goal:
+      enable: true
+      robot_base_frame: base_link_fake
+      xy_tolerance: 0.35
+      drift_hold_sec: 0.8
+      target_change_hold_sec: 0.0

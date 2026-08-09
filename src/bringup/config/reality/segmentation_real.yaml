@@ -1,0 +1,44 @@
+ground_segmentation:
+  ros__parameters:
+    n_threads: 4                # number of threads to use.
+
+    r_min: 0.2                  # minimum point distance.
+    r_max: 10.0                 # maximum navigation point distance.
+    # 实测 80~300 对高台识别无影响，保持 120。见 segmentation_sim.yaml。
+    n_bins: 120                 # number of radial bins.
+    n_segments: 360             # number of radial segments.
+
+    # 最终二分判据(ground_segmentation.cc:178)。高台识别不靠它，见下面
+    # max_start_height 的说明；实车地面更粗糙，这里不要收紧。
+    max_dist_to_line: 0.1       # maximum vertical distance of point to line to be considered ground.
+
+    # 雷达离地高度。节点会用 sensor_height_frame -> 点云 frame 的 TF 查出真值把
+    # 它覆盖掉（TF 里就是 URDF 外参，见 config/reality/measurement_params_real.yaml），
+    # 所以这里填的只是 TF 查不到时的兜底值，跟外参保持一致即可。
+    # 以前这个值要跟外参手工同步，实车就同步失败了：外参 z 是 0.0、这里写 0.59、
+    # xacro 的 default 又是 0.49。现在唯一来源是外参那一行。
+    sensor_height: 0.49         # fallback only, resolved from TF at runtime.
+    sensor_height_frame: "base_link"   # 查 sensor_height 的参考系。空 = 关闭，用上面的值。
+    base_to_ground_z: 0.0       # base_link 原点离地高度，底盘几何；0 = 原点贴地。
+    min_slope: -0.4             # minimum slope of a ground line.
+    max_slope: 0.4              # maximum slope of a ground line.
+    max_fit_error: 0.05         # maximum error of a point during line fit.
+    long_threshold: 1.0         # distance between points after which they are considered far from each other.
+    max_long_height: 0.1        # maximum height change to previous point in long line.
+    # 台阶/高台能不能看见就卡在这一个值上，机理与离线验证数据见
+    # segmentation_sim.yaml 的注释。语义 = 「能识别的最小台阶高度」：
+    # 0.5 时 20cm 台面被当成新地面线的起点、整片高台判成地面；0.1 时台面上
+    # 拟合不出线，落进 obstacle。合成场景下 0/5%/10%/15% 坡度均无虚警。
+    # 实车若出现地面被误标成障碍，往上放到 0.15，但必须小于要识别的最矮
+    # 台阶高度(0.2)；0.15 时 10cm 台阶就识别不到了。
+    max_start_height: 0.1       # maximum difference to estimated ground height to start a new line.
+    line_search_angle: 0.8      # how far to search in angular direction to find a line [rad].
+
+    gravity_aligned_frame: "base_link"   # Frame which has its z axis aligned with gravity. (Sensor frame if empty.)
+
+    latch: false                # latch output topics or not
+    visualize: false            # visualize segmentation result - USE ONLY FOR DEBUGGING
+
+    input_topic: "/livox/lidar_filtered/pointcloud"
+    obstacle_output_topic: "segmentation/obstacle"
+    ground_output_topic: "segmentation/ground"

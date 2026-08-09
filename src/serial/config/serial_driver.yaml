@@ -1,0 +1,7 @@
+/serial_driver_node:
+  ros__parameters:
+    device_name: /dev/ttyACM0
+    baud_rate: 115200
+    flow_control: false
+    parity: none    
+    stop_bits: "1"

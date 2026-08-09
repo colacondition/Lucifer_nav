@@ -1,0 +1,200 @@
+rm_map_server:
+  ros__parameters:
+    use_sim_time: true
+    yaml_filename: ""
+    frame_id: map
+    map_topic: /map
+    publish_frequency: 1.0
+
+rm_global_planner:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    map_topic: /global_costmap/costmap
+    goal_topic: /goal_pose
+    path_topic: /plan_raw
+    planning_frequency: 5.0
+    allow_unknown: true
+    unknown_cost: 1.4
+    obstacle_threshold: 100
+    inflation_radius: 0.9
+    inflation_cost_scaling_factor: 3.0
+    apply_internal_inflation: false
+    map_cost_weight: 20.0
+    map_cost_exponent: 2.0
+    planner_tolerance: 0.5
+    use_clearance_cost: true
+    clearance_desired_distance: 0.6
+    clearance_cost_weight: 3.0
+    replan_on_timer: true
+    replan_on_source_update: false
+    min_replan_distance: 0.20
+    replan_request_topic: /navigation2/replan_request
+    turn_penalty: 0.12
+    local_stitch_enabled: true
+    stitch_min_lookahead_distance: 0.8
+    stitch_max_distance: 3.0
+    path_prune_enabled: false
+    prune_segment_max_cost: 55
+    path_resample_distance: 0.18
+
+rm_global_costmap:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    map_topic: /map
+    pointcloud_topic: /segmentation/obstacle
+    costmap_topic: /global_costmap/costmap
+    raw_costmap_topic: /global_costmap/costmap_raw
+    footprint_topic: /global_costmap/published_footprint
+    marked_cloud_topic: /global_costmap/voxel_marked_cloud
+    voxel_grid_topic: /global_costmap/voxel_grid
+    subscribe_pointcloud: true
+    publish_frequency: 8.0
+    robot_radius: 0.25
+    inflation_radius: 0.5
+    inflation_cost_scaling_factor: 3.0
+    occupied_threshold: 60
+    obstacle_min_range: 0.1
+    obstacle_max_range: 3.0
+    # 障碍高度带，相对机器人底盘（base_link）而不是 map 的 z=0 平面：map 的 z=0
+    # 是雷达平面（Super-LIO 的 odom 锚在开机雷达位姿），地面在 -(安装高度) 处，
+    # 拿绝对 z 比常数会让 20cm 高台静默消失。语义和取值理由见
+    # bringup/config/navigation2.yaml，两份配置必须保持一致。
+    obstacle_z_min_to_robo: 0.1
+    obstacle_z_max_to_robo: 2.0
+    transform_tolerance: 0.2
+    observation_timeout: 1.0
+    reuse_previous_grid: true
+    previous_obstacle_decay: 12
+
+rm_path_smoother:
+  ros__parameters:
+    use_sim_time: true
+    input_path_topic: /plan_raw
+    output_path_topic: /plan
+    costmap_topic: /global_costmap/costmap
+    smoothing_iterations: 20
+    data_weight: 0.28
+    smooth_weight: 0.18
+    tolerance: 0.00001
+    use_costmap_constraints: true
+    obstacle_cost_threshold: 45
+    max_cost_increase: 0
+    preserve_turn_angle: 0.25
+    turn_smoothing_scale: 0.25
+
+rm_local_costmap:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    scan_topic: /scan
+    pointcloud_topic: /segmentation/obstacle
+    costmap_topic: /local_costmap/costmap
+    raw_costmap_topic: /local_costmap/costmap_raw
+    footprint_topic: /local_costmap/published_footprint
+    marked_cloud_topic: /local_costmap/voxel_marked_cloud
+    subscribe_scan: true
+    subscribe_pointcloud: false
+    update_frequency: 10.0
+    publish_frequency: 10.0
+    width: 5.0
+    height: 5.0
+    resolution: 0.05
+    robot_radius: 0.25
+    inflation_radius: 0.35
+    inflation_cost_scaling_factor: 15.0
+    raytrace_max_range: 6.0
+    obstacle_min_range: 0.1
+    obstacle_max_range: 6.0
+    # 同上。局部图管避障，下界取更小的 0.05 以少漏矮障碍，但仍为正值。
+    obstacle_z_min_to_robo: 0.05
+    obstacle_z_max_to_robo: 2.0
+    transform_tolerance: 0.2
+    observation_timeout: 2.0
+    snap_origin_to_grid: true
+    use_observation_stamp_for_origin: true
+    publish_on_observation_update: false
+    use_latest_sensor_transform: false
+    fallback_to_latest_sensor_transform: false
+    update_on_new_observation_only: true
+    reuse_previous_grid: true
+    previous_obstacle_decay: 8
+
+goal_approach_controller:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    input_cmd_vel_topic: /cmd_vel_nav_raw
+    output_cmd_vel_topic: /cmd_vel_nav
+    path_topic: /plan
+    approach_enabled_topic: /goal_approach_controller/enabled
+    approach_distance: 1.5
+    approach_velocity: 0.5
+    direct_approach_distance: 0.5
+    direct_approach_kp: 1.0
+    goal_tolerance: 0.25
+
+rm_velocity_smoother:
+  ros__parameters:
+    use_sim_time: true
+    input_cmd_vel_topic: /cmd_vel_nav
+    output_cmd_vel_topic: /cmd_vel
+    smoothing_frequency: 20.0
+    velocity_timeout: 0.5
+    max_velocity: [2.0, 2.0, 3.0]
+    min_velocity: [-2.0, -2.0, -3.0]
+    max_accel: [4.0, 4.0, 6.0]
+    max_decel: [-4.0, -4.0, -6.0]
+    deadband_velocity: [0.0, 0.0, 0.0]
+
+rm_nav2_compat:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    action_name: /navigate_to_pose
+    goal_topic: /goal_pose
+    status_topic: /navigation2/status
+    feedback_frequency: 10.0
+    action_timeout: 0.0
+
+rm_mpc_controller:
+  ros__parameters:
+    use_sim_time: true
+    target_frame: map
+    path_topic: /plan
+    odom_topic: /Odometry
+    cmd_vel_topic: /cmd_vel_nav_raw
+    control_fps: 30.0
+    expected_speed: 1.5
+    goal_tolerance: 0.2
+    max_track_error: 0.5
+    blind_radius: 0.1
+    delay_time: 0.0
+    default_wz: 0.0
+    # Prediction horizon (MPC): steps * predict_dt seconds ahead.
+    predict_steps: 30
+    predict_dt: 0.1
+    max_speed: 2.0
+    max_accel: 4.0
+    turtle_max_speed: 1.0
+    # QP weights: Q=position tracking, R=control magnitude, Rd=control smoothness.
+    Q: [15.0, 15.0]
+    R: [0.1, 0.1]
+    Rd: [1.0, 0.05]
+    # Odometry delay compensation (off by default; extrapolates pose over odom->now latency).
+    delay_compensation.enable: false
+    delay_compensation.max_dt: 0.5
+    local_safety.costmap_topic: /local_costmap/costmap
+    local_safety.obstacle_threshold: 90
+    local_safety.unknown_is_obstacle: true
+    local_safety.costmap_timeout: 0.5
+    # Check 1.0 s ahead; the 5 m rolling map cannot contain the full 3.0 s horizon at max speed.
+    local_safety.check_steps: 10
+    local_safety.replan_topic: /navigation2/replan_request
+    local_safety.replan_cooldown: 0.5
