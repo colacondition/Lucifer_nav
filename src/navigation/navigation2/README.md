@@ -21,7 +21,7 @@
 - `rm_map_server_node`：读取 `.yaml + .pgm` 栅格地图并发布 `/map`。
 - `rm_global_planner_node`：订阅 `/goal_pose` 和 `/map`，生成 `/plan_raw`。含规划失败冷却、路径发布前验收和规划代次校验。
 - `rm_global_costmap_node`：订阅 `/map` 和 `/segmentation/obstacle`，发布全局代价地图。
-- `rm_path_smoother_node`：平滑 `/plan_raw` 并发布 `/plan`。
+- `rm_minco_path_smoother_node`：用 MINCO 轨迹优化（车体系 ESDF + L-BFGS）平滑 `/plan_raw` 并发布 `/plan`，详见 `MINCO_README.md`。
 - `rm_local_costmap_node`：基于 `/segmentation/obstacle` 点云构建滚动局部代价地图。
 - `rm_mpc_controller_node`：使用 OSQP 跟踪平滑路径，发布 `/cmd_vel_nav_raw` 和 `/predict_path`。内置多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）、弧长域速度剖面和指令链路闭环反馈。
 - `goal_approach_controller_node`：接近目标时将 `/cmd_vel_nav_raw` 修正为 `/cmd_vel_nav`。

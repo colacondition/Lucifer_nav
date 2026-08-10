@@ -35,7 +35,7 @@ Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /L
 
 | Topic | Type | 说明 |
 | :- | :- | :- |
-| `/livox/lidar/pointcloud` | `PointCloud2` | 雷达点云（实车另有 `/livox/lidar` 的 CustomMsg） |
+| `/livox/lidar/pointcloud` | `PointCloud2` | 雷达点云（mid360_driver 实车 / 仿真插件统一发这条，不再有 CustomMsg） |
 | `/segmentation/obstacle` | `PointCloud2` | 地面分割后的障碍点，代价地图输入 |
 | `/Odometry` | `Odometry` | small_glim 里程计（`/lio/robo/odom` 内容相同，供 fast_location） |
 | `/Laser_map` | `PointCloud2` | small_glim 世界系点云，`world` 系 |
@@ -105,8 +105,28 @@ source install/setup.bash
 ./build.sh navigation2 bringup     # 只编指定包，顺序仍按依赖表
 ```
 
-实车驱动需要另装 Livox SDK2（`/usr/local/lib/liblivox_lidar_sdk_shared.so`），
-仿真不需要。
+### 3.1 依赖（换机 / 重装按此顺序）
+
+`small_glim` 硬编码 gcc-13 / C++23，`mid360_driver` 用 asio 收 UDP，两者都需要额外依赖。
+重装或换机时按下面顺序装完，再跑 `./build.sh`：
+
+```sh
+# 1. gcc-13（small_glim 硬编码 C++23，不可降级）
+sudo add-apt-repository ppa:ubuntu-toolchain-r-ubuntu-test/test
+sudo apt update
+sudo apt install -y gcc-13 g++-13 libstdc++-13-dev
+
+# 2. asio（mid360_driver 收 UDP；两个包都要装，asio_cmake_module 不带出头文件）
+sudo apt install -y ros-humble-asio-cmake-module libasio-dev
+```
+
+- **gtsam_points v1.2.0** 源码编译（当前在 `/home/cola/gtsam_points`）：**必须**
+  `-DBUILD_WITH_MARCH_NATIVE=OFF` 且**不开 ASAN**，与 small_glim 的编译旗标一致
+  （ABI 陷阱），装到 `/usr/local` 并 `ldconfig`。GTSAM 4.3a0 已装 `/usr/local`，无则同旗标重编。
+
+> 实车**不再需要** Livox SDK2：`mid360_driver` 是纯 asio UDP 收包，不链接
+> `/usr/local/lib/liblivox_lidar_sdk_shared.so`。`livox_ros_driver2` 仅保留在编译列表里，
+> 给仿真插件 `ros2_livox_simulation` 提供 CustomMsg 消息定义。
 
 ## 四. 运行与调试
 
@@ -148,3 +168,18 @@ ros2 launch bringup real.launch.py world:=RMUL mode:=mapping nav_rviz:=True
 ros2 launch bringup sim.launch.py  world:=RMUL mode:=nav nav_rviz:=True
 ros2 launch bringup real.launch.py world:=RMUL mode:=nav
 ```
+
+### 4.4 实车雷达配置（mid360_driver）
+
+`mid360_driver` 是**纯被动 UDP 收包**：它不给雷达发配置命令，只解析雷达推过来的
+0x01 / 0x03 数据包。所以"雷达往哪推"和"驱动读什么"是两套配置，**三处必须一致**：
+
+| 配置项 | 填在哪 | 值 |
+| :- | :- | :- |
+| 驱动参数 | `config/reality/mid360_driver_real.yaml` | `host_ip: 192.168.10.50`（主机绑包 IP） |
+| 雷达推流目标 | Livox Viewer 2 写进雷达 flash（一次性） | 推流到 `192.168.10.50:56300` |
+| 主机网卡 | 系统网络配置 | 网卡配 `192.168.10.x`，防火墙放行 56300 / 56301 |
+
+注意 `host_ip` 填的是**工控机自己的 IP，不是雷达 IP**（雷达是另一个网段的设备，
+驱动按目标端口收包即可）。三处任何一处不一致，表现都是
+`ros2 topic hz /livox/lidar/pointcloud` 无数据。
