@@ -1,0 +1,18 @@
+/**:
+  ros__parameters:
+    node:
+      debug: false # if true, the node will print debug information
+      enable_mapping: true # if true, mapping runs from startup and the final map is saved on exit (Ctrl-C)
+      enable_tf_publish: false # if true, the node will publish tf (odometry_frame_id <- base_frame_id)
+      imu_time_offset: 0.0 # time offset to be added to the imu timestamps (in seconds)
+      lidar_time_offset: 0.0 # time offset to be added to the lidar timestamps (in seconds)
+      acc_scale: 1.0 # scale factor for the accelerometer measurements
+      imu_sub_topic: "/livox/imu"
+      lidar_sub_topic: "/livox/lidar/pointcloud"
+      odometry_pub_topic: "/Odometry"
+      robo_odometry_pub_topic: "/lio/robo/odom" # consumed by fast_location (not remapped in launch)
+      registered_cloud_pub_topic: "/Laser_map"
+      ivox_cloud_pub_topic: "/small_glim/ivox_cloud"
+      base_frame_id: "base_link" # odometry child frame; carries the lidar pose (super_lio convention)
+      odometry_frame_id: "lidar_odom"
+      cloud_frame_id: "world" # frame_id stamped on published clouds (odom->world is a static identity)

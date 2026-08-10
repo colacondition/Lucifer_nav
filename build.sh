@@ -15,9 +15,9 @@ cd "$(dirname "$0")"
 # 否则 --list 的一致性检查会报出来。
 PACKAGES=(
   "decision_interfaces"
-  "livox_ros_driver2"
-  "basic"
-  "super_lio"
+  "livox_ros_driver2"   # 实车不再启动它的节点，但 ros2_livox_simulation 编译需要其 CustomMsg
+  "mid360_driver"
+  "small_glim"
   "fast_location"
   "cpp_lidar_filter"
   "linefit_ground_segmentation"

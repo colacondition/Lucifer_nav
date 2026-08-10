@@ -1,3 +1,4 @@
+import glob
 import os
 import yaml
 
@@ -53,9 +54,14 @@ def generate_launch_description():
     navigation_params = os.path.join(bringup_dir, 'config', 'navigation2.yaml')
     fast_location_params = os.path.join(bringup_dir, 'config', 'fast_location_main.yaml')
     seg_params = os.path.join(bringup_dir, 'config', 'reality', 'segmentation_real.yaml')
-    superlio_params = os.path.join(
-        bringup_dir, 'config', 'reality', 'superlio_mid360_real.yaml')
-    livox_config = os.path.join(bringup_dir, 'config', 'reality', 'MID360_config.json')
+    # small_glim 的参数分两层：包内 config/params_*.yaml 是全量默认值（glob 加载，
+    # 与上游 launch 的行为一致），bringup 的 small_glim_real.yaml 只放实车差异项。
+    small_glim_default_params = sorted(glob.glob(os.path.join(
+        get_package_share_directory('small_glim'), 'config', 'params_*.yaml')))
+    small_glim_params = os.path.join(
+        bringup_dir, 'config', 'reality', 'small_glim_real.yaml')
+    mid360_driver_params = os.path.join(
+        bringup_dir, 'config', 'reality', 'mid360_driver_real.yaml')
     # 与 sim.launch.py 保持一致：mapping 模式没有 map 帧，用专门的 mapping.rviz。
     rviz_config = PythonExpression([
         "'", os.path.join(bringup_dir, 'rviz', 'mapping.rviz'), "'",
@@ -66,9 +72,9 @@ def generate_launch_description():
     fast_location_pcd_path = ParameterValue(
         ['package://bringup/PCD/', world, '.pcd'], value_type=str)
 
-    # 与 sim.launch.py 同一套逻辑：建图模式才存图。super_lio 的 caceData() 开头就
-    # if(!g_save_map) return，关着的话点云不累积、saveMap() 空转；而 nav 模式下开着
-    # 会让 point_map_ 无上限吃内存。文件名跟着 world 走，否则建 RMUC 会覆盖 RMUL。
+    # 与 sim.launch.py 同一套逻辑：建图模式才存图。small_glim 的 enable_mapping
+    # 打开时 AsyncMapping 从启动就累积关键帧、Ctrl-C 退出（节点析构）时合并落盘；
+    # nav 模式下开着会无上限吃内存。文件名跟着 world 走，否则建 RMUC 会覆盖 RMUL。
     lio_save_map = ParameterValue(
         PythonExpression(["'", mode, "' == 'mapping'"]), value_type=bool)
     lio_map_name = ParameterValue([world, '.pcd'], value_type=str)
@@ -86,9 +92,9 @@ def generate_launch_description():
     declare_waypoint_file = DeclareLaunchArgument(
         'waypoint_file', default_value='/tmp/navigation_waypoints.csv')
     # 建图输出目录，默认就是 mode:=nav 下 fast_location 要读的地方，建完直接能用。
-    # 给绝对路径是为了绕开 super_lio 对相对路径拼 CMake ROOT（它自己的源码目录）
-    # 的行为。--symlink-install 下覆盖已有世界会写穿到 src/bringup/PCD/，新世界的
-    # 文件只落在 install/ 里，下次 colcon build 就没了，要自己拷回源码。
+    # small_glim 的 mapping.output_dir 要给绝对路径（留空时它会退回 ~/mapping 并拼
+    # 时间戳子目录）。--symlink-install 下覆盖已有世界会写穿到 src/bringup/PCD/，
+    # 新世界的文件只落在 install/ 里，下次 colcon build 就没了，要自己拷回源码。
     declare_map_save_dir = DeclareLaunchArgument(
         'map_save_dir', default_value=os.path.join(bringup_dir, 'PCD'))
     # 串口是实车链路的终点：它订阅 /cmd_vel_chassis 下发底盘速度，并把裁判系统
@@ -113,48 +119,38 @@ def generate_launch_description():
         }],
         arguments=common_log_arguments)
 
-    # ===== 2. Livox Mid360 驱动 =====
-    livox_driver = Node(
-        package='livox_ros_driver2',
-        executable='livox_ros_driver2_node',
-        name='livox_lidar_publisher',
+    # ===== 2. Mid360 驱动（自研，被动收 UDP 推流）=====
+    # 不向雷达发配置命令：需事先用 Livox Viewer 2 把推流目标主机
+    # (host_ip, 端口 56301/56401) 持久化写入雷达。话题/frame 等在 yaml 里。
+    lidar_driver = Node(
+        package='mid360_driver',
+        executable='mid360_driver_node',
         output=node_output,
         parameters=[
-            {'xfer_format': 4},
-            {'multi_topic': 0},
-            {'data_src': 0},
-            {'publish_freq': 10.0},
-            {'output_data_type': 0},
-            {'frame_id': 'livox_frame'},
-            {'lvx_file_path': ''},
-            {'user_config_path': livox_config},
-            {'cmdline_input_bd_code': 'livox0000000001'},
+            mid360_driver_params,
+            {'use_sim_time': use_sim_time},
         ],
         arguments=common_log_arguments)
 
-    # ===== 3. Super-LIO (里程计 + 建图) =====
+    # ===== 3. small_glim (里程计 + 建图) =====
+    # 话题名（/Odometry、/lio/robo/odom、/Laser_map）直接在包内 params_node.yaml
+    # 里按本工作区契约配置，无需 remap。参数顺序有意义：后面的覆盖前面的。
     lio_node = Node(
-        package='super_lio',
-        executable='super_lio_node',
+        package='small_glim',
+        executable='small_glim_node',
         output='log',
-        additional_env=system_libusb_env,
-        parameters=[
-            superlio_params,
+        parameters=small_glim_default_params + [
+            small_glim_params,
             {
                 'use_sim_time': use_sim_time,
-                'lio.output.map': True,
-                'lio.map.save_map': lio_save_map,
-                'lio.map.save_map_dir': LaunchConfiguration('map_save_dir'),
-                'lio.map.map_name': lio_map_name,
+                'node.enable_mapping': lio_save_map,
+                'mapping.output_dir': LaunchConfiguration('map_save_dir'),
+                'mapping.map_name': lio_map_name,
             },
-        ],
-        remappings=[
-            ('/lio/odom', '/Odometry'),
-            ('/lio/cloud_world', '/Laser_map'),
         ],
         arguments=common_log_arguments)
 
-    # 连接 odom 与 Super-LIO 输出系（lidar_odom/world），否则 TF 树断裂
+    # 连接 odom 与 small_glim 输出系（lidar_odom/world），否则 TF 树断裂
     tf_odom_to_lidar_odom = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
@@ -326,7 +322,7 @@ def generate_launch_description():
         declare_waypoint_file, declare_map_save_dir,
         declare_use_serial_driver, declare_use_decision,
         robot_state_pub,
-        livox_driver,
+        lidar_driver,
         lio_node,
         tf_odom_to_lidar_odom,
         tf_odom_to_world,

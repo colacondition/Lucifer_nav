@@ -15,7 +15,7 @@ RoboMaster 哨兵导航工作空间，ROS 2 Humble + Gazebo Classic 11，支持�
 数据流：
 
 ```text
-Mid360 点云 ──┬─► Super-LIO ──► /Odometry, /Laser_map
+Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /Laser_map
               │      ▲
               │      └── /livox/imu
               └─► cpp_lidar_filter ──► linefit_ground_segmentation
@@ -37,8 +37,8 @@ Mid360 点云 ──┬─► Super-LIO ──► /Odometry, /Laser_map
 | :- | :- | :- |
 | `/livox/lidar/pointcloud` | `PointCloud2` | 雷达点云（实车另有 `/livox/lidar` 的 CustomMsg） |
 | `/segmentation/obstacle` | `PointCloud2` | 地面分割后的障碍点，代价地图输入 |
-| `/Odometry` | `Odometry` | Super-LIO 里程计 |
-| `/Laser_map` | `PointCloud2` | Super-LIO 世界系点云，`world` 系 |
+| `/Odometry` | `Odometry` | small_glim 里程计（`/lio/robo/odom` 内容相同，供 fast_location） |
+| `/Laser_map` | `PointCloud2` | small_glim 世界系点云，`world` 系 |
 | `/map` | `OccupancyGrid` | 先验栅格地图 |
 | `/goal_pose` | `PoseStamped` | 导航目标 |
 | `/plan` `/predict_path` | `Path` | 全局路径 / MPC 预测轨迹 |
@@ -48,13 +48,15 @@ Mid360 点云 ──┬─► Super-LIO ──► /Odometry, /Laser_map
 
 ```text
 src/bringup                                  总启动，仿真/实车两套 launch 与 config
-src/driver/livox_ros_driver2                 Livox Mid360 驱动
+src/driver/mid360_driver                     Mid360 自研驱动（实车，被动收 UDP 推流）
+src/driver/livox_ros_driver2                 Livox 官方驱动（实车不再启动，保留给仿真
+                                             插件提供 CustomMsg 消息定义）
 src/perception/cpp_lidar_filter              去车身点云 + 降采样
 src/perception/linefit_ground_segmentation_ros2
                                              地面分割（linefit_ground_segmentation
                                              + _ros 两个包）
-src/localization/basic                       super_lio 的公共基础库
-src/localization/super_lio                   LIO 里程计与建图
+src/localization/small_glim                  LIO 里程计与建图（GLIM 精简版，
+                                             GTSAM ISAM2 + GICP/iVox）
 src/localization/fast_location               点云对先验 PCD 的主定位
 src/navigation/navigation2                   导航栈（组件化，A* + 距离场 + MPC）
 src/control/goal_approach_controller         目标接近减速

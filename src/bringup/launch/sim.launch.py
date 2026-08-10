@@ -1,3 +1,4 @@
+import glob
 import os
 import yaml
 
@@ -53,7 +54,12 @@ def generate_launch_description():
     navigation_params = os.path.join(bringup_dir, 'config', 'navigation2.yaml')
     fast_location_params = os.path.join(bringup_dir, 'config', 'fast_location_main.yaml')
     seg_params = os.path.join(bringup_dir, 'config', 'simulation', 'segmentation_sim.yaml')
-    superlio_params = os.path.join(bringup_dir, 'config', 'simulation', 'superlio_mid360_sim.yaml')
+    # small_glim 的参数分两层：包内 config/params_*.yaml 是全量默认值（glob 加载，
+    # 与上游 launch 的行为一致），bringup 的 small_glim_sim.yaml 只放仿真差异项。
+    small_glim_default_params = sorted(glob.glob(os.path.join(
+        get_package_share_directory('small_glim'), 'config', 'params_*.yaml')))
+    small_glim_params = os.path.join(
+        bringup_dir, 'config', 'simulation', 'small_glim_sim.yaml')
     # RViz 配置按 mode 选：navigation.rviz 的 Fixed Frame 是 map，而 map 只有
     # nav 模式下的 fast_location / map_server 才发；建图模式下用 mapping.rviz
     # （Fixed Frame=world，带 /Laser_map 显示）。见 rviz/mapping.rviz 顶部说明。
@@ -66,9 +72,9 @@ def generate_launch_description():
     fast_location_pcd_path = ParameterValue(
         ['package://bringup/PCD/', world, '.pcd'], value_type=str)
 
-    # 建图模式才存图：super_lio 的 caceData() 开头就 if(!g_save_map) return，
-    # 关着的话点云根本不累积、saveMap() 空转，跑完什么都不留。而 nav 模式下开着
-    # 会让 point_map_ 无上限累积内存，所以按 mode 开关。
+    # 建图模式才存图：small_glim 的 enable_mapping 打开时 AsyncMapping 从启动就
+    # 累积关键帧、Ctrl-C 退出（节点析构）时合并落盘；nav 模式下开着会无上限吃内存，
+    # 所以按 mode 开关。
     lio_save_map = ParameterValue(
         PythonExpression(["'", LaunchConfiguration('mode'), "' == 'mapping'"]),
         value_type=bool)
@@ -94,9 +100,8 @@ def generate_launch_description():
     # （fast_location_pcd_path = package://bringup/PCD/<world>.pcd），建完直接能用。
     #
     # 两个坑：
-    # 1) yaml 里的 save_map_dir 是相对路径，super_lio 会拼上 CMake 的 ROOT（它自己的
-    #    源码目录），最终落到 src/localization/super_lio/map/，跟 fast_location 找的
-    #    位置对不上。这里给绝对路径绕开那套拼接。
+    # 1) small_glim 的 mapping.output_dir 要给绝对路径：留空时它会退回 ~/mapping
+    #    并拼时间戳子目录，跟 fast_location 找的位置对不上。
     # 2) --symlink-install 下 install/.../PCD/RMUL.pcd 是指向源码的符号链接，覆盖它
     #    会写穿到 src/bringup/PCD/RMUL.pcd —— 重建已有世界的图正是想要这样。但新世界
     #    的文件只会落在 install/ 里，下次 colcon build 就没了，要自己拷回源码。
@@ -124,25 +129,23 @@ def generate_launch_description():
             'node_output': node_output,
         }.items())
 
-    # ===== 2. Super-LIO (里程计 + 建图) =====
+    # ===== 2. small_glim (里程计 + 建图) =====
+    # 话题名（/Odometry、/lio/robo/odom、/Laser_map）直接在包内 params_node.yaml
+    # 里按本工作区契约配置，无需 remap。点云来自 Gazebo livox 插件的
+    # /livox/lidar/pointcloud（无逐点时间戳，small_glim 自动生成伪时间戳）。
+    # 参数顺序有意义：后面的覆盖前面的。
     lio_node = Node(
-        package='super_lio',
-        executable='super_lio_node',
+        package='small_glim',
+        executable='small_glim_node',
         output='log',
-        additional_env=system_libusb_env,
-        parameters=[
-            superlio_params,
+        parameters=small_glim_default_params + [
+            small_glim_params,
             {
                 'use_sim_time': use_sim_time,
-                'lio.output.map': True,
-                'lio.map.save_map': lio_save_map,
-                'lio.map.save_map_dir': LaunchConfiguration('map_save_dir'),
-                'lio.map.map_name': lio_map_name,
+                'node.enable_mapping': lio_save_map,
+                'mapping.output_dir': LaunchConfiguration('map_save_dir'),
+                'mapping.map_name': lio_map_name,
             },
-        ],
-        remappings=[
-            ('/lio/odom', '/Odometry'),
-            ('/lio/cloud_world', '/Laser_map'),
         ],
         arguments=common_log_arguments)
 

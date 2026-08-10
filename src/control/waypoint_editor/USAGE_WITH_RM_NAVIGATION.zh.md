@@ -36,18 +36,15 @@ source install/setup.bash
 常用命令：
 
 ```bash
-ros2 launch bringup bringup_sim.launch.py \
+ros2 launch bringup sim.launch.py \
   world:=RMUL \
   mode:=nav \
-  lio:=superlio \
-  localization:=slam_toolbox \
-  lio_rviz:=False \
   nav_rviz:=True
 ```
 
-实车使用 `bringup bringup_real.launch.py`，其余 waypoint 面板、服务和话题保持一致。
+实车使用 `bringup real.launch.py`，其余 waypoint 面板、服务和话题保持一致。
 
-`/map` 由 `slam_toolbox` 发布，`Load Map` 不会再启动 Nav2 map server。选择 `.yaml` 时面板只会提示使用现有 `/map`；选择 `.pcd` 时可加载点云地图做可视化。
+`/map` 由 navigation2 的 `rm_map_server` 发布。选择 `.yaml` 时面板只会提示使用现有 `/map`；选择 `.pcd` 时可加载点云地图做可视化。
 
 ## 启动独立编辑器
 

@@ -37,13 +37,9 @@
 
 ```sh
 source install/setup.bash
-ros2 launch bringup bringup_sim.launch.py \
+ros2 launch bringup sim.launch.py \
   world:=RMUL \
   mode:=nav \
-  lio:=superlio \
-  use_fast_location_aux:=True \
-  use_relocalization_monitor:=True \
-  lio_rviz:=False \
   nav_rviz:=True
 ```
 
@@ -51,14 +47,9 @@ ros2 launch bringup bringup_sim.launch.py \
 
 ```sh
 source install/setup.bash
-ros2 launch bringup bringup_real.launch.py \
+ros2 launch bringup real.launch.py \
   world:=RMUL \
-  mode:=nav \
-  lio:=superlio \
-  use_fast_location_aux:=True \
-  use_relocalization_monitor:=True \
-  lio_rviz:=False \
-  nav_rviz:=True
+  mode:=nav
 ```
 
 导航后端由全局规划、全局/局部代价地图、路径平滑、MPC 控制器、速度平滑器和 RViz 兼容 action 组成。

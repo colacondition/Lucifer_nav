@@ -1,0 +1,17 @@
+/**:
+  ros__parameters:
+    # 顶替 livox_ros_driver2 的 PointCloud2 输出话题，cpp_lidar_filter / small_glim 直接消费
+    lidar_topic: /livox/lidar/pointcloud
+    lidar_frame: livox_frame          # 对齐 URDF 的雷达系名
+    imu_topic: /livox/imu
+    imu_frame: livox_frame
+    lidar_publish_time_interval: 0.1  # 10 Hz，对齐旧驱动 publish_freq
+    host_ip: 192.168.10.50            # 取自旧 MID360_config.json 的 host_net_info
+    is_topic_name_with_lidar_ip: false
+    validate_crc: true
+    max_packet_time_jump: 0.5
+    max_packet_time_span: 0.15        # 帧间隔放宽到 0.1s 后，点时间跨度上限同步放宽
+    max_point_range: 300.0
+    max_imu_acc: 100.0
+    max_imu_gyro: 100.0
+    min_drop_log_interval: 0.1
