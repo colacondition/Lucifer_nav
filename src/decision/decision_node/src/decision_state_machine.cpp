@@ -6,8 +6,10 @@ namespace decision
 {
 
 DecisionStateMachine::DecisionStateMachine(
-  HpRecoveryConfig hp_config, TargetConfig target_config)
-: hp_config_(std::move(hp_config)), target_config_(std::move(target_config)) {}
+  HpRecoveryConfig hp_config, TargetConfig target_config, CombatConfig combat_config)
+: hp_config_(std::move(hp_config)),
+  target_config_(std::move(target_config)),
+  combat_config_(std::move(combat_config)) {}
 
 const DecisionState & DecisionStateMachine::state() const { return state_; }
 bool DecisionStateMachine::hpRecoveryActive() const { return hp_recovery_active_; }
@@ -28,9 +30,12 @@ StateMachineResult DecisionStateMachine::resultFor(
 StateMachineResult DecisionStateMachine::transitionTo(
   const DecisionState & previous, DecisionState next, const std::string & reason, double now_sec)
 {
+  const bool entering_center = std::holds_alternative<CenterState>(next);
   state_ = std::move(next);
-  if (state_ == DecisionState{CenterState{CenterSubstate::WaitCenter}}) {
-    wait_center_since_sec_ = now_sec;
+  // 任何一次进入/切换到 CENTER 子状态都刷新计时基准，
+  // 用于 Reposition/Engage 的最小保持时长判定。
+  if (entering_center) {
+    center_substate_since_sec_ = now_sec;
   }
   return resultFor(previous, reason);
 }
@@ -75,7 +80,17 @@ StateMachineResult DecisionStateMachine::tick(const DecisionInputs & inputs, dou
       }
       return resultFor(previous, "recovering");
     }
-    return transitionTo(previous, MoveState{MoveSubstate::GoHome}, "low_hp", now_sec);
+    // 换位脱离进行中（REPOSITION 刚进入且在宽限期内）：让换位动作先完成，
+    // 暂缓低血回家，避免"刚切到 REPOSITION 就被扣血拽回家、路径都还没出来"。
+    const bool repositioning = std::holds_alternative<CenterState>(state_) &&
+      std::get<CenterState>(state_).substate == CenterSubstate::Reposition;
+    const bool escape_remaining =
+      now_sec - center_substate_since_sec_ < combat_config_.reposition_grace_sec;
+    if (!(repositioning && escape_remaining)) {
+      return transitionTo(previous, MoveState{MoveSubstate::GoHome}, "low_hp", now_sec);
+    }
+    // 宽限内：落到下方 combat 分支继续推进 REPOSITION；
+    // 宽限结束仍低血，或换位途中态势转平静，都会在下一拍走到 home/hold。
   }
 
   if (state_ == DecisionState{HomeState{HomeSubstate::WaitHp}} ||
@@ -90,25 +105,67 @@ StateMachineResult DecisionStateMachine::tick(const DecisionInputs & inputs, dou
   }
   if (state_ == DecisionState{MoveState{MoveSubstate::GoCenter}} &&
       eventIs(inputs, TargetName::Center, ExecutorEventType::Succeeded)) {
-    return transitionTo(previous, CenterState{CenterSubstate::WaitCenter}, "center_reached", now_sec);
+    // 抵达中心，进入交战驱动的 HOLD 子状态。
+    return transitionTo(previous, CenterState{CenterSubstate::Hold}, "center_reached", now_sec);
   }
-  if (state_ == DecisionState{CenterState{CenterSubstate::WaitCenter}}) {
-    const bool patrol_ready = target_config_.enable_patrol &&
-      !target_config_.patrol_waypoint_file.empty() &&
-      now_sec - wait_center_since_sec_ >= target_config_.patrol_interval_sec;
-    if (patrol_ready) {
-      return transitionTo(previous, CenterState{CenterSubstate::Patrol}, "patrol_interval", now_sec);
-    }
-    return resultFor(previous, "waiting_center");
-  }
-  if (state_ == DecisionState{CenterState{CenterSubstate::Patrol}} &&
-      (eventIs(inputs, TargetName::Patrol, ExecutorEventType::Succeeded) ||
-       eventIs(inputs, TargetName::Patrol, ExecutorEventType::Aborted))) {
-    return transitionTo(
-      previous, CenterState{CenterSubstate::WaitCenter}, "patrol_finished", now_sec);
+  if (std::holds_alternative<CenterState>(state_)) {
+    return tickCenter(inputs, now_sec);
   }
 
   return resultFor(previous, "");
+}
+
+StateMachineResult DecisionStateMachine::tickCenter(
+  const DecisionInputs & inputs, double now_sec)
+{
+  const DecisionState previous = state_;
+  const auto current = std::get<CenterState>(state_).substate;
+  const double held_for = now_sec - center_substate_since_sec_;
+
+  // 战斗感知关闭或数据无效时，退化为守中心（HOLD），行为等价于原地守点。
+  if (!combat_config_.enable || !inputs.combat.valid) {
+    if (current != CenterSubstate::Hold) {
+      return transitionTo(previous, CenterState{CenterSubstate::Hold}, "combat_disabled", now_sec);
+    }
+    return resultFor(previous, "hold_no_combat");
+  }
+
+  const EngagementState engagement = inputs.combat.state;
+
+  // 被压制/被偷：最高优先，立即换位脱离（Reposition 有最小保持时长防抖）。
+  if (engagement == EngagementState::Suppressed) {
+    if (current != CenterSubstate::Reposition) {
+      return transitionTo(
+        previous, CenterState{CenterSubstate::Reposition}, "suppressed_reposition", now_sec);
+    }
+    return resultFor(previous, "repositioning");
+  }
+
+  // 正在换位：保持到最小时长结束再重新评估，避免刚动就被打断。
+  if (current == CenterSubstate::Reposition &&
+      held_for < combat_config_.reposition_hold_sec) {
+    return resultFor(previous, "reposition_hold");
+  }
+
+  // 正面交战：站定输出（Engage 有最小保持时长，避免交火状态抖动）。
+  if (engagement == EngagementState::Engaging) {
+    if (current != CenterSubstate::Engage) {
+      return transitionTo(previous, CenterState{CenterSubstate::Engage}, "engage", now_sec);
+    }
+    return resultFor(previous, "engaging");
+  }
+
+  // 刚交火完，保持 Engage 到最小时长再转平静，避免频繁抖动。
+  if (current == CenterSubstate::Engage && held_for < combat_config_.engage_hold_sec) {
+    return resultFor(previous, "engage_hold");
+  }
+
+  // 平静：进入/保持 HOLD。守中心锚点维持占领，不发起身运动——
+  // 换位只由交战态势驱动（被压制才 Reposition），不靠定时游走制造动作。
+  if (current != CenterSubstate::Hold) {
+    return transitionTo(previous, CenterState{CenterSubstate::Hold}, "calm_hold", now_sec);
+  }
+  return resultFor(previous, "holding");
 }
 
 }  // namespace decision

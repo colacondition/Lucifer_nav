@@ -73,6 +73,13 @@ void declareDecisionParameters(rclcpp::Node & node)
   declareParameter(
     node, "maintain_goal.target_change_hold_sec", defaults.maintain_goal.target_change_hold_sec);
 
+  declareParameter(node, "combat.enable", defaults.combat.enable);
+  declareParameter(node, "combat.firing_heat_threshold", defaults.combat.firing_heat_threshold);
+  declareParameter(node, "combat.engage_hold_sec", defaults.combat.engage_hold_sec);
+  declareParameter(node, "combat.reposition_hold_sec", defaults.combat.reposition_hold_sec);
+  declareParameter(node, "combat.reposition_path_len", defaults.combat.reposition_path_len);
+  declareParameter(node, "combat.reposition_grace_sec", defaults.combat.reposition_grace_sec);
+
 }
 
 DecisionConfig loadDecisionConfig(rclcpp::Node & node)
@@ -128,6 +135,13 @@ DecisionConfig loadDecisionConfig(rclcpp::Node & node)
   node.get_parameter("maintain_goal.drift_hold_sec", config.maintain_goal.drift_hold_sec);
   node.get_parameter("maintain_goal.target_change_hold_sec", config.maintain_goal.target_change_hold_sec);
 
+  node.get_parameter("combat.enable", config.combat.enable);
+  node.get_parameter("combat.firing_heat_threshold", config.combat.firing_heat_threshold);
+  node.get_parameter("combat.engage_hold_sec", config.combat.engage_hold_sec);
+  node.get_parameter("combat.reposition_hold_sec", config.combat.reposition_hold_sec);
+  node.get_parameter("combat.reposition_path_len", config.combat.reposition_path_len);
+  node.get_parameter("combat.reposition_grace_sec", config.combat.reposition_grace_sec);
+
   validateDecisionConfig(config);
   return config;
 }
@@ -144,6 +158,11 @@ void validateDecisionConfig(DecisionConfig & config)
   if (config.hp_recovery.high_threshold < config.hp_recovery.low_threshold) {
     std::swap(config.hp_recovery.high_threshold, config.hp_recovery.low_threshold);
   }
+
+  config.combat.engage_hold_sec = std::max(config.combat.engage_hold_sec, 0.0);
+  config.combat.reposition_hold_sec = std::max(config.combat.reposition_hold_sec, 0.0);
+  config.combat.reposition_path_len = std::max(config.combat.reposition_path_len, 1);
+  config.combat.reposition_grace_sec = std::max(config.combat.reposition_grace_sec, 0.0);
 }
 
 }  // namespace decision

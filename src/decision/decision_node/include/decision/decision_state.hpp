@@ -13,7 +13,11 @@ namespace decision
 
 enum class HomeSubstate { WaitHome, WaitHp };
 enum class MoveSubstate { GoHome, GoCenter };
-enum class CenterSubstate { WaitCenter, Patrol };
+// 中心区交战驱动子状态：
+//   Hold       平静占区，守视野点并周期性换位（破静止）
+//   Engage     正面交火，站定当前位专注输出
+//   Reposition 被压制/被偷，换位脱离重找视野
+enum class CenterSubstate { Hold, Engage, Reposition };
 
 struct HomeState {
   HomeSubstate substate;

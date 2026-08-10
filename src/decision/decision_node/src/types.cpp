@@ -25,6 +25,20 @@ std::string toString(const TargetName target)
   return "unknown";
 }
 
+std::string toString(const EngagementState state)
+{
+  switch (state) {
+    case EngagementState::Calm:
+      return "calm";
+    case EngagementState::Engaging:
+      return "engaging";
+    case EngagementState::Suppressed:
+      return "suppressed";
+  }
+
+  return "calm";
+}
+
 TargetName targetNameFromString(const std::string & value)
 {
   if (value == "wait_home") {

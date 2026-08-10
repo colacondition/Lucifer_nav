@@ -28,6 +28,26 @@ decision::ExecutorEvent success(decision::TargetName target)
 {
   return {target, decision::ExecutorEventType::Succeeded};
 }
+
+// 带交战态势的输入：hp 健康、游戏进行，combat 有效并指定交战状态。
+decision::DecisionInputs combat(decision::EngagementState state)
+{
+  decision::DecisionInputs in = active(500);
+  in.combat.valid = true;
+  in.combat.state = state;
+  in.combat.firing = (state == decision::EngagementState::Engaging);
+  in.combat.hit = (state != decision::EngagementState::Calm);
+  return in;
+}
+
+// 把机器人推进到 CENTER.HOLD：游戏开始 -> GoCenter -> 到达中心。
+void driveToCenter(decision::DecisionStateMachine & sm, double t0 = 1.0)
+{
+  sm.tick(active(500), t0);
+  auto arrived = active(500);
+  arrived.executor_event = success(decision::TargetName::Center);
+  sm.tick(arrived, t0 + 1.0);
+}
 }  // namespace
 
 TEST(DecisionStateMachine, StartsAtWaitHome)
@@ -100,63 +120,92 @@ TEST(DecisionStateMachine, MoveAbortKeepsCurrentMoveForExecutorRetry)
   EXPECT_EQ(decision::toString(sm.tick(home_aborted, 4.0).state), "MOVE.GO_HOME");
 }
 
-TEST(DecisionStateMachine, CenterSuccessStartsFullPatrolInterval)
+TEST(DecisionStateMachine, CenterArrivalEntersHold)
 {
   auto sm = machine();
-  sm.tick(active(500), 1.0);
-  auto arrived = active(500);
-  arrived.executor_event = success(decision::TargetName::Center);
-  EXPECT_EQ(decision::toString(sm.tick(arrived, 2.0).state), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(sm.tick(active(500), 11.9).state), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(sm.tick(active(500), 12.0).state), "CENTER.PATROL");
+  driveToCenter(sm);
+  EXPECT_EQ(decision::toString(sm.state()), "CENTER.HOLD");
 }
 
-TEST(DecisionStateMachine, PatrolSuccessAndAbortRestartWaitInterval)
+TEST(DecisionStateMachine, EngagingHoldsPositionToFireBack)
 {
   auto sm = machine();
-  sm.tick(active(500), 1.0);
-  auto arrived = active(500);
-  arrived.executor_event = success(decision::TargetName::Center);
-  sm.tick(arrived, 2.0);
-  sm.tick(active(500), 12.0);
-  auto completed = active(500);
-  completed.executor_event = success(decision::TargetName::Patrol);
-  EXPECT_EQ(decision::toString(sm.tick(completed, 15.0).state), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(sm.tick(active(500), 24.9).state), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(sm.tick(active(500), 25.0).state), "CENTER.PATROL");
-
-  decision::DecisionInputs aborted = active(500);
-  aborted.executor_event = decision::ExecutorEvent{
-    decision::TargetName::Patrol, decision::ExecutorEventType::Aborted};
-  EXPECT_EQ(decision::toString(sm.tick(aborted, 26.0).state), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(sm.tick(active(500), 35.9).state), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(sm.tick(active(500), 36.0).state), "CENTER.PATROL");
+  driveToCenter(sm);
+  // 正面交火：应站定进入 ENGAGE。
+  EXPECT_EQ(
+    decision::toString(sm.tick(combat(decision::EngagementState::Engaging), 3.0).state),
+    "CENTER.ENGAGE");
 }
 
-TEST(DecisionStateMachine, DisabledOrUnconfiguredPatrolStaysAtWaitCenter)
+TEST(DecisionStateMachine, SuppressedTriggersReposition)
+{
+  auto sm = machine();
+  driveToCenter(sm);
+  // 被压制/被偷：应立即换位脱离。
+  EXPECT_EQ(
+    decision::toString(sm.tick(combat(decision::EngagementState::Suppressed), 3.0).state),
+    "CENTER.REPOSITION");
+}
+
+TEST(DecisionStateMachine, CalmHoldStaysInCenterWithoutWandering)
+{
+  auto sm = machine();
+  driveToCenter(sm);
+  auto calm = combat(decision::EngagementState::Calm);
+  // 平静守中心：长时间无交火也稳定在 HOLD，不产生任何换位自切换。
+  // 换位只由交战态势驱动（被压制才 Reposition）。
+  auto r1 = sm.tick(calm, 3.0);
+  EXPECT_EQ(decision::toString(r1.state), "CENTER.HOLD");
+  EXPECT_EQ(r1.reason, "holding");
+  auto r2 = sm.tick(calm, 100.0);
+  EXPECT_EQ(decision::toString(r2.state), "CENTER.HOLD");
+  EXPECT_EQ(r2.reason, "holding");
+}
+
+TEST(DecisionStateMachine, EngageHoldsMinDurationBeforeCalm)
+{
+  auto sm = machine();  // 默认 engage_hold_sec = 0.4
+  driveToCenter(sm);
+  sm.tick(combat(decision::EngagementState::Engaging), 3.0);
+  // 交火后立刻转平静：应保持 ENGAGE 到最小时长。
+  EXPECT_EQ(
+    decision::toString(sm.tick(combat(decision::EngagementState::Calm), 3.2).state),
+    "CENTER.ENGAGE");
+  // 超过最小时长后才回到 HOLD。
+  EXPECT_EQ(
+    decision::toString(sm.tick(combat(decision::EngagementState::Calm), 3.5).state),
+    "CENTER.HOLD");
+}
+
+TEST(DecisionStateMachine, RepositionEscapesBeforeLowHpRetreat)
+{
+  auto sm = machine();  // 默认 reposition_grace_sec = 3.0
+  driveToCenter(sm);
+  // 先进入 REPOSITION（此时血量健康）。
+  auto suppressed = combat(decision::EngagementState::Suppressed);
+  EXPECT_EQ(decision::toString(sm.tick(suppressed, 3.0).state), "CENTER.REPOSITION");
+  // 换位途中血量跌破低阈值：宽限期内仍保持 REPOSITION，不被打断回家。
+  auto suppressed_low = suppressed;
+  suppressed_low.current_hp = 119;
+  EXPECT_EQ(decision::toString(sm.tick(suppressed_low, 3.5).state), "CENTER.REPOSITION");
+  // 宽限结束仍低血 → 回家保命。
+  EXPECT_EQ(
+    decision::toString(sm.tick(suppressed_low, 3.0 + 3.0 + 0.1).state),
+    "MOVE.GO_HOME");
+}
+
+TEST(DecisionStateMachine, CombatDisabledStaysAtHold)
 {
   decision::HpRecoveryConfig hp;
-  decision::TargetConfig disabled_targets;
-  disabled_targets.enable_patrol = false;
-  disabled_targets.patrol_waypoint_file = "patrol.csv";
-  disabled_targets.patrol_interval_sec = 10.0;
-  decision::DecisionStateMachine disabled_sm(hp, disabled_targets);
-  disabled_sm.tick(active(500), 1.0);
-  auto arrived = active(500);
-  arrived.executor_event = success(decision::TargetName::Center);
-  disabled_sm.tick(arrived, 2.0);
+  decision::TargetConfig targets;
+  decision::CombatConfig combat_off;
+  combat_off.enable = false;
+  decision::DecisionStateMachine sm(hp, targets, combat_off);
+  driveToCenter(sm);
+  // 战斗感知关闭：即便态势数据存在，也稳定守在 HOLD。
   EXPECT_EQ(
-    decision::toString(disabled_sm.tick(active(500), 100.0).state),
-    "CENTER.WAIT_CENTER");
-
-  decision::TargetConfig unconfigured_targets;
-  unconfigured_targets.enable_patrol = true;
-  decision::DecisionStateMachine unconfigured_sm(hp, unconfigured_targets);
-  unconfigured_sm.tick(active(500), 1.0);
-  unconfigured_sm.tick(arrived, 2.0);
-  EXPECT_EQ(
-    decision::toString(unconfigured_sm.tick(active(500), 100.0).state),
-    "CENTER.WAIT_CENTER");
+    decision::toString(sm.tick(combat(decision::EngagementState::Engaging), 100.0).state),
+    "CENTER.HOLD");
 }
 
 TEST(DecisionStateMachine, IgnoresStaleExecutorResult)
@@ -168,50 +217,32 @@ TEST(DecisionStateMachine, IgnoresStaleExecutorResult)
   EXPECT_EQ(decision::toString(sm.tick(stale, 2.0).state), "MOVE.GO_CENTER");
 }
 
-TEST(DecisionStateMachine, GameInactivePreemptsWaitCenterAndPatrol)
+TEST(DecisionStateMachine, GameInactivePreemptsCenter)
 {
   auto sm = machine();
-  sm.tick(active(500), 1.0);
-  auto arrived = active(500);
-  arrived.executor_event = success(decision::TargetName::Center);
-  sm.tick(arrived, 2.0);
-  decision::DecisionInputs inactive;
+  driveToCenter(sm);
+  decision::DecisionInputs inactive;  // game_active=false
+  // 游戏结束优先级高于交战态势：无论在 CENTER 哪个子状态都回家。
   EXPECT_EQ(decision::toString(sm.tick(inactive, 3.0).state), "MOVE.GO_HOME");
 
   auto second = machine();
-  second.tick(active(500), 1.0);
-  second.tick(arrived, 2.0);
-  second.tick(active(500), 12.0);
-  EXPECT_EQ(decision::toString(second.tick(inactive, 13.0).state), "MOVE.GO_HOME");
+  driveToCenter(second);
+  second.tick(combat(decision::EngagementState::Engaging), 3.0);  // 处于 ENGAGE
+  EXPECT_EQ(decision::toString(second.tick(inactive, 4.0).state), "MOVE.GO_HOME");
 }
 
-TEST(DecisionStateMachine, LowHpPreemptsWaitCenterAndPatrol)
+TEST(DecisionStateMachine, LowHpPreemptsCenter)
 {
   auto sm = machine();
-  sm.tick(active(500), 1.0);
-  auto arrived = active(500);
-  arrived.executor_event = success(decision::TargetName::Center);
-  sm.tick(arrived, 2.0);
+  driveToCenter(sm);
+  // 低血量撤退优先级高于交战态势。
   EXPECT_EQ(decision::toString(sm.tick(active(119), 3.0).state), "MOVE.GO_HOME");
 
   auto second = machine();
-  second.tick(active(500), 1.0);
-  second.tick(arrived, 2.0);
-  second.tick(active(500), 12.0);
-  EXPECT_EQ(decision::toString(second.tick(active(119), 13.0).state), "MOVE.GO_HOME");
-}
-
-TEST(DecisionStateMachine, WaitStateAbortDoesNotChangeDecisionState)
-{
-  auto sm = machine();
-  sm.tick(active(500), 1.0);
-  auto arrived = active(500);
-  arrived.executor_event = success(decision::TargetName::Center);
-  sm.tick(arrived, 2.0);
-  auto aborted = active(500);
-  aborted.executor_event = decision::ExecutorEvent{
-    decision::TargetName::WaitCenter, decision::ExecutorEventType::Aborted};
-  EXPECT_EQ(decision::toString(sm.tick(aborted, 3.0).state), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(sm.tick(active(500), 11.9).state), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(sm.tick(active(500), 12.0).state), "CENTER.PATROL");
+  driveToCenter(second);
+  second.tick(combat(decision::EngagementState::Engaging), 3.0);  // 正在交火
+  auto low = combat(decision::EngagementState::Engaging);
+  low.current_hp = 119;
+  // 即便在交火中，血量见底仍然回家保命。
+  EXPECT_EQ(decision::toString(second.tick(low, 4.0).state), "MOVE.GO_HOME");
 }

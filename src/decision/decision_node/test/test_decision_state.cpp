@@ -9,8 +9,9 @@ TEST(DecisionState, FormatsEveryLeafState)
   EXPECT_EQ(decision::toString(decision::HomeState{decision::HomeSubstate::WaitHp}), "HOME.WAIT_HP");
   EXPECT_EQ(decision::toString(decision::MoveState{decision::MoveSubstate::GoHome}), "MOVE.GO_HOME");
   EXPECT_EQ(decision::toString(decision::MoveState{decision::MoveSubstate::GoCenter}), "MOVE.GO_CENTER");
-  EXPECT_EQ(decision::toString(decision::CenterState{decision::CenterSubstate::WaitCenter}), "CENTER.WAIT_CENTER");
-  EXPECT_EQ(decision::toString(decision::CenterState{decision::CenterSubstate::Patrol}), "CENTER.PATROL");
+  EXPECT_EQ(decision::toString(decision::CenterState{decision::CenterSubstate::Hold}), "CENTER.HOLD");
+  EXPECT_EQ(decision::toString(decision::CenterState{decision::CenterSubstate::Engage}), "CENTER.ENGAGE");
+  EXPECT_EQ(decision::toString(decision::CenterState{decision::CenterSubstate::Reposition}), "CENTER.REPOSITION");
 }
 
 TEST(DecisionState, MapsEveryLeafStateToOneTarget)
@@ -19,8 +20,9 @@ TEST(DecisionState, MapsEveryLeafStateToOneTarget)
   EXPECT_EQ(decision::targetForState(decision::HomeState{decision::HomeSubstate::WaitHp}), decision::TargetName::WaitHp);
   EXPECT_EQ(decision::targetForState(decision::MoveState{decision::MoveSubstate::GoHome}), decision::TargetName::Home);
   EXPECT_EQ(decision::targetForState(decision::MoveState{decision::MoveSubstate::GoCenter}), decision::TargetName::Center);
-  EXPECT_EQ(decision::targetForState(decision::CenterState{decision::CenterSubstate::WaitCenter}), decision::TargetName::WaitCenter);
-  EXPECT_EQ(decision::targetForState(decision::CenterState{decision::CenterSubstate::Patrol}), decision::TargetName::Patrol);
+  EXPECT_EQ(decision::targetForState(decision::CenterState{decision::CenterSubstate::Hold}), decision::TargetName::WaitCenter);
+  EXPECT_EQ(decision::targetForState(decision::CenterState{decision::CenterSubstate::Engage}), decision::TargetName::Center);
+  EXPECT_EQ(decision::targetForState(decision::CenterState{decision::CenterSubstate::Reposition}), decision::TargetName::WaitCenter);
 }
 
 TEST(DecisionState, BuildsLatchedWebMessage)

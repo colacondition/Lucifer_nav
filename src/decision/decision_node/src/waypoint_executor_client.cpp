@@ -238,6 +238,11 @@ bool WaypointExecutorClient::stepExecutorTarget(
     return false;
   }
 
+  // 每次真正下发前重发航点路径：pending 延迟、跨话题乱序、以及同目标再次下发
+  // 时 pending 已匹配而不再重发，都会让下游 follow executor 的 override 过期。
+  // 重发保证它始终采用本次这组点，而不是回退到编辑器当前航点（如 patrol 全部点）。
+  executor_waypoints_pub_->publish(buildPathMessage(waypoints));
+
   auto client = serviceClient(mode);
   if (!client || !client->wait_for_service(std::chrono::seconds(0))) {
     return false;

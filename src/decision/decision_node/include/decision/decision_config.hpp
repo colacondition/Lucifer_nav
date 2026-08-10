@@ -69,6 +69,29 @@ struct MaintainGoalConfig
   double target_change_hold_sec{0.25};
 };
 
+// 战斗感知参数：把中心区行为从"定时巡逻"改为"按交战态势反应"。
+// 只依据两个直接信号判定，不做掉血率推断：
+//   shooter_heat 在开火（热量高） → 正面交火 ENGAGING，站定输出
+//   is_attacked   在挨打           → 被压制/被偷 SUPPRESSED，换位脱离
+//   两者皆无                       → 平静 CALM，守中心
+// 切换防抖由 engage_hold / reposition_hold 最小保持时长承担。
+struct CombatConfig
+{
+  bool enable{true};
+  // shooter_heat 高于此值视为"我正在开火"（热量非零即视为最近在射击）。
+  int firing_heat_threshold{1};
+  // 进入 ENGAGE 后至少保持多久，避免交火状态抖动。
+  double engage_hold_sec{0.4};
+  // REPOSITION（被压制换位）后至少保持多久再重新评估。
+  double reposition_hold_sec{0.5};
+  // REPOSITION 换位路径长度：从点池随机挑 N 个不重复的点连成路径依次走完。
+  int reposition_path_len{3};
+  // 换位脱离进行中暂缓低血回家撤退的宽限时长：给换位动作时间完成，
+  // 避免"刚切到 REPOSITION 就被扣血拽回家、路径都还没出来"。
+  // 宽限结束仍低血才回家保命。
+  double reposition_grace_sec{3.0};
+};
+
 struct DecisionConfig
 {
   double loop_hz{10.0};
@@ -81,6 +104,7 @@ struct DecisionConfig
   TargetConfig targets;
   WaypointConfig waypoint;
   MaintainGoalConfig maintain_goal;
+  CombatConfig combat;
 };
 
 void declareDecisionParameters(rclcpp::Node & node);
