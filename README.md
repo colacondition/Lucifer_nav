@@ -6,7 +6,8 @@ RoboMaster 哨兵导航工作空间，ROS 2 Humble + Gazebo Classic 11，支持�
 
 传感器是 Livox Mid360（雷达 + 内置 IMU），场地支持 RMUC / RMUL。
 
-`navigation2` 是组件化的单个功能包：8 个导航节点编进同一个 shared library，
+`navigation2` 是组件化的单个功能包：10 个导航节点（全局/局部规划、代价地图、路径平滑、
+MPC 控制器、隧道云台请求、云台可视化等）编进同一个 shared library，
 用 `rclcpp_components` 注册，全部加载进一个 `component_container_mt`，进程内零拷贝。
 全局规划用 A*，在 `OccupancyGrid` 上构建 2D 距离场做 clearance cost 让路径远离障碍；
 平滑后的 `/plan` 交给 MPC 控制器跟踪，控制器内含弧长进度跟踪、卡住检测、
@@ -43,6 +44,9 @@ Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /L
 | `/goal_pose` | `PoseStamped` | 导航目标 |
 | `/plan` `/predict_path` | `Path` | 全局路径 / MPC 预测轨迹 |
 | `/cmd_vel_chassis` | `Twist` | 最终底盘速度 |
+| `/gimbal_posture` | `GimbalPosture` | 云台收/放请求（rm_tunnel_posture → 电控 / 仿真模拟器） |
+| `/gimbal_posture_state` | `GimbalPostureState` | 电控持续回传的云台实态（仿真由 simulated_gimbal 顶替） |
+| `/gimbal_status` | `MarkerArray` | 云台状态可视化（RViz 的 GimbalStatus 显示块） |
 
 ## 二. 代码结构
 
@@ -67,6 +71,7 @@ src/interfaces/custom_msgs                   自定义消息（包名 decision_i
 src/serial                                   实车串口（包名 serial_driver）
 src/simulation/pb_rm_simulation               Gazebo 场景
 src/simulation/ros2_livox_simulation          Livox 仿真插件
+src/simulation/simulated_gimbal               仿真专用云台模拟器（顶替电控持续回传）
 ```
 
 `bringup` 下的关键文件：
@@ -80,13 +85,16 @@ config/{simulation,reality}/                 分环境的外参、分割、LIO �
 urdf/sentry_robot_{sim,real}.xacro            机器人模型
 map/<world>.msgpack                          语义地图（唯一真源，/map 由它生成）
 PCD/<world>.pcd                              fast_location 的先验点云图
-rviz/navigation.rviz                         nav 模式（Fixed Frame = map）
+tools/pcd_to_navmap.py                       点云 → msgpack 转换（pgm 链路已整体删除）
+tools/semantic_map_editor.py                 语义地图人工标注：刷隧道、画轴线、填 spec
+rviz/navigation.rviz                         nav 模式（Fixed Frame = map，含云台状态显示）
 rviz/mapping.rviz                            mapping 模式（Fixed Frame = world）
 ```
 
-`navigation2` 的 8 个组件：`rm_map_server`、`rm_global_costmap`、`rm_global_planner`、
-`rm_path_smoother`、`rm_local_costmap`、`rm_mpc_controller`、`rm_velocity_smoother`、
-`rm_nav2_compat`；`goal_approach_controller` 从独立包组合进同一容器。
+`navigation2` 的 10 个组件：`rm_map_server`、`rm_global_costmap`、`rm_global_planner`、
+`rm_minco_path_smoother`、`rm_local_costmap`、`rm_mpc_controller`、`rm_velocity_smoother`、
+`rm_nav2_compat`、`rm_tunnel_posture`、`rm_gimbal_visualizer`；
+`goal_approach_controller` 从独立包组合进同一容器。
 
 ## 三. 编译
 
@@ -180,6 +188,27 @@ ros2 run bringup semantic_map_editor.py map/RMUL.msgpack
 隧道靠人工标：点云里顶板/横梁和墙没有区别，几何上分不出「能钻过去」。编辑器里把
 通道格刷成 TUNNEL、用「隧道轴线」工具画出轴向（无向，正反等价），并给每条隧道填
 净高/净宽/限速。保存前会按 C++ 加载器的同一套不变量自检，坏图直接拒绝写出。
+
+### 4.2.2 隧道与云台收放
+
+标注进 msgpack 的隧道在导航时由 `rm_tunnel_posture` 驱动云台：车距最近隧道本体格
+≤ `run_up`（spec 里配，默认 0.5 m）发「收」，洞里全程保持，距隧道退开
+`run_up + hysteresis`（0.3 m）才发「抬」。判据只看距离，跟轴线端点/车头朝向无关。
+
+云台链路（实车）：
+
+```text
+rm_tunnel_posture ──/gimbal_posture──► serial_driver ──► 电控（执行收/放）
+                                         电控持续回传 /gimbal_posture_state ◄──┘
+                                                         │
+                                        rm_mpc_controller（请求收而实态还高 → 停车等）
+```
+
+MPC 只在「请求收、实测还高」时停车等云台到位；出洞请求抬起后**不等实态**、边走边抬
+（确认过的设计，见 `mpc_controller_node.cpp` 门控注释）。电控回传是持续的当前姿态，
+仿真里由 `simulated_gimbal` 顶替（动作延迟 0.5 s、20 Hz 持续回传）。RViz 的
+`GimbalStatus` 显示块实时画云台实态（绿=收下/低、红=立着/高，方块 z 随实态升降）
+和请求命令，实车仿真通用。
 
 ### 4.3 导航
 

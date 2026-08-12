@@ -18,7 +18,7 @@
 
 ## 节点
 
-- `rm_map_server_node`：读取 `.yaml + .pgm` 栅格地图并发布 `/map`。
+- `rm_map_server_node`：读取 `map/<world>.msgpack` 语义地图并发布 `/map`（占据栅格由 `terrain` 通道的 OBSTACLE 格推导；隧道等「能站但要摆姿态才能进」的先验在另一张语义通道里，不参与 /map 占据判定）。
 - `rm_global_planner_node`：订阅 `/goal_pose` 和 `/map`，生成 `/plan_raw`。含规划失败冷却、路径发布前验收和规划代次校验。
 - `rm_global_costmap_node`：订阅 `/map` 和 `/segmentation/obstacle`，发布全局代价地图。
 - `rm_minco_path_smoother_node`：用 MINCO 轨迹优化（车体系 ESDF + L-BFGS）平滑 `/plan_raw` 并发布 `/plan`，详见 `MINCO_README.md`。
@@ -28,6 +28,8 @@
 - `rm_velocity_smoother_node`：将 `/cmd_vel_nav` 平滑为 `/cmd_vel`。
 - `fake_vel_transform_node`：总 bringup 中将 `/cmd_vel` 转换并发布为底盘执行话题 `/cmd_vel_chassis`。
 - `rm_nav2_compat_node`：提供 `/navigate_to_pose` action，把 RViz Nav2 Goal 转成 `/goal_pose`。
+- `rm_tunnel_posture_node`：订阅语义地图与车体位姿，判断车是否接近/正在隧道内，向电控发布 `/gimbal_posture` 收云台请求（距最近隧道本体格 ≤ `run_up` 发收、洞里全程保持、退开 `run_up + hysteresis` 才发抬）。判据只看距离，不读车体参数；收多低、到位没到位全归电控。
+- `rm_gimbal_visualizer_node`：订阅电控持续回传的 `/gimbal_posture_state` 和请求 `/gimbal_posture`，发布 `/gimbal_status` MarkerArray（实车/仿真通用；RViz 显示方块+文字：绿=收下/低，红=立着/高）。
 
 运行时节点和话题采用 `rm_*` 命名，以匹配泓龙哨兵工程中的航点执行器、控制链路和 RViz 配置。
 
@@ -107,8 +109,8 @@ MPC 使用 `/local_costmap/costmap` 对求解后的预测运动逐段做碰撞�
 source install/setup.bash
 ros2 launch navigation2 bringup.launch.py \
   use_sim_time:=True \
-  map:=/home/cola/HL_navigation_27/src/HL_bringup/map/RMUL.yaml \
-  params_file:=/home/cola/HL_navigation_27/src/HL_bringup/config/navigation2.yaml
+  map:=/home/cola/Lucifer_nav/src/bringup/map/RMUL.msgpack \
+  params_file:=/home/cola/Lucifer_nav/src/bringup/config/navigation2.yaml
 ```
 
 
@@ -119,7 +121,7 @@ ros2 launch navigation2 bringup.launch.py start_map_server:=False
 队内主调参文件：
 
 ```text
-src/HL_bringup/config/navigation2.yaml
+src/bringup/config/navigation2.yaml
 ```
 
 ## 测试
