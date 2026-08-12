@@ -1,10 +1,22 @@
 rm_map_server:
   ros__parameters:
     use_sim_time: true
-    yaml_filename: ""
+    map_filename: ""
     frame_id: map
     map_topic: /map
+    semantic_map_topic: /map_server/semantic_map
     publish_frequency: 1.0
+    # 离线膨胀。参数是物理距离，换分辨率不用重调。
+    # 这一层不是给 A* 用的（它有自己的 clearance 距离场），是给 MINCO / MPC 当
+    # 梯度源：代价在障碍格内跳到 255、格外是 0，梯度既不连续又在一格外恒为零，
+    # 优化器根本看不见远处的约束。
+    inflation:
+      full_cost_radius_m: 0.10
+      cutoff_radius_m: 0.30
+      decay_rate_per_m: 24.0
+      # 膨胀圈方向模长上限，必须 <= 0.9。超过 0.95 会让膨胀圈被误判成隧道本体，
+      # 也就是「车还没进洞就以为自己在洞里」。
+      direction_non_body_magnitude_cap: 0.9
 
 rm_global_planner:
   ros__parameters:
@@ -38,6 +50,14 @@ rm_global_planner:
     path_prune_enabled: false
     prune_segment_max_cost: 55
     path_resample_distance: 0.18
+    # 语义地图：隧道格的轴线用来在洞内给「偏离轴线」加代价。收不到这个话题时 A*
+    # 退回纯几何行为（隧道被当普通空地），不报错。
+    semantic_map_topic: /map_server/semantic_map
+    # 洞内偏离轴线的代价权重：每步加 w * (1 - |cos θ|)。洞只比车稍宽，横向余量很小，
+    # 斜着走一格就贴壁，所以要把路径压到轴线上。
+    #
+    # 是软代价而不是硬性禁止斜步：车体是圆柱，朝向不影响能不能过。设 0 关闭。
+    tunnel_axis_cost_weight: 2.0
 
 rm_global_costmap:
   ros__parameters:
@@ -45,6 +65,9 @@ rm_global_costmap:
     global_frame: map
     robot_base_frame: base_link_fake
     map_topic: /map
+    # 语义地图：隧道格的净高用来在点云高度判定里放过顶板，净宽用来把该格的膨胀
+    # 半径压到通道容得下的值。没收到这个话题时行为退回纯几何，不会报错。
+    semantic_map_topic: /map_server/semantic_map
     pointcloud_topic: /segmentation/obstacle
     costmap_topic: /global_costmap/costmap
     raw_costmap_topic: /global_costmap/costmap_raw
@@ -65,6 +88,16 @@ rm_global_costmap:
     # bringup/config/navigation2.yaml，两份配置必须保持一致。
     obstacle_z_min_to_robo: 0.1
     obstacle_z_max_to_robo: 2.0
+    # 隧道本体内的上限，同样相对底盘。压到 0.20 是为了把顶板和侧壁的上半段滤掉，
+    # 否则洞口会被涂成致命格、规划器看不到唯一的通路。
+    #
+    # 为什么不用 TunnelSpec 里的净高：净高是从地面量的，这个阈值相对 base_link，
+    # 两者差一个底盘离地偏置。宁可给一个偏保守的固定值，也不要拿量纲不同的量
+    # 硬凑 —— 算高了顶板就滤不掉，洞口照旧封死。净高只用来告诉电控要收多低。
+    #
+    # 代价是洞里高于 0.20 的矮障碍会被当成隧道结构放过。隧道净空本来就不高，
+    # 这个高度上真有东西的话车也过不去，所以先按结构处理。
+    tunnel_obstacle_z_max_to_robo: 0.20
     transform_tolerance: 0.2
     observation_timeout: 1.0
     reuse_previous_grid: true
@@ -84,6 +117,15 @@ rm_minco_path_smoother:
     penalty_mu: 0.4           # Smoothed L1 惩罚函数的 μ 参数
     enable_optimization: true # 是否启用优化
 
+    # 语义地图：隧道格的轴线用来在洞内给「偏离轴线」加软代价。收不到这个话题或图里
+    # 没隧道时对齐项自动失效，退回纯几何平滑。
+    semantic_map_topic: /map_server/semantic_map
+    # 隧道内偏离轴线的软代价权重：每段加 w * (1 - |cos θ|)。A* 出的路已经沿轴，这一项
+    # 防止平滑阶段在洞口把对着洞的走向拧成斜切。洞只比车稍宽，斜一点就贴壁。
+    #
+    # 软代价而非硬约束：车是圆柱，朝向不影响能不能过，偏轴只是该少走。设 0 关闭。
+    tunnel_axis_weight: 5.0
+
     # 时间分配参数
     default_velocity: 1.5     # 默认速度（用于计算段时间）
     min_segment_time: 0.1     # 最小段时间（秒）
@@ -93,8 +135,17 @@ rm_minco_path_smoother:
     esdf_height: 2.0          # ESDF 地图高度（米）
     esdf_resolution: 0.05     # ESDF 分辨率（米）
 
-    # 机器人外形（多边形顶点，单位：米）
-    robot_footprint: [-0.3, -0.25, 0.3, -0.25, 0.3, 0.25, -0.3, 0.25]
+    # 机器人外形（多边形顶点，单位：米）。
+    #
+    # 车体是圆柱（半径 0.25，见 bringup/urdf/*.xacro），这里用正八边形逼近 ——
+    # RC-ESDF 要的是多边形。顶点在半径 0.27 上、边中点在 0.25，即外接八边形：
+    # 宁可略微高估车体，也不要在洞里低估。
+    #
+    # 别退回成矩形：原来的 [±0.3, ±0.25] 在车头方向多算了 5 cm，而洞只比车稍宽，
+    # 这 5 cm 会让 MINCO 以为洞里塞不进去。
+    robot_footprint: [
+      0.25, 0.104, 0.104, 0.25, -0.104, 0.25, -0.25, 0.104,
+      -0.25, -0.104, -0.104, -0.25, 0.104, -0.25, 0.25, -0.104]
 
 rm_local_costmap:
   ros__parameters:
@@ -103,6 +154,9 @@ rm_local_costmap:
     robot_base_frame: base_link_fake
     scan_topic: /scan
     pointcloud_topic: /segmentation/obstacle
+    # 语义地图：隧道格的净高用来在点云高度判定里放过顶板，净宽用来把该格的膨胀
+    # 半径压到通道容得下的值。没收到这个话题时行为退回纯几何，不会报错。
+    semantic_map_topic: /map_server/semantic_map
     costmap_topic: /local_costmap/costmap
     raw_costmap_topic: /local_costmap/costmap_raw
     footprint_topic: /local_costmap/published_footprint
@@ -123,6 +177,9 @@ rm_local_costmap:
     # 同上。局部图管避障，下界取更小的 0.05 以少漏矮障碍，但仍为正值。
     obstacle_z_min_to_robo: 0.05
     obstacle_z_max_to_robo: 2.0
+    # 隧道本体内的上限，语义见 rm_global_costmap 里的同名参数。两边必须一致：
+    # 只在一边放行会让全局规划出的路在局部层被判为撞墙。
+    tunnel_obstacle_z_max_to_robo: 0.20
     transform_tolerance: 0.2
     observation_timeout: 2.0
     snap_origin_to_grid: true
@@ -180,6 +237,11 @@ rm_mpc_controller:
     path_topic: /plan
     odom_topic: /Odometry
     cmd_vel_topic: /cmd_vel_nav_raw
+    # 云台收放。rm_tunnel_posture 在进洞前把 posture_topic 置真，serial_driver 把电控
+    # 回传的实测姿态发到 posture_state_topic。请求「收下来」而实测还没变成「低」时，本
+    # 节点停车等 —— 云台立着进洞会撞在顶板上，停着等的代价只是不动。
+    gimbal.posture_topic: /gimbal_posture
+    gimbal.posture_state_topic: /gimbal_posture_state
     control_fps: 30.0
     expected_speed: 1.5
     goal_tolerance: 0.2
@@ -208,3 +270,35 @@ rm_mpc_controller:
     local_safety.check_steps: 10
     local_safety.replan_topic: /navigation2/replan_request
     local_safety.replan_cooldown: 0.5
+    # 隧道限速窗口。洞内的参考速度按 TunnelSpec 的 [velocity_min, velocity_max] 夹：
+    # 洞里净空低、余量小，全速冲进去既危险、参考又不可跟踪。减速斜坡在进洞前就铺开，
+    # 不是洞口瞬间跳变。收不到语义地图或图里没隧道时静默失效。设 enable=false 关闭。
+    tunnel_speed_window.enable: true
+    semantic_map_topic: /map_server/semantic_map
+
+rm_tunnel_posture:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: map
+    robot_base_frame: base_link_fake
+    semantic_map_topic: /map_server/semantic_map
+    # 发给电控的收云台请求。true = 车即将进洞或正在洞里，云台必须收下来。
+    posture_topic: /gimbal_posture
+    # 判定频率。提前量是距离量（TunnelSpec.run_up），不是时间量，所以这里不需要跟
+    # 控制环同频；10 Hz 下 1.5 m/s 每帧走 0.15 m，相对 run_up 的余量足够。
+    update_frequency: 10.0
+    # 抬起云台要比落下多退这么多米才算离开隧道影响范围。
+    # 没有滞回时，标志位会在 run_up 边界上随定位噪声抖动，电控那边就是云台反复抬落。
+    hysteresis: 0.3
+
+rm_gimbal_visualizer:
+  ros__parameters:
+    use_sim_time: true
+    # 画在车体坐标系里，随车走。与 rm_tunnel_posture 用同一个 frame。
+    robot_base_frame: base_link_fake
+    # 实态 = 电控持续回传（serial_driver 转发电控，仿真里是 simulated_gimbal）。
+    posture_state_topic: /gimbal_posture_state
+    # 命令 = rm_tunnel_posture 发的切换请求，和实态并排显示，能看出执行延迟。
+    posture_topic: /gimbal_posture
+    # RViz MarkerArray 显示块订阅这个话题。
+    marker_topic: /gimbal_status

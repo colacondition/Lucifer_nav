@@ -12,6 +12,8 @@
 //   3. 前向扫描：从起点正推，限制加速度 max_tangential_accel。
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -45,6 +47,15 @@ public:
 
   const SpeedProfileParams & params() const noexcept { return params_; }
 
+  // 隧道限速窗口查询：给世界坐标，若落在隧道本体内写出该洞的 [vmin, vmax] 并返回
+  // true，否则返回 false。为空时不做隧道限速。窗口来自 TunnelSpec.velocity_*，
+  // 洞里净空低、余量小，全速冲进去既危险又会让 MPC 的参考不可跟踪。
+  void set_tunnel_window(
+    std::function<bool(const Eigen::Vector2d &, double &, double &)> query)
+  {
+    tunnel_window_ = std::move(query);
+  }
+
   // 路径变化时调用。PathReference 的几何方法已是 public，可以直接使用。
   void rebuild(const PathReference & ref, double max_speed)
   {
@@ -75,6 +86,32 @@ public:
         ? std::sqrt(std::max(params_.max_lateral_accel / kappa, 0.0))
         : max_speed;
       speeds_[i] = std::clamp(v_curve, params_.min_speed, max_speed);
+    }
+
+    // 步骤 1.5：隧道限速窗口。洞内的样本按 TunnelSpec 的 [vmin, vmax] 夹：vmax 压
+    // 住上限（洞里不许全速），vmin 抬住下限（洞里别爬得太慢，堵在里面更危险）。
+    //
+    // 必须在后向/前向扫描之前做：那两步会把「洞口要减到 vmax」这件事沿弧长向洞外
+    // 传播成一段平滑的减速斜坡，让车在进洞前就减到位，而不是在洞口瞬间跳变 ——
+    // 跳变的参考 MPC 跟不上，正是要避免的。
+    //
+    // vmin 会被后面的曲率/终点约束再压低（取 min），这是对的：弯太急或已到终点时
+    // 停得下来比守住洞内下限更重要，所以这里只在不与那些冲突时抬升。
+    if (tunnel_window_) {
+      for (int i = 0; i < n; ++i) {
+        const Eigen::Vector2d p = ref.pos_by_arc(samples_[i]);
+        double vmin = 0.0;
+        double vmax = 0.0;
+        if (!tunnel_window_(p, vmin, vmax)) {
+          continue;
+        }
+        if (vmax > 1e-6) {
+          speeds_[i] = std::min(speeds_[i], vmax);
+        }
+        if (vmin > 1e-6) {
+          speeds_[i] = std::max(speeds_[i], std::min(vmin, max_speed));
+        }
+      }
     }
 
     // 步骤 2：终点强制为零（如果启用），再后向扫描保证减速可达。
@@ -174,6 +211,8 @@ private:
   SpeedProfileParams params_;
   std::vector<double> samples_;
   std::vector<double> speeds_;
+  // 隧道限速窗口查询。为空时不做隧道限速。见 set_tunnel_window / rebuild 步骤 1.5。
+  std::function<bool(const Eigen::Vector2d &, double &, double &)> tunnel_window_;
 };
 
 }  // namespace navigation2::mpc

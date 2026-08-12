@@ -12,7 +12,7 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('navigation2')
 
     use_sim_time = LaunchConfiguration('use_sim_time')
-    map_yaml = LaunchConfiguration('map')
+    map_file = LaunchConfiguration('map')
     params_file = LaunchConfiguration('params_file')
     log_level = LaunchConfiguration('log_level')
     node_output = LaunchConfiguration('node_output')
@@ -33,7 +33,7 @@ def generate_launch_description():
             output=node_output,
             parameters=[params_file, {
                 'use_sim_time': use_sim_time,
-                'yaml_filename': map_yaml,
+                'map_filename': map_file,
             }],
             arguments=['--ros-args', '--log-level', log_level]),
     ])

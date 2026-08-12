@@ -14,6 +14,7 @@ struct MincoOptimizer::Impl
   lbfgs::lbfgs_parameter_t lbfgs_params_;
 
   std::function<bool(const Eigen::Vector2d &, double &, Eigen::Vector2d &)> esdf_query_;
+  std::function<bool(const Eigen::Vector2d &, Eigen::Vector2d &)> tunnel_axis_query_;
 
   // 优化过程中的临时变量
   int piece_num_{0};
@@ -103,6 +104,79 @@ struct MincoOptimizer::Impl
     return grad;
   }
 
+  // 隧道轴线对齐软代价，逐段累加。段 k 从 point(k) 走到 point(k+1)，若该段落在
+  // 隧道本体内，代价 = w * (1 - |cos θ|)，θ 是段走向与轴线的夹角。
+  //
+  // 为什么按段而不是按点：对齐约束的是「走向」，而走向是相邻两点之差，天然是段的
+  // 属性。梯度落到段两端的可优化点上（边界点固定，梯度被丢弃）。
+  //
+  // 双向取 |·|：隧道正进倒进等价（见 SemanticMap::axisAlignment）。
+  double attach_axis_functional(const Eigen::Matrix2Xd & in_ps, Eigen::Matrix2Xd & gradp) const
+    noexcept
+  {
+    const double w = params_.tunnel_axis_weight;
+    if (w <= 0.0 || !tunnel_axis_query_) {
+      return 0.0;
+    }
+    const int M = piece_num_ + 1;  // 总点数（含首尾）
+    if (M < 2) {
+      return 0.0;
+    }
+
+    // 取第 k 个点：0 是首、M-1 是尾（均固定），其余是 in_ps 的列（可优化）。
+    auto point_at = [&](int k) -> Eigen::Vector2d {
+      if (k == 0) {
+        return waypoints_.front();
+      }
+      if (k == M - 1) {
+        return waypoints_.back();
+      }
+      return in_ps.col(k - 1);
+    };
+
+    double cost_val = 0.0;
+    double c_cost = 0.0;
+
+    for (int k = 0; k < M - 1; ++k) {
+      const Eigen::Vector2d pa = point_at(k);
+      const Eigen::Vector2d pb = point_at(k + 1);
+
+      // 段落在洞里才算：查两端，任一端在本体内就用那端的轴线。直洞整条同轴，取哪端
+      // 都一样；进/出洞的段只有一端在洞内，必须用洞内那端，否则洞口段不受约束。
+      Eigen::Vector2d axis;
+      if (!tunnel_axis_query_(pa, axis) && !tunnel_axis_query_(pb, axis)) {
+        continue;
+      }
+
+      const Eigen::Vector2d d = pb - pa;
+      const double n = d.norm();
+      if (n < 1e-9) {
+        continue;
+      }
+      const Eigen::Vector2d u = d / n;
+      const double proj = u.dot(axis);       // = cos θ（axis 已归一化）
+      const double s = (proj >= 0.0) ? 1.0 : -1.0;
+
+      kahan_sum(cost_val, c_cost, w * (1.0 - std::abs(proj)));
+
+      // dcost/dd = -w * (s/n) * (axis - proj * u)，见推导：|cos θ| 对段向量的梯度
+      // 是轴线在垂直于走向方向上的分量。dd/dpb = +I，dd/dpa = -I。
+      const Eigen::Vector2d dcost_dd = -w * (s / n) * (axis - proj * u);
+      if (!dcost_dd.allFinite()) {
+        continue;
+      }
+      // 只有内部点（k 或 k+1 落在 [1, M-2]）进 gradp；边界点固定。
+      if (k >= 1 && k <= M - 2) {
+        gradp.col(k - 1).noalias() += -dcost_dd;   // 对 pa
+      }
+      if (k + 1 >= 1 && k + 1 <= M - 2) {
+        gradp.col(k).noalias() += dcost_dd;         // 对 pb
+      }
+    }
+
+    return cost_val;
+  }
+
   // 附加障碍物惩罚项到梯度
   double attach_penalty_functional(const Eigen::Matrix2Xd & in_ps, Eigen::Matrix2Xd & gradp) const noexcept
   {
@@ -185,6 +259,7 @@ struct MincoOptimizer::Impl
 
     cost_val += energy;
     cost_val += instance->attach_penalty_functional(in_ps, gradp);
+    cost_val += instance->attach_axis_functional(in_ps, gradp);
 
     Eigen::VectorXd g_full(2 * ctrl_num);
     g_full.setZero();
@@ -309,6 +384,12 @@ void MincoOptimizer::setEsdfQuery(
   std::function<bool(const Eigen::Vector2d &, double &, Eigen::Vector2d &)> query_fn)
 {
   impl_->esdf_query_ = query_fn;
+}
+
+void MincoOptimizer::setTunnelAxisQuery(
+  std::function<bool(const Eigen::Vector2d &, Eigen::Vector2d &)> query_fn)
+{
+  impl_->tunnel_axis_query_ = query_fn;
 }
 
 std::vector<Piece<5, 2>> MincoOptimizer::optimize(

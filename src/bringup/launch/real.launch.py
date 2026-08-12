@@ -68,7 +68,7 @@ def generate_launch_description():
         " if '", mode, "' == 'mapping' else ",
         "'", os.path.join(bringup_dir, 'rviz', 'navigation.rviz'), "'",
     ])
-    nav_map_yaml = [PathJoinSubstitution([bringup_dir, 'map', world]), '.yaml']
+    nav_map_file = [PathJoinSubstitution([bringup_dir, 'map', world]), '.msgpack']
     fast_location_pcd_path = ParameterValue(
         ['package://bringup/PCD/', world, '.pcd'], value_type=str)
 
@@ -221,7 +221,7 @@ def generate_launch_description():
         condition=LaunchConfigurationEquals('mode', 'nav'),
         launch_arguments={
             'use_sim_time': use_sim_time,
-            'map': nav_map_yaml,
+            'map': nav_map_file,
             'params_file': navigation_params,
             'start_map_server': 'True',
             'start_mpc_controller': 'True',

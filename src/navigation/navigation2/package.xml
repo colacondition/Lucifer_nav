@@ -26,6 +26,10 @@
   <depend>visualization_msgs</depend>
   <depend>builtin_interfaces</depend>
   <depend>osqp_vendor</depend>
+  <!-- 语义地图文件格式（msgpack.hpp 是 header-only，无需链接） -->
+  <depend>libmsgpack-dev</depend>
+  <!-- SemanticMap / TunnelSpec / ChassisMode 消息 -->
+  <depend>decision_interfaces</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

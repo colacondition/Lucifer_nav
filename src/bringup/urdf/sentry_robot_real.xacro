@@ -20,21 +20,27 @@
   <xacro:arg name="xyz" default="0.0 0.0 0.49" />
   <xacro:arg name="rpy" default="0.7854 0 0" />
   
+  <!-- 底盘是圆柱：朝向不影响能不能过隧道，只要对准洞口进去就行。半径跟导航参数里的
+       robot_radius 一致（config/navigation2.yaml），两处对不上会让实际能过的洞在
+       规划器看来过不去，或者反过来。 -->
+  <xacro:property name="radius_base" value="0.25" />
+  <xacro:property name="height_base" value="0.1" />
+
   <link name="base_link">
     <visual>
       <geometry>
-        <box size="0.2 .3 .1"/>
+        <cylinder length="${height_base}" radius="${radius_base}"/>
       </geometry>
-      <origin rpy="0 0 ${PI/2}" xyz="0 0 0.05"/>
+      <origin rpy="0 0 0" xyz="0 0 0.05"/>
       <material name="white">
         <color rgba="1 1 1 1"/>
       </material>
     </visual>
     <collision>
       <geometry>
-        <box size="0.2 .3 0.1"/>
+        <cylinder length="${height_base}" radius="${radius_base}"/>
       </geometry>
-      <origin rpy="0 0 ${PI/2}" xyz="0 0 0.05"/>
+      <origin rpy="0 0 0" xyz="0 0 0.05"/>
     </collision>
     <xacro:default_inertial mass="8.2"/>
   </link>

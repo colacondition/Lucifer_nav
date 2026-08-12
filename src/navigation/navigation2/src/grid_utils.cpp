@@ -23,6 +23,8 @@ struct InflationKernelEntry
   int dx{0};
   int dy{0};
   int8_t cost{0};
+  // 到核中心的物理距离（m）。逐格半径上限要拿它比，存下来省一次 hypot。
+  float distance{0.0F};
 };
 
 const std::vector<InflationKernelEntry> & getInflationKernel(
@@ -64,7 +66,8 @@ const std::vector<InflationKernelEntry> & getInflationKernel(
         -std::max(0.0, cost_scaling_factor) * std::max(0.0, distance));
       const int cost = std::clamp(
         static_cast<int>(std::round(1.0 + normalized * 98.0)), 1, 99);
-      cache.entries.push_back({dx, dy, static_cast<int8_t>(cost)});
+      cache.entries.push_back(
+        {dx, dy, static_cast<int8_t>(cost), static_cast<float>(distance)});
     }
   }
 
@@ -211,12 +214,15 @@ void inflateOccupancyGrid(
 
 void applyInflationCostGradient(
   nav_msgs::msg::OccupancyGrid & grid, double inflation_radius, int occupied_threshold,
-  double cost_scaling_factor)
+  double cost_scaling_factor, const std::vector<float> & radius_limit)
 {
   // 用距离衰减给障碍周围铺代价梯度。
   if (inflation_radius <= 0.0 || grid.info.resolution <= 0.0F || grid.data.empty()) {
     return;
   }
+
+  // 逐格半径上限：长度对不上就当没传，而不是索引越界。
+  const bool use_limit = radius_limit.size() == grid.data.size();
 
   const int radius_cells =
     static_cast<int>(std::ceil(inflation_radius / static_cast<double>(grid.info.resolution)));
@@ -250,6 +256,12 @@ void applyInflationCostGradient(
 
       const auto nidx = gridIndex(grid, nx, ny);
       if (grid.data[nidx] >= occupied_threshold || grid.data[nidx] < 0) {
+        continue;
+      }
+
+      // 上限挂在「被膨胀到的格」上而不是障碍格上：隧道格只接受近处障碍的代价，
+      // 洞外的墙不该把洞里涂满。壁面格自己仍然是致命的，不走这条路径。
+      if (use_limit && entry.distance > radius_limit[nidx]) {
         continue;
       }
 

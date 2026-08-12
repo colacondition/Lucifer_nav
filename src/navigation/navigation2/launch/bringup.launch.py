@@ -14,7 +14,7 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('navigation2')
 
     use_sim_time = LaunchConfiguration('use_sim_time')
-    map_yaml = LaunchConfiguration('map')
+    map_file = LaunchConfiguration('map')
     params_file = LaunchConfiguration('params_file')
     start_map_server = LaunchConfiguration('start_map_server')
     start_global_planner = LaunchConfiguration('start_global_planner')
@@ -25,6 +25,8 @@ def generate_launch_description():
     start_goal_approach_controller = LaunchConfiguration('start_goal_approach_controller')
     start_velocity_smoother = LaunchConfiguration('start_velocity_smoother')
     start_nav2_compat = LaunchConfiguration('start_nav2_compat')
+    start_tunnel_posture = LaunchConfiguration('start_tunnel_posture')
+    start_gimbal_visualizer = LaunchConfiguration('start_gimbal_visualizer')
     container_name = LaunchConfiguration('container_name')
 
     common_params = [params_file, {'use_sim_time': use_sim_time}]
@@ -71,13 +73,15 @@ def generate_launch_description():
         DeclareLaunchArgument('start_goal_approach_controller', default_value='true'),
         DeclareLaunchArgument('start_velocity_smoother', default_value='true'),
         DeclareLaunchArgument('start_nav2_compat', default_value='true'),
+        DeclareLaunchArgument('start_tunnel_posture', default_value='true'),
+        DeclareLaunchArgument('start_gimbal_visualizer', default_value='true'),
         DeclareLaunchArgument('container_name', default_value='nav_container'),
 
         container,
 
         nav_component(
             'navigation2::RmMapServer', 'rm_map_server', start_map_server,
-            {'yaml_filename': map_yaml}),
+            {'map_filename': map_file}),
         nav_component('navigation2::RmGlobalCostmap', 'rm_global_costmap', start_global_costmap),
         nav_component('navigation2::RmGlobalPlanner', 'rm_global_planner', start_global_planner),
         nav_component('navigation2::RmMincoPathSmoother', 'rm_minco_path_smoother', start_path_smoother),
@@ -86,6 +90,13 @@ def generate_launch_description():
         nav_component('navigation2::RmVelocitySmoother', 'rm_velocity_smoother',
                       start_velocity_smoother),
         nav_component('navigation2::RmNav2Compat', 'rm_nav2_compat', start_nav2_compat),
+        # 隧道云台请求：图里没有隧道时它只是每 0.1 s 发一个 false，成本可忽略，
+        # 所以默认开着 —— 忘记开的代价是云台撞在顶板上。
+        nav_component('navigation2::RmTunnelPosture', 'rm_tunnel_posture', start_tunnel_posture),
+        # 云台状态可视化：只读电控回传和请求，不碰控制，纯显示。实车仿真都要看，
+        # 默认开。忘开的代价只是 RViz 里看不到云台状态，不影响行驶。
+        nav_component('navigation2::RmGimbalVisualizer', 'rm_gimbal_visualizer',
+                      start_gimbal_visualizer),
 
         # goal_approach_controller lives in its own package (PCL-free, separate deps)
         # but composes into the same container.

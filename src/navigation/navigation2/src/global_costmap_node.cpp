@@ -1,14 +1,17 @@
 #include "grid_utils.hpp"
+#include "semantic_map_consumer.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <decision_interfaces/msg/semantic_map.hpp>
 #include <geometry_msgs/msg/polygon_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -39,6 +42,29 @@ public:
       [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
         latest_map_ = std::move(msg);
         publishCostmap();
+      });
+
+    // 语义地图和 /map 同源同 QoS（都由 rm_map_server 用 transient_local 发一次），
+    // 所以不需要时间同步 —— 两者要么都收到，要么这张地图根本没加载。
+    semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
+      semantic_map_topic_, map_qos,
+      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+        try {
+          // rm_map_server 每秒重发同一张图兜底，内容没变时 update 直接返回 false，
+          // 不重建方向场也不动逐格半径缓存。
+          if (!receiver_.update(*msg)) {
+            return;
+          }
+        } catch (const std::exception & ex) {
+          // 拒收整帧而不是凑合用：通道长度对不上意味着格号可能整体错位，会在错误的
+          // 位置放过顶板点云。已持有的上一张好图保持不变。
+          RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
+          return;
+        }
+        RCLCPP_INFO(
+          get_logger(), "Global costmap got semantic map: %zu tunnels",
+          receiver_.map().tunnels().size());
+        inflation_radius_limit_.clear();
       });
 
     // 点云和激光都可作为全局障碍输入。
@@ -92,6 +118,8 @@ private:
     global_frame_ = declare_parameter<std::string>("global_frame", "map");
     robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "base_link_fake");
     map_topic_ = declare_parameter<std::string>("map_topic", "/map");
+    semantic_map_topic_ =
+      declare_parameter<std::string>("semantic_map_topic", "/map_server/semantic_map");
     pointcloud_topic_ =
       declare_parameter<std::string>("pointcloud_topic", "/segmentation/obstacle");
     costmap_topic_ = declare_parameter<std::string>("costmap_topic", "/global_costmap/costmap");
@@ -118,6 +146,10 @@ private:
     // map 系的 z=0 是雷达平面不是地面，详见 local_costmap_node.cpp 里的说明。
     obstacle_z_min_to_robo_ = declare_parameter<double>("obstacle_z_min_to_robo", 0.1);
     obstacle_z_max_to_robo_ = declare_parameter<double>("obstacle_z_max_to_robo", 2.0);
+    // 隧道本体内的高度带上限，同样相对底盘。语义与 local_costmap_node.cpp 的同名
+    // 参数一致，两边必须一起改。
+    tunnel_obstacle_z_max_to_robo_ =
+      declare_parameter<double>("tunnel_obstacle_z_max_to_robo", 0.20);
     transform_tolerance_ = declare_parameter<double>("transform_tolerance", 0.2);
     observation_timeout_ = declare_parameter<double>("observation_timeout", 1.0);
     reuse_previous_grid_ = declare_parameter<bool>("reuse_previous_grid", true);
@@ -254,6 +286,25 @@ private:
     }
   }
 
+  // 该点所在位置允许的最大障碍高度（相对底盘）。
+  //
+  // 隧道顶板和侧壁在点云里跟墙没有区别，照常规高度带（上限 2 m）判定会把整个洞口
+  // 涂成致命格，规划器彻底看不到通路。所以在隧道本体内把上限压低：顶板在阈值之上，
+  // 被滤掉；洞里真有个箱子的话仍然在阈值之下，照常标为障碍 —— 这不是「隧道内不看
+  // 点云」，只是不把隧道自己的结构当障碍。
+  //
+  // 阈值用独立参数而不是 TunnelSpec::clear_height：净高是从地面量的，而这里的高度
+  // 相对 base_link，两者差一个未知的底盘离地偏置。直接拿净高当阈值等于默认这个偏置
+  // 为 0，错的方向恰好是危险的那一侧（阈值偏高 → 顶板没被滤掉 → 洞口照旧封死）。
+  // clear_height 只用来告诉电控要收多低。
+  double tunnelHeightLimit(double world_x, double world_y) const
+  {
+    if (tunnelSpecAtPoint(receiver_.map(), world_x, world_y) == nullptr) {
+      return std::numeric_limits<double>::infinity();
+    }
+    return tunnel_obstacle_z_max_to_robo_;
+  }
+
   void processPointCloud(
     nav_msgs::msg::OccupancyGrid & grid,
     std::vector<geometry_msgs::msg::Point> & marked_points,
@@ -310,6 +361,9 @@ private:
         if (height_to_robo < obstacle_z_min_to_robo_ ||
           height_to_robo > obstacle_z_max_to_robo_)
         {
+          continue;
+        }
+        if (height_to_robo > tunnelHeightLimit(point.x, point.y)) {
           continue;
         }
 
@@ -383,6 +437,20 @@ private:
     return cloud;
   }
 
+  // 逐格膨胀半径上限，按需算一次就缓存：全局栅格是静态的（origin/尺寸跟 /map 一样
+  // 不动），只有换地图时才需要重算，而换地图会清掉缓存。
+  const std::vector<float> & inflationRadiusLimit(const nav_msgs::msg::OccupancyGrid & grid)
+  {
+    if (!inflation_radius_limit_.empty() &&
+      inflation_radius_limit_.size() == grid.data.size())
+    {
+      return inflation_radius_limit_;
+    }
+    inflation_radius_limit_ =
+      makeInflationRadiusLimit(grid, receiver_.map(), inflation_radius_, robot_radius_);
+    return inflation_radius_limit_;
+  }
+
   void publishCostmap()
   {
     if (!latest_map_) {
@@ -431,7 +499,8 @@ private:
 
     auto inflated_grid = raw_grid;
     applyInflationCostGradient(
-      inflated_grid, inflation_radius_, occupied_threshold_, inflation_cost_scaling_factor_);
+      inflated_grid, inflation_radius_, occupied_threshold_, inflation_cost_scaling_factor_,
+      inflationRadiusLimit(raw_grid));
     inflated_grid.header.stamp = now_time;
     costmap_pub_->publish(inflated_grid);
   }
@@ -439,6 +508,7 @@ private:
   std::string global_frame_;
   std::string robot_base_frame_;
   std::string map_topic_;
+  std::string semantic_map_topic_;
   std::string pointcloud_topic_;
   std::string costmap_topic_;
   std::string raw_costmap_topic_;
@@ -457,6 +527,7 @@ private:
   double obstacle_max_range_{3.0};
   double obstacle_z_min_to_robo_{0.1};
   double obstacle_z_max_to_robo_{2.0};
+  double tunnel_obstacle_z_max_to_robo_{0.20};
   double transform_tolerance_{0.2};
   double observation_timeout_{1.0};
   bool reuse_previous_grid_{true};
@@ -466,8 +537,13 @@ private:
   sensor_msgs::msg::LaserScan::SharedPtr latest_scan_;
   sensor_msgs::msg::PointCloud2::SharedPtr latest_pointcloud_;
   std::optional<nav_msgs::msg::OccupancyGrid> previous_raw_grid_;
+  // 没收到语义地图时 receiver_.map() 是空图（valid() == false），所有隧道查询退化成
+  // 「没有隧道」，行为与改动前完全一致。
+  SemanticMapReceiver receiver_;
+  std::vector<float> inflation_radius_limit_;
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+  rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr raw_costmap_pub_;

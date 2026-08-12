@@ -1,13 +1,16 @@
 #include "grid_utils.hpp"
+#include "semantic_map_consumer.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <decision_interfaces/msg/semantic_map.hpp>
 #include <geometry_msgs/msg/polygon_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -48,6 +51,27 @@ public:
         });
     }
 
+    // 语义地图：局部代价地图自己不加载 /map，但隧道顶板必须在这里也被滤掉 ——
+    // 局部图才是 MPC 的碰撞依据，只在全局图上放行等于让车看见洞口却撞在顶板上。
+    semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
+      semantic_map_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
+      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+        try {
+          // 内容没变就不重建 —— rm_map_server 每秒重发一次，重建 RMUC 大小的方向场
+          // 要 16 万次三角函数，而这个节点和 MPC 共用执行器。
+          if (!receiver_.update(*msg)) {
+            return;
+          }
+        } catch (const std::exception & ex) {
+          // 拒收整帧，保留上一张好图。半张图会让隧道格错位到别的位置。
+          RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
+          return;
+        }
+        RCLCPP_INFO(
+          get_logger(), "Local costmap got semantic map: %zu tunnels",
+          receiver_.map().tunnels().size());
+      });
+
     // 输出栅格给规划器和控制器。
     auto costmap_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
     costmap_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>(costmap_topic_, costmap_qos);
@@ -79,6 +103,8 @@ private:
     robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "base_link_fake");
     scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
     pointcloud_topic_ = declare_parameter<std::string>("pointcloud_topic", "/segmentation/obstacle");
+    semantic_map_topic_ =
+      declare_parameter<std::string>("semantic_map_topic", "/map_server/semantic_map");
     costmap_topic_ = declare_parameter<std::string>("costmap_topic", "/local_costmap/costmap");
     raw_costmap_topic_ =
       declare_parameter<std::string>("raw_costmap_topic", "/local_costmap/costmap_raw");
@@ -107,6 +133,10 @@ private:
     // bottom_z_to_robo_z / top_z_to_robo_z。
     obstacle_z_min_to_robo_ = declare_parameter<double>("obstacle_z_min_to_robo", 0.05);
     obstacle_z_max_to_robo_ = declare_parameter<double>("obstacle_z_max_to_robo", 2.0);
+    // 隧道本体内的高度带上限，同样相对底盘。语义与 global_costmap_node.cpp 的同名
+    // 参数一致，两边必须一起改。
+    tunnel_obstacle_z_max_to_robo_ =
+      declare_parameter<double>("tunnel_obstacle_z_max_to_robo", 0.20);
     transform_tolerance_ = declare_parameter<double>("transform_tolerance", 0.2);
     observation_timeout_ = declare_parameter<double>("observation_timeout", 0.5);
     snap_origin_to_grid_ = declare_parameter<bool>("snap_origin_to_grid", true);
@@ -623,6 +653,20 @@ private:
     }
   }
 
+  // 该点所在位置允许的最大障碍高度（相对底盘）。隧道本体内压到
+  // tunnel_obstacle_z_max_to_robo_，把顶板滤掉；该阈值以下的真障碍照常标记。
+  //
+  // 阈值不取 TunnelSpec::clear_height：净高从地面量，这里的高度相对 base_link，
+  // 差一个未知的底盘离地偏置。语义与 global_costmap_node.cpp 的同名函数一致，两边
+  // 必须一起改 —— 只在一边放行会让全局规划出的路在局部层被判为撞墙。
+  double tunnelHeightLimit(double world_x, double world_y) const
+  {
+    if (tunnelSpecAtPoint(receiver_.map(), world_x, world_y) == nullptr) {
+      return std::numeric_limits<double>::infinity();
+    }
+    return tunnel_obstacle_z_max_to_robo_;
+  }
+
   void processPointCloud(
     nav_msgs::msg::OccupancyGrid & grid,
     std::vector<geometry_msgs::msg::Point> & marked_points,
@@ -674,6 +718,9 @@ private:
         if (height_to_robo < obstacle_z_min_to_robo_ ||
           height_to_robo > obstacle_z_max_to_robo_)
         {
+          continue;
+        }
+        if (height_to_robo > tunnelHeightLimit(point.x, point.y)) {
           continue;
         }
         int map_x = 0;
@@ -801,8 +848,11 @@ private:
     }
 
     auto inflated_grid = raw_grid;
+    // 局部栅格跟车滚动，origin 每帧都变，逐格上限不能跨帧缓存。地图里没有隧道时
+    // makeInflationRadiusLimit 直接返回空，不用逐格扫。
     applyInflationCostGradient(
-      inflated_grid, inflation_radius_, 50, inflation_cost_scaling_factor_);
+      inflated_grid, inflation_radius_, 50, inflation_cost_scaling_factor_,
+      makeInflationRadiusLimit(raw_grid, receiver_.map(), inflation_radius_, robot_radius_));
     markRobotFootprintFree(inflated_grid, robot_transform);
     previous_inflated_grid_ = inflated_grid;
 
@@ -821,6 +871,7 @@ private:
   std::string robot_base_frame_;
   std::string scan_topic_;
   std::string pointcloud_topic_;
+  std::string semantic_map_topic_;
   std::string costmap_topic_;
   std::string raw_costmap_topic_;
   std::string footprint_topic_;
@@ -840,6 +891,7 @@ private:
   double obstacle_max_range_{6.0};
   double obstacle_z_min_to_robo_{0.05};
   double obstacle_z_max_to_robo_{2.0};
+  double tunnel_obstacle_z_max_to_robo_{0.20};
   double transform_tolerance_{0.2};
   double observation_timeout_{0.5};
   bool snap_origin_to_grid_{true};
@@ -856,7 +908,11 @@ private:
   std::optional<nav_msgs::msg::OccupancyGrid> previous_raw_grid_;
   std::optional<nav_msgs::msg::OccupancyGrid> previous_inflated_grid_;
   std::optional<builtin_interfaces::msg::Time> last_processed_observation_stamp_;
+  // 未收到语义地图时 receiver_.map() 是空图，隧道查询全部退化成「没有隧道」，
+  // 行为与改动前一致。
+  SemanticMapReceiver receiver_;
 
+  rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_pub_;

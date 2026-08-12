@@ -78,7 +78,7 @@ config/navigation2.yaml                      导航参数（launch 实际加载�
 config/fast_location_main.yaml               定位参数
 config/{simulation,reality}/                 分环境的外参、分割、LIO 参数
 urdf/sentry_robot_{sim,real}.xacro            机器人模型
-map/<world>.{pgm,yaml}                       代价地图
+map/<world>.msgpack                          语义地图（唯一真源，/map 由它生成）
 PCD/<world>.pcd                              fast_location 的先验点云图
 rviz/navigation.rviz                         nav 模式（Fixed Frame = map）
 rviz/mapping.rviz                            mapping 模式（Fixed Frame = world）
@@ -161,6 +161,25 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/cm
 ```sh
 ros2 launch bringup real.launch.py world:=RMUL mode:=mapping nav_rviz:=True
 ```
+
+建好的点云在 `PCD/<world>.pcd`。
+
+### 4.2.1 由点云生成语义地图
+
+`rm_map_server` 只读 `map/<world>.msgpack`：`/map` 占据栅格由其中 `terrain` 通道的
+OBSTACLE 格推导，隧道等「能站但要摆姿态才能进」的先验也存在同一张图里。
+
+```sh
+# 1) 点云直接转 msgpack（三态 terrain：障碍 / 空地 / 未知，隧道格留空）
+ros2 run bringup pcd_to_navmap.py PCD/RMUL.pcd -o map/RMUL.msgpack
+
+# 2) 人工标注：补激光扫不到的围栏、删观众席噪点，把通道标成隧道并画轴线
+ros2 run bringup semantic_map_editor.py map/RMUL.msgpack
+```
+
+隧道靠人工标：点云里顶板/横梁和墙没有区别，几何上分不出「能钻过去」。编辑器里把
+通道格刷成 TUNNEL、用「隧道轴线」工具画出轴向（无向，正反等价），并给每条隧道填
+净高/净宽/限速。保存前会按 C++ 加载器的同一套不变量自检，坏图直接拒绝写出。
 
 ### 4.3 导航
 

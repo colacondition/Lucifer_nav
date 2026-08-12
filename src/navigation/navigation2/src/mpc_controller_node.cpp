@@ -22,8 +22,13 @@
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 
+#include <decision_interfaces/msg/gimbal_posture.hpp>
+#include <decision_interfaces/msg/gimbal_posture_state.hpp>
+#include <decision_interfaces/msg/semantic_map.hpp>
+
 #include "local_path_safety.hpp"
 #include "rc_esdf.h"
+#include "semantic_map_consumer.hpp"
 #include "mpc/mpc_solver.hpp"
 #include "mpc/path_reference.hpp"
 #include "mpc/progress_monitor.hpp"
@@ -134,6 +139,12 @@ public:
     // rm_velocity_smoother 以 smoothing_frequency 无条件定频发布，所以这条流
     // 是连续的：超时意味着下游真的停了，而不是「本来就没有指令」。
     executed_cmd_timeout_ = declare_parameter<double>("feedback.executed_cmd_timeout", 0.3);
+    // 云台收放：rm_tunnel_posture 发请求，serial_driver 转发电控回传的实测姿态。
+    // 请求「收下来」而回传还没变成「低」时，本节点停车等 —— 判据见 control()。
+    gimbal_posture_topic_ = declare_parameter<std::string>(
+      "gimbal.posture_topic", "/gimbal_posture");
+    gimbal_posture_state_topic_ = declare_parameter<std::string>(
+      "gimbal.posture_state_topic", "/gimbal_posture_state");
     // 本节点发非零、下游却持续为零，说明指令被覆写。持续这么久才报，避开
     // velocity_smoother 的正常加速爬坡（4.0 m/s² @ 20 Hz，0→1.5 m/s 约 0.375 s）。
     override_detect_time_ = declare_parameter<double>("feedback.override_detect_time", 1.0);
@@ -207,6 +218,25 @@ public:
       speed_profile_.configure(sp_params);
     }
 
+    // 隧道限速窗口：速度剖面在洞内的样本按 TunnelSpec 的 [vmin, vmax] 夹。收不到
+    // 语义地图或图里没隧道时 tunnelSpecAtPoint 返回 nullptr，窗口不生效。
+    tunnel_speed_window_enabled_ = declare_parameter<bool>("tunnel_speed_window.enable", true);
+    semantic_map_topic_ = declare_parameter<std::string>(
+      "semantic_map_topic", "/map_server/semantic_map");
+    if (tunnel_speed_window_enabled_) {
+      speed_profile_.set_tunnel_window(
+        [this](const Eigen::Vector2d & p, double & vmin, double & vmax) {
+          std::lock_guard<std::mutex> lk(map_mutex_);
+          const TunnelSpec * spec = tunnelSpecAtPoint(receiver_.map(), p.x(), p.y());
+          if (spec == nullptr) {
+            return false;
+          }
+          vmin = spec->velocity_min;
+          vmax = spec->velocity_max;
+          return true;
+        });
+    }
+
     // 恢复链参数。车贴到障碍上后规划器起点检查过不了，必须先物理脱困再
     // 重规划，否则会陷入「停车 -> 请求重规划 -> 起点不可行 -> 继续停车」。
     recovery_enabled_ = declare_parameter<bool>("recovery.enable", true);
@@ -261,19 +291,27 @@ public:
     esdf_enabled_       = declare_parameter<bool>("esdf.enable", false);
     esdf_safety_margin_ = declare_parameter<double>("esdf.safety_margin", 0.04);
     esdf_check_steps_   = declare_parameter<int>("esdf.check_steps", 5);
-    const double esdf_length = declare_parameter<double>("esdf.robot_length", 0.60);
-    const double esdf_width  = declare_parameter<double>("esdf.robot_width",  0.45);
+    // 车体是圆柱（半径见 bringup/urdf/*.xacro 的 radius_base）。原来这里是
+    // 0.60×0.45 的矩形，那是旧的方形车。隧道只比车稍宽，圆柱在洞里转任何角度都
+    // 能过，可矩形一转就会把 0.3 m 长的车头戳进侧壁 —— 而侧壁在 /segmentation/
+    // obstacle 里照常有点（那条点云不按隧道净高滤顶板/侧壁），于是 esdfPathSafe
+    // 会在唯一的通路里误判碰撞、把车打进恢复。用圆柱足迹这个误判才不会发生。
+    const double esdf_radius = declare_parameter<double>("esdf.robot_radius", 0.25);
     esdf_obstacle_topic_ = declare_parameter<std::string>(
       "esdf.obstacle_topic", "/segmentation/obstacle");
 
     if (esdf_enabled_) {
       // 地图留足车身周围空间。
-      const double map_half = std::max(esdf_length, esdf_width) + 0.5;
+      const double map_half = esdf_radius + 0.5;
       esdf_map_.initialize(map_half * 2.0, map_half * 2.0, 0.02);
-      const double hl = esdf_length / 2.0;
-      const double hw = esdf_width  / 2.0;
+      // 用正八边形外接圆逼近圆柱：RC-ESDF 要多边形。边中点在半径上、顶点在
+      // r/cos(π/8) 上，即外接八边形 —— 宁可略微高估车体，也不要在洞里低估。
+      // 与 MINCO 的 robot_footprint 用同一套逼近（params/navigation2.yaml）。
+      const double t = esdf_radius * std::tan(M_PI / 8.0);
+      const double r = esdf_radius;
       esdf_map_.generateFromPolygon({
-        { hl,  hw}, {-hl,  hw}, {-hl, -hw}, { hl, -hw}});
+        { r,  t}, { t,  r}, {-t,  r}, {-r,  t},
+        {-r, -t}, {-t, -r}, { t, -r}, { r, -t}});
       esdf_obstacle_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         esdf_obstacle_topic_, rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
@@ -281,9 +319,8 @@ public:
           latest_esdf_obstacle_ = std::move(msg);
         });
       RCLCPP_INFO(get_logger(),
-        "RC-ESDF enabled: footprint=%.2fx%.2f m  margin=%.3f m  steps=%d  obstacle=%s",
-        esdf_length, esdf_width, esdf_safety_margin_,
-        esdf_check_steps_, esdf_obstacle_topic_.c_str());
+        "RC-ESDF enabled: cylinder r=%.2f m  margin=%.3f m  steps=%d  obstacle=%s",
+        esdf_radius, esdf_safety_margin_, esdf_check_steps_, esdf_obstacle_topic_.c_str());
     }
 
     mpc::MpcParams mp;
@@ -353,6 +390,39 @@ public:
         last_executed_cmd_time_ = now();
       });
 
+    // 云台收放的请求与实测。两条都订：请求告诉我们「要不要等」，实测告诉我们「等到了没」。
+    // 只看请求会在云台还立着的时候就放车走；只看实测则分不清「云台是高的」和「本来就该是高的」。
+    const auto posture_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+    gimbal_posture_sub_ = create_subscription<decision_interfaces::msg::GimbalPosture>(
+      gimbal_posture_topic_, posture_qos,
+      [this](decision_interfaces::msg::GimbalPosture::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        gimbal_lower_requested_ = msg->lower;
+      });
+    gimbal_posture_state_sub_ = create_subscription<decision_interfaces::msg::GimbalPostureState>(
+      gimbal_posture_state_topic_, posture_qos,
+      [this](decision_interfaces::msg::GimbalPostureState::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        gimbal_lowered_ = msg->lowered;
+        has_gimbal_state_ = true;
+      });
+
+    // 语义地图：只用来查隧道限速窗口。同源同 QoS（transient_local），收不到时
+    // 窗口静默失效。整帧不自洽时保留上一张好图。
+    if (tunnel_speed_window_enabled_) {
+      const auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+      semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
+        semantic_map_topic_, map_qos,
+        [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+          std::lock_guard<std::mutex> lk(map_mutex_);
+          try {
+            receiver_.update(*msg);
+          } catch (const std::exception & ex) {
+            RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
+          }
+        });
+    }
+
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(cmd_vel_topic_, rclcpp::QoS(1));
     cmd_norm_pub_ = create_publisher<std_msgs::msg::Float64>("/cmd_vel_norm", rclcpp::QoS(1));
     predict_path_pub_ = create_publisher<nav_msgs::msg::Path>("predict_path", rclcpp::QoS(1));
@@ -420,6 +490,9 @@ private:
     bool goal_changed;
     double executed_speed;
     std::optional<rclcpp::Time> executed_stamp;
+    bool gimbal_lower_requested;
+    bool gimbal_lowered;
+    bool has_gimbal_state;
     {
       std::lock_guard<std::mutex> lk(mtx_);
       ready = has_path_ && has_odom_;
@@ -432,6 +505,9 @@ private:
       goal_changed_ = false;
       executed_speed = executed_speed_;
       executed_stamp = last_executed_cmd_time_;
+      gimbal_lower_requested = gimbal_lower_requested_;
+      gimbal_lowered = gimbal_lowered_;
+      has_gimbal_state = has_gimbal_state_;
     }
 
     // 控制周期实测值。定时器抖动、以及仿真时钟下 wall timer 与 /clock 的
@@ -513,6 +589,29 @@ private:
       publishStop();
       // 没有路径/里程计时车本来就不该动，不能算无进展。
       progress_monitor_.reset();
+      return;
+    }
+
+    // 等云台真的收下来再走。请求「收下来」而回传还是「高」，就停在原地。
+    //
+    // 电控的执行是可信的，这里不做重试、不设超时 —— 这个门只是在等那一小段动作时间。
+    // 提前量（run_up）是按距离给的，正常情况下车走到洞口之前回传早就翻过来了，一帧都不会停。
+    //
+    // 「还没收到过任何回传」这种情况不需要单独判：gimbal_lowered_ 的初值就是 false，所以
+    // 电控没起来、回传帧没实现、串口没插，一律落在「没收好」这一侧 —— 车停着等。这个初值
+    // 是安全方向的选择，翻过来的代价是云台撞在顶板上。改它之前先看
+    // test_gimbal_gate_no_feedback.py。
+    //
+    // 只在请求收的方向拦。请求抬起而云台还没抬起来只是少打一会儿，不值得停车。
+    if (gimbal_lower_requested && !gimbal_lowered) {
+      publishStop();
+      // 不算无进展：车是被我们自己拦住的，不是卡住了。让 stuck 判据在这里累积会触发
+      // 倒车恢复 —— 云台还立着的时候倒车，只是把撞击换个方向。
+      progress_monitor_.reset();
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "等云台收下来再进洞：%s。车已停住。",
+        has_gimbal_state ? "电控回传的姿态还是「高」" : "还没收到过电控的姿态回传");
       return;
     }
 
@@ -1127,6 +1226,14 @@ private:
   std::string esdf_obstacle_topic_;
   sensor_msgs::msg::PointCloud2::SharedPtr latest_esdf_obstacle_;
 
+  // 隧道限速窗口。语义地图在订阅回调里写、在 rebuildSpeedProfile 的窗口查询里读，
+  // 两者可能不同线程（单容器多线程执行器），用独立的 map_mutex_ 护住 receiver_ ——
+  // 与控制状态的 mtx_ 分开，避免把地图订阅和控制环相互阻塞。
+  bool tunnel_speed_window_enabled_{true};
+  std::string semantic_map_topic_;
+  SemanticMapReceiver receiver_;
+  std::mutex map_mutex_;
+
   std::mutex mtx_;
   nav_msgs::msg::Odometry odom_;
   mpc::PathReference ref_;
@@ -1145,6 +1252,13 @@ private:
   // goal_approach_controller 覆写、被 rm_velocity_smoother 限幅或超时归零。
   double executed_speed_{0.0};
   std::optional<rclcpp::Time> last_executed_cmd_time_;
+  // 云台收放的请求与实测，由各自的订阅回调写入。请求到位之前车不走 —— 判据见 control()。
+  bool gimbal_lower_requested_{false};
+  // 初值 false 是拦车判据的安全默认值：还没收到回传时按「没收好」处理。见 control()。
+  bool gimbal_lowered_{false};
+  // 只用来分辨停车日志该说「云台还在动」还是「回传压根没来」。不参与拦车判据 ——
+  // 加进判据是多余的，因为 gimbal_lowered_ 的初值已经覆盖了「没收到过」这种情况。
+  bool has_gimbal_state_{false};
 
   mpc::MpcSolver solver_;
   // 进度跟踪与失效检测只在控制线程里用，不需要加锁。
@@ -1162,6 +1276,8 @@ private:
   mpc::SafePointSearchParams safe_point_params_;
   // 指令链路可观测性。只在控制线程里读写。
   std::string executed_cmd_topic_;
+  std::string gimbal_posture_topic_;
+  std::string gimbal_posture_state_topic_;
   double executed_cmd_timeout_{0.3};
   double override_detect_time_{1.0};
   // 「本节点发速度但链路末端为零」的累计时长，超过 override_detect_time_ 报警。
@@ -1205,6 +1321,10 @@ private:
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr local_costmap_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr esdf_obstacle_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr executed_cmd_sub_;
+  rclcpp::Subscription<decision_interfaces::msg::GimbalPosture>::SharedPtr gimbal_posture_sub_;
+  rclcpp::Subscription<decision_interfaces::msg::GimbalPostureState>::SharedPtr
+    gimbal_posture_state_sub_;
+  rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr cmd_norm_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr predict_path_pub_;

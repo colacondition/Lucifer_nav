@@ -68,7 +68,7 @@ def generate_launch_description():
         " if '", LaunchConfiguration('mode'), "' == 'mapping' else ",
         "'", os.path.join(bringup_dir, 'rviz', 'navigation.rviz'), "'",
     ])
-    nav_map_yaml = [PathJoinSubstitution([bringup_dir, 'map', world]), '.yaml']
+    nav_map_file = [PathJoinSubstitution([bringup_dir, 'map', world]), '.msgpack']
     fast_location_pcd_path = ParameterValue(
         ['package://bringup/PCD/', world, '.pcd'], value_type=str)
 
@@ -217,11 +217,28 @@ def generate_launch_description():
         condition=LaunchConfigurationEquals('mode', 'nav'),
         launch_arguments={
             'use_sim_time': use_sim_time,
-            'map': nav_map_yaml,
+            'map': nav_map_file,
             'params_file': navigation_params,
             'start_map_server': 'True',
             'start_mpc_controller': 'True',
         }.items())
+
+    # ===== 6.5 仿真云台模拟器 =====
+    # 实车的 /gimbal_posture_state 由 serial_driver 转发电控的持续回传；仿真没有
+    # 电控，由这个节点顶替：收到收/放请求后等 action_delay（默认 0.5s）翻转内部
+    # 姿态，并以固定频率（默认 20Hz）持续回传当前姿态 —— 跟电控的上报行为一致，
+    # 让 MPC 的「等云台收下来再进洞」和 RViz 云台状态显示在仿真里都跑通。
+    simulated_gimbal_node = Node(
+        condition=LaunchConfigurationEquals('mode', 'nav'),
+        package='simulated_gimbal',
+        executable='simulated_gimbal_node',
+        name='simulated_gimbal',
+        output=node_output,
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'action_delay': 0.5,
+        }],
+        arguments=common_log_arguments)
 
     # ===== 7. 速度转换 =====
     vel_transform_node = Node(
@@ -286,6 +303,7 @@ def generate_launch_description():
         ground_seg_node,
         fast_loc_node,
         start_navigation,
+        simulated_gimbal_node,
         vel_transform_node,
         waypoint_follow_executor,
         waypoint_patrol_executor,

@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AllRobotHP.msg"
@@ -17,6 +18,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GameStatus.msg"
   "msg/RFID.msg"
   "msg/RobotControl.msg"
+  "msg/TunnelSpec.msg"
+  "msg/SemanticMap.msg"
+  "msg/GimbalPosture.msg"
+  "msg/GimbalPostureState.msg"
+  DEPENDENCIES std_msgs
 )
 
 ament_package()

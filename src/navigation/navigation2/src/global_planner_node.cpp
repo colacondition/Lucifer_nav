@@ -1,6 +1,7 @@
 #include "distance_field.hpp"
 #include "grid_utils.hpp"
 #include "path_stitching.hpp"
+#include "semantic_map_consumer.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include <decision_interfaces/msg/semantic_map.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -51,6 +53,31 @@ public:
             map_->info.height, map_topic_.c_str());
         }
         if (goal_ && (!had_map || replan_on_source_update_)) {
+          planFromCurrentPose(true);
+        }
+      });
+
+    // 语义地图和代价地图同源同 QoS，收不到时行为退回纯几何 A*（隧道被当普通空地，
+    // 斜切进洞口不会被拦），不报错。
+    semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
+      semantic_map_topic_, map_qos,
+      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+        try {
+          if (!receiver_.update(*msg)) {
+            return;
+          }
+        } catch (const std::exception & ex) {
+          // 整帧拒收：通道长度对不上意味着格号可能整体错位，拿错位的轴线去判方向
+          // 会在错误的位置放行斜切。保留上一张好图。
+          RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
+          return;
+        }
+        // 轴线表按代价地图的格号索引，语义地图换了就得重建。
+        axis_grid_built_ = false;
+        RCLCPP_INFO(
+          get_logger(), "Global planner got semantic map: %zu tunnels",
+          receiver_.map().tunnels().size());
+        if (goal_) {
           planFromCurrentPose(true);
         }
       });
@@ -159,6 +186,21 @@ private:
     // 已变成障碍的段落。
     path_acceptance_enabled_ = declare_parameter<bool>("path_acceptance_enabled", true);
     path_acceptance_max_cost_ = declare_parameter<int>("path_acceptance_max_cost", 85);
+
+    semantic_map_topic_ =
+      declare_parameter<std::string>("semantic_map_topic", "/map_server/semantic_map");
+    // 隧道内偏离轴线的代价权重：每走一步加 w * (1 - |cos θ|)，θ 是步进方向与隧道
+    // 轴线的夹角。设 0 关闭。
+    //
+    // 洞只比车稍宽，横向余量很小，斜着走一格就贴壁 —— 这个代价把路径压到轴线上。
+    //
+    // 为什么是软代价而不是硬性禁止斜步：车体是圆柱，朝向不影响能不能过，只要对着
+    // 洞口进去就行，「偏离轴线」是该少走的，不是不能走。硬阈值还会在洞口附近把可行
+    // 的一步整个拿掉，逼出绕路或不可达。
+    //
+    // 量级：单格代价基线是 1.0，权重 2.0 时垂直于轴线的一步要 2.0，绕开它去走沿轴
+    // 的两三格更便宜 —— 塑形够强，但不会让洞变成不可达。
+    tunnel_axis_cost_weight_ = declare_parameter<double>("tunnel_axis_cost_weight", 2.0);
   }
 
   bool getRobotPose(geometry_msgs::msg::PoseStamped & pose)
@@ -444,6 +486,33 @@ private:
       start_pose, goal_pose);
   }
 
+  // 轴线表的缓存。重建要逐格做「格号 → 世界坐标 → 语义格」，RMUC 尺寸下是十几万
+  // 次；A* 每秒跑 5 次，每次重建会直接吃掉规划预算。
+  //
+  // 几何（尺寸/分辨率/origin）不变就能复用：表按格号索引，代价值变了不影响格号到
+  // 语义格的映射关系。语义地图换了则由订阅回调清空。
+  const TunnelAxisGrid & tunnelAxisFor(const nav_msgs::msg::OccupancyGrid & grid)
+  {
+    const bool geometry_changed =
+      axis_grid_width_ != grid.info.width || axis_grid_height_ != grid.info.height ||
+      axis_grid_resolution_ != grid.info.resolution ||
+      axis_grid_origin_x_ != grid.info.origin.position.x ||
+      axis_grid_origin_y_ != grid.info.origin.position.y;
+
+    // 用单独的标志位而不是 tunnel_axis_.empty() 判「建过没」：没有隧道的地图建出来
+    // 的表本来就是空的，拿 empty() 当判据会让最常见的情形每次规划都重扫一遍全图。
+    if (!axis_grid_built_ || geometry_changed) {
+      tunnel_axis_ = TunnelAxisGrid::build(grid, receiver_.map());
+      axis_grid_built_ = true;
+      axis_grid_width_ = grid.info.width;
+      axis_grid_height_ = grid.info.height;
+      axis_grid_resolution_ = grid.info.resolution;
+      axis_grid_origin_x_ = grid.info.origin.position.x;
+      axis_grid_origin_y_ = grid.info.origin.position.y;
+    }
+    return tunnel_axis_;
+  }
+
   nav_msgs::msg::OccupancyGrid preparePlanningGrid(
     const nav_msgs::msg::OccupancyGrid & source_map) const
   {
@@ -519,6 +588,10 @@ private:
         clearance_desired_distance_, clearance_cost_weight_);
     };
 
+    // 轴线表按 grid 的格号索引，而 grid 来自 preparePlanningGrid（可能加了膨胀，但
+    // 几何不变）。几何不变就能复用，所以只在语义地图或代价地图几何变化时重建。
+    const TunnelAxisGrid & tunnel_axis = tunnelAxisFor(grid);
+
     g_score[static_cast<std::size_t>(*start_index)] = 0.0;
     open.push({*start_index, heuristic(*start_index, *goal_index)});
 
@@ -557,6 +630,19 @@ private:
         }
 
         const int neighbor = static_cast<int>(gridIndex(grid, nx, ny));
+
+        // 隧道内偏离轴线要加代价：洞只比车稍宽，斜着走一格就贴壁。纯几何代价图看不
+        // 出这件事 —— 顶板和侧壁在点云里跟墙一样，语义地图是唯一的信息来源。
+        //
+        // 地图里没隧道时 tunnel_axis 是空的，stepAlignment 恒返回 1.0，这一项为 0。
+        double axis_cost = 0.0;
+        if (!tunnel_axis.empty() && tunnel_axis_cost_weight_ > 0.0) {
+          const double alignment = tunnel_axis.stepAlignment(
+            static_cast<std::size_t>(current.index), static_cast<std::size_t>(neighbor),
+            direction[0], direction[1]);
+          axis_cost = tunnel_axis_cost_weight_ * (1.0 - alignment);
+        }
+
         const double step = (direction[0] != 0 && direction[1] != 0) ? std::sqrt(2.0) : 1.0;
         double turn_cost = 0.0;
         const int parent_index = parent[static_cast<std::size_t>(current.index)];
@@ -577,7 +663,7 @@ private:
         }
         const double tentative =
           g_score[static_cast<std::size_t>(current.index)] + step * cellCost(grid, nx, ny) +
-          turn_cost + clearance_cost(neighbor);
+          turn_cost + axis_cost + clearance_cost(neighbor);
         if (tentative >= g_score[static_cast<std::size_t>(neighbor)]) {
           continue;
         }
@@ -863,7 +949,20 @@ private:
   bool path_acceptance_enabled_{true};
   int path_acceptance_max_cost_{85};
 
+  // 语义地图与派生的轴线表。收不到语义地图时表是空的，A* 退回纯几何行为。
+  std::string semantic_map_topic_;
+  double tunnel_axis_cost_weight_{2.0};
+  SemanticMapReceiver receiver_;
+  TunnelAxisGrid tunnel_axis_;
+  bool axis_grid_built_{false};
+  unsigned int axis_grid_width_{0};
+  unsigned int axis_grid_height_{0};
+  float axis_grid_resolution_{0.0F};
+  double axis_grid_origin_x_{0.0};
+  double axis_grid_origin_y_{0.0};
+
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+  rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr replan_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;

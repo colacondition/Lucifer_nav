@@ -91,7 +91,8 @@ ros2 launch bringup sim.launch.py  world:=RMUL mode:=mapping nav_rviz:=True
 落盘位置 = `<map_save_dir>/<world>.pcd`（launch 传 `mapping.output_dir` 为绝对路径、
 `mapping.map_name` 为 `<world>.pcd`；留空则退回 `~/mapping` + 时间戳子目录）。
 输出是**纯 xyz 二进制 PCD**（`pcl::PointXYZ`），fast_location 直接可读，
-`pcd_to_gridmap.py`（只读 xyz）转 pgm 也兼容。
+`bringup` 的 `pcd_to_navmap.py`（只读 xyz）也能把它直接转成导航用的语义地图
+msgpack（详见根 README「由点云生成语义地图」）。
 
 > 注意：`--symlink-install` 下覆盖已存在的 world 会写穿到 `src/bringup/PCD/`；新建
 > world 只落在 `install/`，下次 colcon build 会清掉，要自己拷回源码目录。

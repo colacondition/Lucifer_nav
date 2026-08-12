@@ -1,12 +1,15 @@
 #include "grid_utils.hpp"
 #include "rc_esdf.h"
 #include "minco/minco_optimizer.hpp"
+#include "semantic_map_consumer.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <string>
 #include <vector>
 
+#include <decision_interfaces/msg/semantic_map.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -30,6 +33,10 @@ public:
     robot_radius_ = declare_parameter<double>("robot_radius", 1.0);
     penalty_mu_ = declare_parameter<double>("penalty_mu", 0.4);
     enable_optimization_ = declare_parameter<bool>("enable_optimization", true);
+    // 隧道内偏离轴线的软代价权重。收不到语义地图或图里没隧道时自动失效。
+    tunnel_axis_weight_ = declare_parameter<double>("tunnel_axis_weight", 5.0);
+    semantic_map_topic_ = declare_parameter<std::string>(
+      "semantic_map_topic", "/map_server/semantic_map");
 
     // 时间分配参数
     default_velocity_ = declare_parameter<double>("default_velocity", 1.0);
@@ -63,6 +70,7 @@ public:
     params.data_weight = data_weight_;
     params.robot_radius = robot_radius_;
     params.penalty_mu = penalty_mu_;
+    params.tunnel_axis_weight = tunnel_axis_weight_;
     params.enable = enable_optimization_;
     minco_optimizer_->setParams(params);
 
@@ -70,6 +78,28 @@ public:
     minco_optimizer_->setEsdfQuery(
       [this](const Eigen::Vector2d & pos, double & dist, Eigen::Vector2d & grad) {
         return esdf_map_.query(pos, dist, grad);
+      });
+
+    // 隧道轴线查询：给 MINCO 的对齐软代价用。语义地图收不到时 receiver_.map() 无效，
+    // tunnelAxisAtPoint 恒返回 false，对齐项自动失效。
+    minco_optimizer_->setTunnelAxisQuery(
+      [this](const Eigen::Vector2d & pos, Eigen::Vector2d & axis) {
+        std::lock_guard<std::mutex> lk(map_mutex_);
+        return tunnelAxisAtPoint(receiver_.map(), pos, axis);
+      });
+
+    // 语义地图和代价地图同源同 QoS。收不到时对齐项静默失效（隧道被当普通空地），
+    // 不报错。整帧不自洽时保留上一张好图。
+    auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+    semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
+      semantic_map_topic_, map_qos,
+      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+        std::lock_guard<std::mutex> lk(map_mutex_);
+        try {
+          receiver_.update(*msg);
+        } catch (const std::exception & ex) {
+          RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
+        }
       });
 
     path_sub_ = create_subscription<nav_msgs::msg::Path>(
@@ -161,7 +191,9 @@ private:
   double data_weight_;
   double robot_radius_;
   double penalty_mu_;
+  double tunnel_axis_weight_;
   bool enable_optimization_;
+  std::string semantic_map_topic_;
 
   double default_velocity_;
   double min_segment_time_;
@@ -175,7 +207,13 @@ private:
 
   std::unique_ptr<MincoOptimizer> minco_optimizer_;
 
+  // 语义地图。轴线查询在优化回调里读，语义地图在订阅回调里写，两者可能不同线程
+  // （单容器多线程执行器），用锁护住 receiver_。
+  SemanticMapReceiver receiver_;
+  std::mutex map_mutex_;
+
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+  rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
 };
 

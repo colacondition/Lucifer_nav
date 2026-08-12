@@ -55,9 +55,12 @@ bool isOccupied(int8_t value, int occupied_threshold, bool unknown_is_occupied);
 void inflateOccupancyGrid(
   nav_msgs::msg::OccupancyGrid & grid, double inflation_radius, int occupied_threshold = 50);
 
+// radius_limit 给每格一个膨胀半径上限（m），长度必须等于 grid.data.size()，否则
+// 整个上限被忽略。用于隧道：窄通道容不下全局那么大的膨胀半径，见
+// semantic_map_consumer.hpp 的 makeInflationRadiusLimit。空 vector = 无逐格上限。
 void applyInflationCostGradient(
   nav_msgs::msg::OccupancyGrid & grid, double inflation_radius, int occupied_threshold = 50,
-  double cost_scaling_factor = 8.0);
+  double cost_scaling_factor = 8.0, const std::vector<float> & radius_limit = {});
 
 std::vector<GridCell> raytraceLine(int x0, int y0, int x1, int y1);
 

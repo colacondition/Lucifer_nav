@@ -18,9 +18,16 @@ constexpr auto kTransmitInterval = std::chrono::milliseconds(1);
 constexpr auto kReceiveInterval = std::chrono::milliseconds(5);
 constexpr auto kStatusInterval = std::chrono::seconds(1);
 constexpr auto kReconnectDelay = std::chrono::seconds(1);
+// 云台姿态帧的发送周期。20 Hz：导航侧判定跑 10 Hz，发得比它快一档，最坏情况下的额外
+// 延迟不超过一个判定周期。平时这一帧的内容是 0（不动），5 字节 × 20 Hz 对带宽无影响。
+constexpr auto kGimbalPostureInterval = std::chrono::milliseconds(50);
 constexpr uint8_t kPacketHead0 = static_cast<uint8_t>('H');
 constexpr uint8_t kPacketHead1 = static_cast<uint8_t>('L');
+// 云台姿态回传的帧型字节。上行现在有两种帧，长度不同（裁判 9 字节、姿态 5 字节），
+// 靠第二个字节定帧型、帧型定长度 —— 不能反过来靠长度猜。
+constexpr uint8_t kPostureStateHead1 = static_cast<uint8_t>('P');
 constexpr std::size_t kDecisionPacketSize = sizeof(DecisionPacket);
+constexpr std::size_t kPostureStatePacketSize = sizeof(GimbalPostureStatePacket);
 
 std::string packetToHex(const uint8_t * data, std::size_t size)
 {
@@ -38,6 +45,11 @@ std::string packetToHex(const uint8_t * data, std::size_t size)
 }
 
 std::string packetToHex(const ChassisCommandPacket & packet)
+{
+  return packetToHex(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+}
+
+std::string packetToHex(const GimbalPosturePacket & packet)
 {
   return packetToHex(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
 }
@@ -74,10 +86,20 @@ SerialDriverNode::SerialDriverNode(const rclcpp::NodeOptions & options)
     "cmd_vel_chassis", rclcpp::SensorDataQoS(),
     std::bind(&SerialDriverNode::ChassisCmdCallback, this, std::placeholders::_1));
 
+  // 收云台请求。transient_local + reliable 要跟 rm_tunnel_posture 的发布端对上 ——
+  // QoS 不匹配的表现是「话题在、一帧都收不到」，而且不报错，云台会直接撞在顶板上。
+  gimbal_posture_sub_ = this->create_subscription<decision_interfaces::msg::GimbalPosture>(
+    "gimbal_posture", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
+    std::bind(&SerialDriverNode::GimbalPostureCallback, this, std::placeholders::_1));
+
   robot_status_pub_ = this->create_publisher<decision_interfaces::msg::RobotStatus>(
     "robot_status", rclcpp::SensorDataQoS());
   game_status_pub_ = this->create_publisher<decision_interfaces::msg::GameStatus>(
     "game_status", rclcpp::SensorDataQoS());
+  // 云台实测姿态。跟请求同样是状态型话题，用 transient_local 让晚起的订阅者立刻拿到
+  // 当前姿态，而不是等下一帧回传。
+  gimbal_posture_state_pub_ = this->create_publisher<decision_interfaces::msg::GimbalPostureState>(
+    "gimbal_posture_state", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
 
   transmit_timer_ = this->create_wall_timer(
     kTransmitInterval, std::bind(&SerialDriverNode::transmit, this));
@@ -85,11 +107,23 @@ SerialDriverNode::SerialDriverNode(const rclcpp::NodeOptions & options)
     kReceiveInterval, std::bind(&SerialDriverNode::receive, this));
   status_timer_ = this->create_wall_timer(
     kStatusInterval, std::bind(&SerialDriverNode::logStatus, this));
+  gimbal_posture_timer_ = this->create_wall_timer(
+    kGimbalPostureInterval, [this]() {
+      syncGimbalPosture();
+    });
 
   RCLCPP_INFO(
     get_logger(),
     "Subscribed to cmd_vel_chassis; RX=HL+current_hp+game_progress+stage_remain_time+crc16; chassis scale x=%.1f y=%.1f w=%.1f",
     chassis_vel_x_scale_, chassis_vel_y_scale_, chassis_vel_w_scale_);
+  RCLCPP_INFO(
+    get_logger(),
+    "Gimbal posture: sub=gimbal_posture pub=gimbal_posture_state; "
+    "TX=HG+lower+crc16 (%zu bytes, sent only while state differs, checked every %ld ms); "
+    "RX=HP+raised+crc16 (%zu bytes, 0=lowered)",
+    sizeof(GimbalPosturePacket),
+    static_cast<long>(kGimbalPostureInterval.count()),
+    sizeof(GimbalPostureStatePacket));
 }
 
 int SerialDriverNode::transmit()
@@ -116,7 +150,12 @@ int SerialDriverNode::transmit()
     }
 
     const auto packet = bufferToStruct<ChassisCommandPacket>(buffer);
-    const int bytes_written = port_->transmit(buffer, static_cast<int>(packet_size));
+    int bytes_written = 0;
+    {
+      // 锁只包住这一次 write，不要包整个 while —— 队列里攒了几十帧时会把云台帧饿死。
+      std::lock_guard<std::mutex> lock(write_mutex_);
+      bytes_written = port_->transmit(buffer, static_cast<int>(packet_size));
+    }
     last_write_size_.store(bytes_written, std::memory_order_relaxed);
 
     if (bytes_written != static_cast<int>(packet_size)) {
@@ -175,45 +214,65 @@ void SerialDriverNode::processReceiveBuffer()
 {
   std::lock_guard<std::mutex> lock(receive_mutex_);
 
-  // RX frame: 'H''L' + decision payload + uint16 crc16.
-  while (receive_buffer_.size() >= kDecisionPacketSize) {
-    // Sync on head bytes.
-    if (receive_buffer_[0] != kPacketHead0 || receive_buffer_[1] != kPacketHead1) {
+  // 上行有两种帧：'H''L' 裁判数据、'H''P' 云台姿态回传。长度不同，所以必须先按第二个
+  // 字节定帧型再按帧型取长度。原来的写法假定只有一种帧长，会把姿态帧当垃圾一个字节
+  // 一个字节吃掉 —— 表现是回传永远收不到，而且日志里干干净净。
+  while (receive_buffer_.size() >= 2) {
+    if (receive_buffer_[0] != kPacketHead0) {
       receive_buffer_.erase(receive_buffer_.begin());
       continue;
     }
 
-    if (!handlePacket(receive_buffer_.data(), kDecisionPacketSize)) {
-      // Head matched but CRC/content invalid: drop one byte and resync.
+    std::size_t frame_size = 0;
+    if (receive_buffer_[1] == kPacketHead1) {
+      frame_size = kDecisionPacketSize;
+    } else if (receive_buffer_[1] == kPostureStateHead1) {
+      frame_size = kPostureStatePacketSize;
+    } else {
+      // 'H' 后面跟了个不认识的帧型字节：这个 'H' 是数据里碰巧出现的，不是帧头。
+      receive_buffer_.erase(receive_buffer_.begin());
+      continue;
+    }
+
+    if (receive_buffer_.size() < frame_size) {
+      // 帧还没收全。留在缓冲里等下一次 receive()，不要丢 —— 丢了就得等对面重发。
+      break;
+    }
+
+    if (!handlePacket(receive_buffer_.data(), frame_size)) {
+      // 帧型对但 CRC 不过：丢一个字节重新同步。
       receive_buffer_.erase(receive_buffer_.begin());
       continue;
     }
 
     receive_buffer_.erase(
       receive_buffer_.begin(),
-      receive_buffer_.begin() + static_cast<std::ptrdiff_t>(kDecisionPacketSize));
+      receive_buffer_.begin() + static_cast<std::ptrdiff_t>(frame_size));
   }
 }
 
 bool SerialDriverNode::handlePacket(const uint8_t * data, std::size_t size)
 {
-  if (size != kDecisionPacketSize) {
+  if (data[0] != kPacketHead0) {
     return false;
   }
 
-  if (data[0] != kPacketHead0 || data[1] != kPacketHead1) {
-    return false;
-  }
-
-  // Full frame CRC covers the whole decision packet (same algorithm as chassis TX).
+  // 全帧 CRC，两种上行帧同一个算法（也跟下行的底盘帧一致）。
   if (!crc16::Verify_CRC16_Check_Sum(data, static_cast<uint32_t>(size))) {
     return false;
   }
 
-  const auto packet = bufferToStruct<DecisionPacket>(data);
-  publishDecisionPacket(packet);
+  if (data[1] == kPacketHead1 && size == kDecisionPacketSize) {
+    publishDecisionPacket(bufferToStruct<DecisionPacket>(data));
+    return true;
+  }
 
-  return true;
+  if (data[1] == kPostureStateHead1 && size == kPostureStatePacketSize) {
+    publishGimbalPostureState(bufferToStruct<GimbalPostureStatePacket>(data));
+    return true;
+  }
+
+  return false;
 }
 
 void SerialDriverNode::publishDecisionPacket(const DecisionPacket & packet)
@@ -292,6 +351,114 @@ void SerialDriverNode::ChassisCmdCallback(const geometry_msgs::msg::Twist::Share
   }
 }
 
+void SerialDriverNode::publishGimbalPostureState(const GimbalPostureStatePacket & packet)
+{
+  // 极性翻转只在 isGimbalLowered 里做（packet.hpp），这里之后一律是 lowered 语义。
+  const bool lowered = isGimbalLowered(packet);
+
+  decision_interfaces::msg::GimbalPostureState msg;
+  msg.lowered = lowered;
+
+  const bool previous_lowered = gimbal_state_lowered_.exchange(lowered, std::memory_order_relaxed);
+  const bool first = gimbal_state_rx_count_.fetch_add(1, std::memory_order_relaxed) == 0;
+
+  if (gimbal_posture_state_pub_) {
+    gimbal_posture_state_pub_->publish(msg);
+  }
+
+  if (first || previous_lowered != lowered) {
+    // 回传是持续的，每帧都打会把日志刷没，所以只在翻转时打。请求值一起打出来：
+    // 这两个值分开看都正常，只有对比才能发现「导航一直在请求收，云台压根没动」。
+    RCLCPP_INFO(
+      get_logger(), "Gimbal posture state: lowered=%s (requested lower=%s)",
+      lowered ? "true" : "false",
+      has_gimbal_request_.load(std::memory_order_relaxed) ?
+      (gimbal_lower_.load(std::memory_order_relaxed) ? "true" : "false") : "none");
+  }
+}
+
+void SerialDriverNode::GimbalPostureCallback(
+  const decision_interfaces::msg::GimbalPosture::SharedPtr msg)
+{
+  // 只存值，发送交给定时器。回调里直接写串口会让这条链路的时序取决于导航侧的发布节奏，
+  // 而且写阻塞时会拖住导航节点所在的执行器。
+  gimbal_lower_.store(msg->lower, std::memory_order_relaxed);
+  has_gimbal_request_.store(true, std::memory_order_relaxed);
+
+  // 只在翻转时打日志：这一帧 20 Hz 重发，每帧都打会把日志刷没。
+  const bool previous = gimbal_lower_logged_.exchange(msg->lower, std::memory_order_relaxed);
+  if (previous != msg->lower) {
+    RCLCPP_INFO(
+      get_logger(), "Gimbal posture request changed: lower=%s", msg->lower ? "true" : "false");
+  }
+}
+
+void SerialDriverNode::syncGimbalPosture()
+{
+  // 平时发 0（什么都不做），请求翻转时发一帧 1 —— 只发这一帧。
+  //
+  // 判据是「请求变了」而不是「实测跟请求不一致」。后者看似更稳，实际会连发：脉冲发出去
+  // 之后串口往返 + 云台动作要几十毫秒，这期间回传还是旧值，20 Hz 下一致性判据会再触发
+  // 一次，云台被切回去。用请求翻转做判据就没有这个窗口 —— 一次请求对应一帧指令。
+  //
+  // 也正因为如此，这里不需要等回传、不需要知道当前姿态：请求从「抬」变成「收」，发一次
+  // 切换就是对的。回传只用来让 MPC 知道云台到位没有（见 rm_mpc_controller），不参与发送。
+  const bool want_lower = gimbal_lower_.load(std::memory_order_relaxed);
+  const bool toggle_pending =
+    has_gimbal_request_.load(std::memory_order_relaxed) &&
+    gimbal_commanded_lower_.load(std::memory_order_relaxed) != want_lower;
+
+  if (!transmitGimbalPosture(toggle_pending ? 1 : 0)) {
+    // 写失败（端口没开、write 返回短），指令根本没上线。不记账，下个周期还会发。
+    // 这不是「不信电控」—— 检查的是我们自己 write 的返回值。
+    return;
+  }
+
+  if (toggle_pending) {
+    gimbal_commanded_lower_.store(want_lower, std::memory_order_relaxed);
+    RCLCPP_INFO(get_logger(), "发送云台切换指令：目标=%s", want_lower ? "低" : "高");
+  }
+}
+
+bool SerialDriverNode::transmitGimbalPosture(uint8_t toggle)
+{
+  if (!port_->isPortOpen()) {
+    return false;
+  }
+
+  GimbalPosturePacket packet{};
+  packet.gimbal_toggle = toggle;
+  crc16::Append_CRC16_Check_Sum(reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
+
+  uint8_t buffer[sizeof(GimbalPosturePacket)];
+  structToBuffer(packet, buffer);
+
+  int bytes_written = 0;
+  {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    bytes_written = port_->transmit(buffer, static_cast<int>(sizeof(buffer)));
+  }
+
+  if (bytes_written != static_cast<int>(sizeof(buffer))) {
+    // 不重连、不清缓冲：底盘速度帧的失败路径已经在管端口重开了，这里再插一手会在
+    // 串口抖动时把重连打成两倍频。下一个周期自然会重发，丢一帧的代价是 50 ms 延迟。
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Gimbal posture write failed. expected=%zu actual=%d device=%s raw=[%s]",
+      sizeof(buffer), bytes_written, config_->devname.c_str(), packetToHex(packet).c_str());
+    return false;
+  }
+
+  if (toggle != 0) {
+    // 只统计脉冲。把 0 帧也算进去的话这个数就只是个周期计数，看不出发过几次切换。
+    gimbal_sent_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  RCLCPP_DEBUG(
+    get_logger(), "Gimbal posture frame sent. toggle=%u raw=[%s]",
+    static_cast<unsigned int>(packet.gimbal_toggle), packetToHex(packet).c_str());
+  return true;
+}
+
 void SerialDriverNode::logStatus()
 {
   std::size_t queue_bytes = 0;
@@ -303,7 +470,8 @@ void SerialDriverNode::logStatus()
   RCLCPP_INFO(
     get_logger(),
     "Serial status: port_open=%s device=%s fd=%d queue_bytes=%llu decision_rx=%llu received=%llu queued=%llu "
-    "sent=%llu failed=%llu last_write=%d last_hp=%u last_game=%u last_time=%u",
+    "sent=%llu failed=%llu last_write=%d last_hp=%u last_game=%u last_time=%u "
+    "gimbal_want=%s gimbal_is=%s gimbal_toggles=%llu gimbal_rx=%llu",
     port_->isPortOpen() ? "true" : "false", config_->devname.c_str(), port_->fd,
     static_cast<unsigned long long>(queue_bytes),
     static_cast<unsigned long long>(received_decision_count_.load(std::memory_order_relaxed)),
@@ -314,19 +482,29 @@ void SerialDriverNode::logStatus()
     last_write_size_.load(std::memory_order_relaxed),
     static_cast<unsigned int>(last_current_hp_.load(std::memory_order_relaxed)),
     static_cast<unsigned int>(last_game_progress_.load(std::memory_order_relaxed)),
-    static_cast<unsigned int>(last_stage_remain_time_.load(std::memory_order_relaxed)));
+    static_cast<unsigned int>(last_stage_remain_time_.load(std::memory_order_relaxed)),
+    has_gimbal_request_.load(std::memory_order_relaxed) ?
+    (gimbal_lower_.load(std::memory_order_relaxed) ? "lowered" : "raised") : "none",
+    gimbal_state_rx_count_.load(std::memory_order_relaxed) > 0 ?
+    (gimbal_state_lowered_.load(std::memory_order_relaxed) ? "lowered" : "raised") : "unknown",
+    static_cast<unsigned long long>(gimbal_sent_count_.load(std::memory_order_relaxed)),
+    static_cast<unsigned long long>(gimbal_state_rx_count_.load(std::memory_order_relaxed)));
 }
 
 bool SerialDriverNode::reopenPort(const char * reason)
 {
   RCLCPP_WARN(get_logger(), "%s. Reopening serial port...", reason);
-  port_->closePort();
   {
-    std::lock_guard<std::mutex> lock(receive_mutex_);
-    receive_buffer_.clear();
+    // 关 / 开端口期间不能有别的线程在写：fd 会在 write 中途被换掉。
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    port_->closePort();
+    {
+      std::lock_guard<std::mutex> receive_lock(receive_mutex_);
+      receive_buffer_.clear();
+    }
+    rclcpp::sleep_for(kReconnectDelay);
+    port_->openPort();
   }
-  rclcpp::sleep_for(kReconnectDelay);
-  port_->openPort();
 
   if (!port_->isPortOpen()) {
     RCLCPP_ERROR(

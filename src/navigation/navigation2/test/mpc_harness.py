@@ -8,6 +8,7 @@
 # passed, it only showed on the real robot.
 import time
 
+from decision_interfaces.msg import GimbalPosture, GimbalPostureState
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 import rclpy
@@ -51,6 +52,14 @@ class Harness(Node):
         # Chain-end feedback.  The node uses this (not its own published
         # speed) to drive ProgressMonitor -- see feedback.executed_cmd_topic.
         self.executed_cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # 云台收放。默认两条都不发 —— 没有请求时门是开的，其他测试不受影响。
+        # 发了请求就必须也发实测姿态，否则节点按「还没收到过回传」停车（这是刻意的保守
+        # 默认值，见 control() 里的判据）。
+        self.gimbal_posture_pub = self.create_publisher(
+            GimbalPosture, '/gimbal_posture', transient_local_qos())
+        self.gimbal_posture_state_pub = self.create_publisher(
+            GimbalPostureState, '/gimbal_posture_state', transient_local_qos())
 
         self.approach_enabled = []
         self.create_subscription(
@@ -121,6 +130,22 @@ class Harness(Node):
         executed = Twist()
         executed.linear.x = float(executed_speed)
         self.executed_cmd_pub.publish(executed)
+
+    def set_gimbal(self, requested_lower, measured_lowered=None):
+        """
+        Publish one gimbal request plus its measured posture.
+
+        measured_lowered=None 表示只发请求、不发回传 —— 用来测「还没收到过回传」的分支。
+        两条话题都是 transient_local，发一次就 latch 住，不需要在驱动循环里重复发。
+        """
+        request = GimbalPosture()
+        request.lower = bool(requested_lower)
+        self.gimbal_posture_pub.publish(request)
+
+        if measured_lowered is not None:
+            state = GimbalPostureState()
+            state.lowered = bool(measured_lowered)
+            self.gimbal_posture_state_pub.publish(state)
 
     def drive(self, duration_s, robot_xy, goal_xy, executed_speed, rate_hz=20.0):
         """

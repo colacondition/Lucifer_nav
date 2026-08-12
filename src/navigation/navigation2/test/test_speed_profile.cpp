@@ -186,5 +186,96 @@ TEST(SpeedProfile, InvalidPathGivesZero)
   EXPECT_DOUBLE_EQ(sp.speed_at(1.0), 0.0);
 }
 
+// 隧道限速窗口：把 [4, 6] m 段标成 vmax=0.5 的隧道，直线其余段全速。
+// 洞内速度必须被 vmax 压住，洞外中段仍达最大速度。
+TEST(SpeedProfile, TunnelWindowClampsMaxSpeedInside)
+{
+  auto ref = makeRef({{0.0, 0.0}, {10.0, 0.0}});
+  auto sp = makeProfile(kMaxSpeed, false);   // 不强制终点减速，隔离窗口效果
+  sp.set_tunnel_window(
+    [](const Eigen::Vector2d & p, double & vmin, double & vmax) {
+      if (p.x() >= 4.0 && p.x() <= 6.0) {
+        vmin = 0.0;
+        vmax = 0.5;
+        return true;
+      }
+      return false;
+    });
+  sp.rebuild(ref, kMaxSpeed);
+  ASSERT_TRUE(sp.valid());
+
+  // 洞内被夹到 vmax。
+  EXPECT_LE(sp.speed_at(5.0), 0.5 + 1e-6);
+  // 洞外远处仍能全速（洞前留了足够长的加速距离）。
+  EXPECT_NEAR(sp.speed_at(1.0), kMaxSpeed, 0.1);
+}
+
+// 窗口必须在前/后向扫描之前施加：洞口前应出现一段减速斜坡，
+// 而不是在洞口瞬间从全速跳到 vmax。检查洞口前 0.5 m 处速度已明显低于 max。
+TEST(SpeedProfile, TunnelWindowRampsBeforeMouth)
+{
+  auto ref = makeRef({{0.0, 0.0}, {10.0, 0.0}});
+  auto sp = makeProfile(kMaxSpeed, false);
+  sp.set_tunnel_window(
+    [](const Eigen::Vector2d & p, double & vmin, double & vmax) {
+      if (p.x() >= 4.0 && p.x() <= 6.0) {
+        vmin = 0.0;
+        vmax = 0.3;
+        return true;
+      }
+      return false;
+    });
+  sp.rebuild(ref, kMaxSpeed);
+  ASSERT_TRUE(sp.valid());
+
+  // 洞口在 s≈4：进洞前 0.3 m 处速度应已被后向扫描拉低到接近 vmax，远小于全速。
+  EXPECT_LT(sp.speed_at(3.7), kMaxSpeed);
+  EXPECT_LE(sp.speed_at(4.0), 0.3 + 0.15);
+}
+
+// 空窗口（查询恒 false）不改变任何速度：有无窗口两条剖面逐点一致。
+TEST(SpeedProfile, TunnelWindowEmptyIsNoop)
+{
+  auto ref = makeRef({{0.0, 0.0}, {10.0, 0.0}});
+
+  auto base = makeProfile(kMaxSpeed, false);
+  base.rebuild(ref, kMaxSpeed);
+
+  auto empty_win = makeProfile(kMaxSpeed, false);
+  empty_win.set_tunnel_window(
+    [](const Eigen::Vector2d &, double &, double &) { return false; });
+  empty_win.rebuild(ref, kMaxSpeed);
+
+  for (double s = 0.0; s <= 10.0; s += 0.5) {
+    EXPECT_NEAR(empty_win.speed_at(s), base.speed_at(s), 1e-9) << "at s=" << s;
+  }
+}
+
+// vmin 抬升下限：单位半圆的曲率会把中段速度压到 ~1.41；给整段隧道标 vmin=1.5
+// （不超过 max_speed），洞内中段速度应被抬到接近 vmin，高于无窗口时的曲率限速值。
+// 终点减速关闭以隔离效果。
+TEST(SpeedProfile, TunnelWindowRaisesMin)
+{
+  constexpr double R = 1.0;
+  auto arc = makeArc(R, M_PI, kMaxSpeed);
+
+  auto base = makeProfile(kMaxSpeed, false);
+  base.rebuild(arc, kMaxSpeed);
+  const double total = arc.total_length();
+  const double base_mid = base.speed_at(total * 0.5);
+
+  auto win = makeProfile(kMaxSpeed, false);
+  win.set_tunnel_window(
+    [](const Eigen::Vector2d &, double & vmin, double & vmax) {
+      vmin = kMaxSpeed;   // 会被 min(vmin, max_speed) 夹到 max_speed
+      vmax = 0.0;         // 不设上限
+      return true;
+    });
+  win.rebuild(arc, kMaxSpeed);
+  const double win_mid = win.speed_at(total * 0.5);
+
+  EXPECT_GT(win_mid, base_mid);   // 下限确实把曲率限速抬高了
+}
+
 }  // namespace
 }  // namespace navigation2::mpc

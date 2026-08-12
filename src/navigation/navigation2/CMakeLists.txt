@@ -25,6 +25,10 @@ find_package(Eigen3 REQUIRED)
 # OSQP C library (via ros-humble-osqp-vendor) for the MPC controller.
 find_package(osqp REQUIRED)
 
+# msgpack (libmsgpack-dev) for the semantic map file format. Header-only C++ API,
+# so there is no library to link — just the include path.
+find_path(MSGPACK_INCLUDE_DIR msgpack.hpp REQUIRED)
+
 # One shared library from every source in the tree.
 # NOTE: file(GLOB) does not re-run when files are added/removed; re-run cmake
 # (touch this file or clean-build) after adding a new source.
@@ -36,6 +40,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
   $<INSTALL_INTERFACE:include>
 )
+target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${MSGPACK_INCLUDE_DIR})
 target_link_libraries(${PROJECT_NAME}
   Eigen3::Eigen
   osqp::osqp
@@ -59,6 +64,10 @@ rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN "navigation2::RmVelocitySmoother" EXECUTABLE rm_velocity_smoother_node)
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN "navigation2::RmNav2Compat"       EXECUTABLE rm_nav2_compat_node)
+rclcpp_components_register_node(${PROJECT_NAME}
+  PLUGIN "navigation2::RmTunnelPosture"    EXECUTABLE rm_tunnel_posture_node)
+rclcpp_components_register_node(${PROJECT_NAME}
+  PLUGIN "navigation2::RmGimbalVisualizer" EXECUTABLE rm_gimbal_visualizer_node)
 
 install(DIRECTORY include/
   DESTINATION include
@@ -78,6 +87,21 @@ if(BUILD_TESTING)
     test/test_local_path_safety.cpp
   )
   target_link_libraries(test_local_path_safety ${PROJECT_NAME})
+
+  ament_add_gtest(test_semantic_map
+    test/test_semantic_map.cpp
+  )
+  target_link_libraries(test_semantic_map ${PROJECT_NAME})
+
+  ament_add_gtest(test_semantic_map_consumer
+    test/test_semantic_map_consumer.cpp
+  )
+  target_link_libraries(test_semantic_map_consumer ${PROJECT_NAME})
+
+  ament_add_gtest(test_tunnel_posture
+    test/test_tunnel_posture.cpp
+  )
+  target_link_libraries(test_tunnel_posture ${PROJECT_NAME})
 
   ament_add_gtest(test_distance_field
     test/test_distance_field.cpp
@@ -128,6 +152,21 @@ if(BUILD_TESTING)
   # transformPoint 之前比原始 z 是 +0.025，在 map 里跟固定 z=0 比也只有 +0.025
   # （map 的 z=0 是雷达平面，不是地面）。
   add_launch_test(test/test_costmap_height_frame.py TIMEOUT 120)
+  # 锁住隧道顶板不进代价地图、洞内真障碍照进这两条。顶板和墙在点云里没有区别，按
+  # 常规高度带判定会把整个洞口涂成致命格，规划器彻底看不到通路 —— 无报错，表现只是
+  # 「车不走那条唯一的路」。反向也测：不能退化成「隧道内不看点云」。
+  add_launch_test(test/test_costmap_tunnel_roof.py TIMEOUT 120)
+  # 锁住收云台请求在节点层是通的。判定本身有 gtest，这里管接线：语义地图的 QoS、
+  # tf 的坐标系、话题名。这三处错的表现完全一样 —— 标志位永远 false，日志里没有报错，
+  # 云台在洞口撞上去。
+  add_launch_test(test/test_tunnel_posture_node.py TIMEOUT 120)
+  # 锁住「等云台收到位再走」。判据用了三条话题上的值，gtest 碰不到；错了的表现是车照常
+  # 开进去、云台撞在顶板上，没有任何一层会报错。也一并回归「没有云台请求时不影响行驶」——
+  # 这个门在 control() 的主路径上，写反会把全部导航停掉。
+  add_launch_test(test/test_gimbal_gate.py TIMEOUT 90)
+  # 「一条回传都没收到过」必须单独一个进程：/gimbal_posture_state 是 transient_local，
+  # 跟别的用例共进程的话会被前面发过的姿态污染，这个分支根本进不去。
+  add_launch_test(test/test_gimbal_gate_no_feedback.py TIMEOUT 90)
   # 锁住 RC-ESDF 是真的在跑。障碍点云喂一个挡路的点，esdfPathSafe 返回 false，
   # MPC 进恢复。反向测试：注掉 esdf_map_.query 那行，测试必须失败。
   add_launch_test(test/test_esdf_obstacle_cloud.py TIMEOUT 90)
