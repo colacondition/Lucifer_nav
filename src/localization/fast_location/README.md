@@ -1,12 +1,12 @@
 # fast_location
 
-点云对先验 PCD 的主定位。吃 small_glim 的 `/Laser_map`（世界系点云）和
+点云对先验 PCD 的主定位。吃 small_glim 的 `/Laser_map_dense`（世界系定位稠密点云）和
 `/lio/robo/odom`（10Hz 里程计），用 **FastGICP 多尺度级联**把当前扫描配准到先验
 点云图，输出 **`map→odom` TF**。本工作空间里它是**唯一的 map→odom 来源**：
 navigation2 代价地图、RViz 的定位都靠它把 odom 树和 map 树连起来。
 
 ```text
-/Laser_map ──┐                     ┌──► map→odom TF (200Hz)
+/Laser_map_dense ──┐               ┌──► map→odom TF (200Hz)
               ├─► FastGICP 级联 ──┤
 /lio/robo/odom┘   3.0→2.0→1.5→1.0  └──► 退化/平滑后修正 map→odom
 ```
@@ -62,7 +62,7 @@ small_glim 输出的纯 xyz PCD。
 
 | Topic | 方向 | 类型 | 说明 |
 | :- | :- | :- | :- |
-| `/Laser_map` | 订阅 | `PointCloud2` | small_glim 世界系点云（launch 把 `sub_scan_topic` 覆盖到这条） |
+| `/Laser_map_dense` | 订阅 | `PointCloud2` | small_glim 世界系定位稠密点云（launch 把 `sub_scan_topic` 覆盖到这条） |
 | `/lio/robo/odom` | 订阅 | `Odometry` | small_glim 里程计，提供位姿初猜与帧对齐 |
 | `initialpose_3d` / `/initialpose` | 订阅 | `PoseStamped` / `PoseWithCovarianceStamped` | 手动/外部播种初始位姿 |
 | `pc_in_map` | 发布 | `PointCloud2` | 匹配到 map 后的当前扫描 |
@@ -126,7 +126,7 @@ small_glim 输出的纯 xyz PCD。
 `fast_location_main.yaml` → 覆盖字典：
 
 ```text
-sub_scan_topic: /Laser_map
+sub_scan_topic: /Laser_map_dense
 map_pcd_path:   package://bringup/PCD/<world>.pcd
 scan_voxel_size: 0.20          # 体素放粗、线程收 2，牺牲精度换实时性
 submap_voxel_size_first/track: 0.20 / 0.35

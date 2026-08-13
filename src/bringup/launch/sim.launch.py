@@ -243,7 +243,7 @@ def generate_launch_description():
         parameters=[fast_location_params, {
             'use_sim_time': use_sim_time,
             'map_pcd_path': fast_location_pcd_path,
-            'sub_scan_topic': '/Laser_map',
+            'sub_scan_topic': '/Laser_map_dense',
             'scan_voxel_size': 0.20,
             'submap_voxel_size_first': 0.20,
             'submap_voxel_size_track': 0.35,

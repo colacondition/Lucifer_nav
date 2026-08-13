@@ -140,8 +140,25 @@ private:
     // EMA 平滑系数 α：接受新结果后 T_smooth = α*T_new + (1-α)*T_prev。
     // 越小越平滑、越滞后；默认 0.7 响应较快。
     double ema_alpha_{0.7};
+    // 出洞/几何恢复拍的临时 EMA 系数：接近 1（一拍吸收绝大部分修正，避免数秒
+    // 爬行），又保留少量平滑防止单拍噪声完全外露成抖动。
+    double recovery_alpha_{0.95};
     bool ema_initialized_{false};
     Eigen::Matrix4f ema_transform_{Eigen::Matrix4f::Identity()};
+    // 出洞检测：上一拍是否退化。退化→正常的转变（几何恢复，如出隧道）意味着
+    // 本拍 ICP 修正是找回退化期间累积的漂移，应用高 α 快速收敛而非 0.7 爬行。
+    bool last_degenerate_{false};
+    bool degeneracy_recovery_{false};
+    // 连续退化拍数（迟滞）：单拍条件数在阈值附近抖动会频繁误触发出洞。
+    // 连续 degenerate_enter_streak_ 拍退化才认定"在洞里"，之后出洞才触发恢复。
+    int degenerate_streak_{0};
+    int degenerate_enter_streak_{3};
+    // 粗→细逃逸的触发周期：每 coarse_every_ 拍穿插一次粗尺度 ICP（打破自锁
+    // 累积漂移），其余拍用单尺度 1.0 保持逐拍稳定。粗尺度每拍都跑会把随机
+    // 逃逸变成逐拍抖动（体素 0.4m、对应距离 3m 太松，重复几何里每拍收敛到
+    // 不同局部最优），降频后只在需要时拉回漂移，抖动被 EMA 平滑。
+    int coarse_every_{5};
+    int frame_counter_{0};
     int gicp_max_iterations_first_ = 50;
     int gicp_max_iterations_track_ = 20;
     bool publish_tf_ = true; // 是否发布 map->odom TF

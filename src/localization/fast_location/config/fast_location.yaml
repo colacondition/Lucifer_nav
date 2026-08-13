@@ -23,7 +23,7 @@
     ema_alpha: 0.7
 
     # ========== 话题配置 ==========
-    sub_scan_topic: "/lio/cloud_world"          # 订阅点云话题
+    sub_scan_topic: "/Laser_map_dense"          # 订阅点云话题（small_glim 的定位稠密点云）
     sub_odom_topic: "/lio/robo/odom"            # 订阅里程计话题
     sub_init_pose_topic: "initialpose_3d"      # PoseStamped初始位姿话题
     sub_init_pose_covariance_topic: "/initialpose"  # RViz 2D Pose Estimate 初始位姿

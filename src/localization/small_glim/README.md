@@ -2,7 +2,7 @@
 
 LIO 里程计 + 建图包（GLIM 的因子图精简版）。吃 Mid360 的 `/livox/lidar/pointcloud`
 和 `/livox/imu`，用 **GTSAM ISAM2 固定滞后平滑 + IMU 预积分 + GICP/iVox** 估计位姿，
-输出 `/Odometry`、`/lio/robo/odom`（供 fast_location）、`/Laser_map`（世界系点云），
+输出 `/Odometry`、`/lio/robo/odom`（供 fast_location）、`/Laser_map`（odometry 下采样世界系点云）、`/Laser_map_dense`（供 fast_location 的定位稠密点云），
 并广播动态 `lidar_odom→base_link` TF。
 
 ```text
@@ -20,7 +20,7 @@ LIO 里程计 + 建图包（GLIM 的因子图精简版）。吃 Mid360 的 `/liv
 
 | 文件 | 职责 |
 | :- | :- |
-| `src/small_glim_node.cpp` | ROS 接线：订阅/发布、`pub_odometry`（双发 odom + TF）、`pub_cloud`（/Laser_map）、析构时落盘 |
+| `src/small_glim_node.cpp` | ROS 接线：订阅/发布、`pub_odometry`（双发 odom + TF）、`pub_cloud`（/Laser_map）、`pub_localization_cloud`（/Laser_map_dense）、析构时落盘 |
 | `src/preprocess/` | `cloud_deskewing`（逐点时间戳去畸变）、`cloud_covariance_estimation`、`cloud_preprocessor`（距离滤波+体素降采样+离群点剔除）、`time_keeper`（时间戳校验/伪时间戳） |
 | `src/odometry/` | `initial_state_estimation`（重力水平+航向锚定初始化）、`imu_integration`（预积分）、`odometry_estimation`（ISAM2 因子图）、`async_odometry_estimation`（线程封装）、`estimation_frame` |
 | `src/mapping/` | `async_mapping`：关键帧选取、增量合并、退出时 `save_final_map()` |
@@ -41,7 +41,7 @@ LIO 里程计 + 建图包（GLIM 的因子图精简版）。吃 Mid360 的 `/liv
   配准点取 `target_downsampling_rate`；支持 `ivox_update_delay`（延迟插帧防自碰撞
   "impact"）、`ivox_impact_pause_duration`（撞击后暂停更新）。
 - **强度纯透传**：LIO 是纯几何（xyz + 协方差），`intensity_field` 只做提取，不参与
-  匹配；发布 `/Laser_map` 时逐点带 intensity（无则填 0），避免下游 PCL 报警。
+  匹配；发布 `/Laser_map`/`/Laser_map_dense` 时逐点带 intensity（无则填 0），避免下游 PCL 报警。
 
 ## 参数分层
 
@@ -105,13 +105,14 @@ msgpack（详见根 README「由点云生成语义地图」）。
 | `/livox/imu` | 订阅 | IMU |
 | `/Odometry` | 发布 | 里程计，child=base_link 实为雷达位姿（super_lio 约定），MPC 消费 |
 | `/lio/robo/odom` | 发布 | 与 /Odometry 同内容，供 fast_location |
-| `/Laser_map` | 发布 | 世界系点云，frame=`world`（odom→world 是静态恒等） |
+| `/Laser_map` | 发布 | odometry 下采样世界系点云（可视化/调试），frame=`world`（odom→world 是静态恒等） |
+| `/Laser_map_dense` | 发布 | 给 fast_location 的定位稠密点云（更细下采样，独立于 odometry 分辨率），frame=`world` |
 | `/small_glim/ivox_cloud` | 发布 | 调试用 iVox 目标点云 |
 
 TF：动态 `lidar_odom→base_link`（修正帧率，`enable_tf_publish` 时）；odom 原点 z 锚在
 开机雷达平面。`odom→lidar_odom`、`odom→world` 由 bringup 的静态 TF 提供。
 
-**修正帧率 = 点云率（约 10Hz）**：三个输出（TF/odom/Laser_map）同频同源。此前试过把
+**修正帧率 = 点云率（约 10Hz）**：TF/odom/点云（Laser_map、Laser_map_dense）同频同源。此前试过把
 TF/odom 外推到 IMU 率，引发"方块抖"和"点云拉丝"，已回退；要保持 10Hz 一致。
 
 ## 依赖

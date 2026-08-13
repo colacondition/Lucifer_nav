@@ -14,6 +14,7 @@ CloudPreprocessorParams::CloudPreprocessorParams(const Config::Ptr config) {
     distance_far_thresh = config->param<double>("preprocess.distance_far_thresh");
     use_random_grid_downsampling = config->param<bool>("preprocess.use_random_grid_downsampling");
     downsample_resolution = config->param<double>("preprocess.downsample_resolution");
+    localization_downsample_resolution = config->param<double>("preprocess.localization_downsample_resolution");
     downsample_target = config->param<int>("preprocess.random_downsample_target");
     downsample_rate = config->param<double>("preprocess.random_downsample_rate");
     enable_outlier_removal = config->param<bool>("preprocess.enable_outlier_removal");
@@ -204,6 +205,69 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess(const RawPoints::ConstPtr r
 
     logger::debug("cloud_preprocess", "Preprocessed: {} -> {} points", raw_points->size(), preprocessed->size());
     return preprocessed;
+}
+
+PreprocessedFrame::Ptr CloudPreprocessor::preprocess_for_localization(const RawPoints::ConstPtr raw_points) {
+    if (params->localization_downsample_resolution <= 0.0) {
+        // <=0 disables the separate localization cloud entirely.
+        return nullptr;
+    }
+
+    std::vector<double> times(raw_points->times);
+    std::vector<Eigen::Vector4d> points(raw_points->points);
+    std::vector<double> intensities(raw_points->intensities);
+
+    auto frame = std::make_shared<gtsam_points::PointCloud>();
+    frame->num_points = raw_points->size();
+    frame->times = times.data();
+    frame->points = points.data();
+    if (!intensities.empty()) {
+        frame->intensities = intensities.data();
+    }
+
+    // Finer voxel downsampling than the odometry path. This is the whole point of the
+    // decoupling: fast_location's global search needs a dense cloud to score well, while
+    // odometry's GICP needs a coarser cloud to keep its per-frame cost flat.
+    frame = gtsam_points::voxelgrid_sampling(
+        frame,
+        params->localization_downsample_resolution,
+        params->num_threads
+    );
+
+    // Distance filter (same near/far window as the odometry cloud).
+    std::vector<int> indices;
+    indices.reserve(frame->size());
+    const double squared_distance_near_thresh = params->distance_near_thresh * params->distance_near_thresh;
+    const double squared_distance_far_thresh = params->distance_far_thresh * params->distance_far_thresh;
+    for (size_t i = 0; i < frame->size(); i++) {
+        const bool is_finite = frame->points[i].allFinite();
+        const double squared_dist = (Eigen::Vector4d() << frame->points[i].head<3>(), 0.0).finished().squaredNorm();
+        if (squared_dist > squared_distance_near_thresh && squared_dist < squared_distance_far_thresh && is_finite) {
+            indices.push_back(static_cast<int>(i));
+        }
+    }
+    if (indices.size() < static_cast<size_t>(params->min_points_after_filter)) {
+        return nullptr;
+    }
+
+    std::sort(indices.begin(), indices.end(), [&](const int lhs, const int rhs) {
+        return frame->times[lhs] < frame->times[rhs];
+    });
+    frame = gtsam_points::sample(frame, indices);
+
+    auto localized = std::make_shared<PreprocessedFrame>();
+    localized->stamp = raw_points->stamp;
+    localized->scan_end_time = raw_points->stamp + frame->times[frame->size() - 1];
+    localized->times.assign(frame->times, frame->times + frame->size());
+    localized->points.assign(frame->points, frame->points + frame->size());
+    if (frame->intensities) {
+        localized->intensities.assign(frame->intensities, frame->intensities + frame->size());
+    }
+    // No neighbor_indices: fast_location never consumes them, and building a kd-tree for
+    // the dense cloud every frame would waste CPU.
+
+    logger::debug("cloud_preprocess", "Localization cloud: {} -> {} points", raw_points->size(), localized->size());
+    return localized;
 }
 
 std::vector<size_t> CloudPreprocessor::find_neighbors(

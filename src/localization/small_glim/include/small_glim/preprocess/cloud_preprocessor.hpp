@@ -22,6 +22,7 @@ public:
     bool global_shutter; ///< Assume all points in a scan are takes at the same moment and replace per-point timestamps with zero (disable deskewing)
     bool use_random_grid_downsampling; ///< If true, use random grid downsampling, otherwise, use the conventional voxel grid
     double downsample_resolution; ///< Downsampling resolution
+    double localization_downsample_resolution; ///< Downsampling resolution for the denser localization cloud (finer than the odometry cloud)
     int downsample_target; ///< Target number of points for downsampling
     double downsample_rate; ///< Downsamping rate (used for random grid downsampling)
     bool enable_outlier_removal; ///< If true, apply statistical outlier removal
@@ -57,6 +58,18 @@ public:
     * @return Preprocessed points
     */
     PreprocessedFrame::Ptr preprocess(const RawPoints::ConstPtr raw_points);
+
+    /**
+    * @brief Preprocess a raw point cloud for fast_location localization
+    * @param raw_points  Raw points
+    * @return Preprocessed points (LiDAR frame)
+    *
+    * Independent of the odometry path: downsamples at a finer resolution so fast_location
+    * sees a denser cloud, while odometry keeps its coarser (jitter-free) resolution.
+    * Points stay in the LiDAR frame; the node transforms them with the odometry pose at
+    * publish time. No k-NN indices are computed (fast_location never consumes them).
+    */
+    PreprocessedFrame::Ptr preprocess_for_localization(const RawPoints::ConstPtr raw_points);
 
 private:
     std::vector<size_t> find_neighbors(const Eigen::Vector4d* points, const size_t num_points, const size_t k) const;

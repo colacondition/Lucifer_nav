@@ -16,15 +16,15 @@ MPC 控制器、隧道云台请求、云台可视化等）编进同一个 shared
 数据流：
 
 ```text
-Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /Laser_map
+Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /Laser_map, /Laser_map_dense
               │      ▲
               │      └── /livox/imu
               └─► cpp_lidar_filter ──► linefit_ground_segmentation
                                             └─► /segmentation/obstacle
                                                        │
-/Laser_map ──► fast_location ──(map→odom)──┐           │
-                                           ▼           ▼
-                                  navigation2 (A* + 距离场 + MPC)
+/Laser_map_dense ──► fast_location ──(map→odom)──┐     │
+                                                 ▼     ▼
+                                        navigation2 (A* + 距离场 + MPC)
                                            │
         /cmd_vel_nav_raw ──► goal_approach_controller
                              ──► /cmd_vel_nav ──► velocity_smoother
@@ -39,7 +39,8 @@ Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /L
 | `/livox/lidar/pointcloud` | `PointCloud2` | 雷达点云（mid360_driver 实车 / 仿真插件统一发这条，不再有 CustomMsg） |
 | `/segmentation/obstacle` | `PointCloud2` | 地面分割后的障碍点，代价地图输入 |
 | `/Odometry` | `Odometry` | small_glim 里程计（`/lio/robo/odom` 内容相同，供 fast_location） |
-| `/Laser_map` | `PointCloud2` | small_glim 世界系点云，`world` 系 |
+| `/Laser_map` | `PointCloud2` | small_glim 世界系点云（odometry 下采样帧，`world` 系，供可视化/调试） |
+| `/Laser_map_dense` | `PointCloud2` | small_glim 给 fast_location 的定位稠密点云（更细下采样，`world` 系） |
 | `/map` | `OccupancyGrid` | 先验栅格地图 |
 | `/goal_pose` | `PoseStamped` | 导航目标 |
 | `/plan` `/predict_path` | `Path` | 全局路径 / MPC 预测轨迹 |

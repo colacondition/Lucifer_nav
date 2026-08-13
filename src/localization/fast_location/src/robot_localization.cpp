@@ -113,6 +113,13 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     }
     this->declare_parameter<double>("ema_alpha", 0.7);
     ema_alpha_ = this->get_parameter("ema_alpha").as_double();
+    this->declare_parameter<double>("recovery_alpha", 0.95);
+    recovery_alpha_ = this->get_parameter("recovery_alpha").as_double();
+    this->declare_parameter<int>("degenerate_enter_streak", 3);
+    degenerate_enter_streak_ = this->get_parameter("degenerate_enter_streak").as_int();
+    this->declare_parameter<int>("coarse_every", 5);
+    coarse_every_ = static_cast<int>(
+        std::max<int64_t>(1, this->get_parameter("coarse_every").as_int()));
     use_fast_gicp_ = this->get_parameter("use_fast_gicp").as_bool();
     use_cuda_ = this->get_parameter("use_cuda").as_bool();
     gicp_num_threads_ = this->get_parameter("gicp_num_threads").as_int();
@@ -713,8 +720,33 @@ bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess
     }
     else
     {
-        // 后续跟踪直接单尺度，速度更快。
-        T_final = this->runICP(scan_for_icp, submap, pose_guess, 1.0, gicp_max_iterations_track_, fitness);
+        // 跟踪：默认单尺度 1.0（逐拍稳定），每 coarse_every_ 拍穿插一次粗→细
+        // 逃逸。粗尺度（2.0）体素大、点数少、对应距离阈值放大到 3m，收敛域
+        // 更大，能跳出单尺度 ICP 困住的局部最优（累积漂移的根源）；但每拍都跑
+        // 会把这种随机逃逸变成逐拍抖动（重复几何里每拍收敛到不同局部最优），
+        // 所以降频穿插，只定期拉回漂移，其余拍交给稳定的单尺度 + EMA 平滑。
+        ++frame_counter_;
+        if (frame_counter_ >= coarse_every_) {
+            frame_counter_ = 0;
+            Eigen::Matrix4f T_coarse = this->runICP(
+                scan_for_icp, submap, pose_guess, 2.0, gicp_max_iterations_track_, fitness);
+            T_final = this->runICP(
+                scan_for_icp, submap, T_coarse, 1.0, gicp_max_iterations_track_, fitness);
+        } else {
+            T_final = this->runICP(
+                scan_for_icp, submap, pose_guess, 1.0, gicp_max_iterations_track_, fitness);
+        }
+        // 出洞迟滞：连续 degenerate_enter_streak_ 拍退化才认定"在洞里"，
+        // 退化→正常的转变（几何恢复，如出隧道）才触发快速收敛。单拍条件数在
+        // 阈值附近抖动不会误触发（否则频繁跳过 EMA 平滑，逐拍噪声外露成抖动）。
+        if (last_degenerate_) {
+            ++degenerate_streak_;
+        } else if (degenerate_streak_ >= degenerate_enter_streak_) {
+            degeneracy_recovery_ = true;
+            degenerate_streak_ = 0;
+        } else {
+            degenerate_streak_ = 0;
+        }
     }
     auto icp_end = std::chrono::high_resolution_clock::now();
     auto icp_time = std::chrono::duration_cast<std::chrono::milliseconds>(icp_end - icp_start).count();
@@ -744,6 +776,10 @@ bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess
         "[FAILED] Localization failed | Fitness: %.4f < %.4f | Pose: (%.2f, %.2f, %.2f) | Shift: %.2fm | Time: %ldms",
         fitness, th, final_trans.x(), final_trans.y(), final_trans.z(), pose_shift, total_time);
     if (!first_localization_) {
+        // 本拍失败不会进入 acceptLocalizationResult，出洞标志若残留会在下一拍
+        // 被误当成"几何恢复直接接受"。这里清零，避免跨拍泄漏。
+        degeneracy_recovery_ = false;
+        degenerate_streak_ = 0;
         handleTrackingFailure();
     }
     return false;
@@ -758,18 +794,26 @@ bool RobotLocalizationNode::acceptLocalizationResult(
     const std::chrono::high_resolution_clock::time_point &start_time,
     bool global_search_result)
 {
+    // 出洞/几何恢复拍用高 α 快速收敛：退化期间沿退化轴交回 LIO，LIO 累积的
+    // 漂移在几何恢复后由 ICP 一次性找回；若仍走 0.7 的 EMA 会抹成数秒爬行。
+    // 保留少量平滑（recovery_alpha_≈0.95）防止本拍单点噪声完全外露成抖动。
+    const bool recovered = degeneracy_recovery_;
+    degeneracy_recovery_ = false;
     {
         std::lock_guard<std::mutex> lock(tf_mutex);
         // EMA 平滑：防止定位更新在低频（0.5Hz）下产生 map→odom 的突变跳帧。
         // 借鉴 B（HWSentryNav26）的 odom_localizer 平滑策略；α=0.7 时每拍吸收
         // 70% 新结果，约 3 个更新周期（6s）完全收敛。
-        // 全局重定位后直接接受（ema_initialized_ 清零），避免从错误旧位置插值。
+        // 全局重定位/首次后直接接受（ema_initialized_ 清零），避免从错误旧位置插值。
         if (!ema_initialized_ || global_search_result) {
             ema_transform_ = result;
             ema_initialized_ = true;
         } else {
             // 在 SE(2) 上做线性插值（z 轴忽略，平面机器人）。
-            const float alpha = static_cast<float>(std::clamp(ema_alpha_, 0.0, 1.0));
+            // 出洞恢复拍临时用 recovery_alpha_（≈0.95）快速吸收大修正，其余用 ema_alpha_。
+            const float alpha = recovered
+                ? static_cast<float>(std::clamp(recovery_alpha_, 0.0, 1.0))
+                : static_cast<float>(std::clamp(ema_alpha_, 0.0, 1.0));
             // 平移插值
             ema_transform_.block<3,1>(0,3) =
                 alpha * result.block<3,1>(0,3) +
@@ -983,6 +1027,8 @@ Eigen::Matrix4f RobotLocalizationNode::runICP(PointCloudXYZI::Ptr src, PointClou
         return Eigen::Matrix4f::Identity();
     }
     fitness_score = assessment.inlier_ratio;
+    // 记录本拍退化状态，供出洞检测（退化→正常的转变）在 acceptLocalizationResult 使用。
+    last_degenerate_ = assessment.is_degenerate;
 
     // 可观测性门控。长走廊场景下点云沿走廊方向几乎没有匹配约束，GICP 在该
     // 方向给出的平移修正是噪声。

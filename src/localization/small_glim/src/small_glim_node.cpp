@@ -28,6 +28,7 @@ public:
 
     void pub_odometry(const EstimationFrame::ConstPtr frame);
     void pub_cloud(const EstimationFrame::ConstPtr frame, const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher);
+    void pub_localization_cloud(const EstimationFrame::ConstPtr frame, const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher);
     void wait();
 
 private:
@@ -57,6 +58,12 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr robo_odometry_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr registered_cloud_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr ivox_cloud_pub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr localization_cloud_pub;
+
+    // Latest denser localization cloud (LiDAR frame), produced alongside the odometry
+    // cloud and transformed by the odometry pose at publish time. Written in
+    // lidar_callback, read in timer_callback; both run on the executor's single thread.
+    PreprocessedFrame::ConstPtr latest_localization_frame;
 };
 
 }
@@ -106,6 +113,7 @@ SmallGlimNode::SmallGlimNode(const rclcpp::NodeOptions& options): Node("small_gl
     const std::string odometry_pub_topic = config->param<std::string>("node.odometry_pub_topic");
     const std::string robo_odometry_pub_topic = config->param<std::string>("node.robo_odometry_pub_topic");
     const std::string registered_cloud_pub_topic = config->param<std::string>("node.registered_cloud_pub_topic");
+    const std::string localization_cloud_pub_topic = config->param<std::string>("node.localization_cloud_pub_topic");
     const std::string ivox_cloud_pub_topic = config->param<std::string>("node.ivox_cloud_pub_topic");
 
     // Subscribers
@@ -122,6 +130,7 @@ SmallGlimNode::SmallGlimNode(const rclcpp::NodeOptions& options): Node("small_gl
     odometry_pub = create_publisher<nav_msgs::msg::Odometry>(odometry_pub_topic, rclcpp::QoS(1));
     robo_odometry_pub = create_publisher<nav_msgs::msg::Odometry>(robo_odometry_pub_topic, rclcpp::QoS(1));
     registered_cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>(registered_cloud_pub_topic, rclcpp::QoS(1));
+    localization_cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>(localization_cloud_pub_topic, rclcpp::QoS(1));
     ivox_cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>(ivox_cloud_pub_topic, rclcpp::QoS(1));
 
     // Start timer
@@ -178,6 +187,9 @@ size_t SmallGlimNode::lidar_callback(const sensor_msgs::msg::PointCloud2::ConstS
         logger::warn("node", "skip LiDAR frame rejected by preprocessing (stamp={:.6f})", raw_points->stamp);
         return 0;
     }
+    // Denser cloud for fast_location, decoupled from the odometry downsampling. Produced
+    // here (once per accepted frame) and transformed at publish time with the odometry pose.
+    latest_localization_frame = preprocessor->preprocess_for_localization(raw_points);
     odometry_estimation->insert_frame(preprocessed);
     const size_t workload = odometry_estimation->workload();
     logger::debug("node", "workload={}", workload);
@@ -192,6 +204,7 @@ void SmallGlimNode::timer_callback() {
     if (!estimation_frames.empty()) {
         pub_odometry(estimation_frames.back());
         pub_cloud(estimation_frames.back(), registered_cloud_pub);
+        pub_localization_cloud(estimation_frames.back(), localization_cloud_pub);
     }
     if (!target_ivox_frames.empty()) {
         pub_cloud(target_ivox_frames.back(), ivox_cloud_pub);
@@ -273,14 +286,70 @@ void SmallGlimNode::pub_cloud(
     field_intensity.count = 1;
     msg.fields = {field_x, field_y, field_z, field_intensity};
     msg.data.resize(msg.row_step * msg.height);
-    // fast_location converts /Laser_map into pcl::PointCloudXYZI and PCL warns every
-    // frame when the intensity field is missing. Emit real intensity when available
-    // (mid360 real hardware), otherwise zeros (sim plugin has no intensity).
+    // Downstream PCL consumers (fast_location, rviz) convert these clouds into
+    // pcl::PointCloudXYZI and PCL warns every frame when the intensity field is missing.
+    // Emit real intensity when available (mid360 real hardware), otherwise zeros (sim
+    // plugin has no intensity).
     const bool has_intensity = frame->frame->has_intensities();
     for (size_t i = 0; i < num_points; i++) {
         Eigen::Vector3f pt = points[i](Eigen::seq(0, 2)).cast<float>();
         if (frame->frame_type != FrameType::WORLD) pt = frame->T_world_frame().cast<float>() * pt;
         const float intensity = has_intensity ? static_cast<float>(frame->frame->intensities[i]) : 0.0f;
+        std::memcpy(msg.data.data() + i * 16, pt.data(), sizeof(pt));
+        std::memcpy(msg.data.data() + i * 16 + 12, &intensity, sizeof(intensity));
+    }
+    publisher->publish(msg);
+}
+
+void SmallGlimNode::pub_localization_cloud(
+    const EstimationFrame::ConstPtr frame,
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher
+) {
+    const auto& dense = latest_localization_frame;
+    if (!dense || dense->points.empty()) {
+        return;
+    }
+    const size_t num_points = dense->points.size();
+    sensor_msgs::msg::PointCloud2 msg;
+    msg.header.frame_id = cloud_frame_id;
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(frame->stamp * 1e9));
+    msg.height = 1;
+    msg.width = static_cast<uint32_t>(num_points);
+    msg.is_dense = true;
+    msg.point_step = 16;
+    msg.row_step = static_cast<uint32_t>(16 * num_points);
+    sensor_msgs::msg::PointField field_x;
+    field_x.name = "x";
+    field_x.offset = 0;
+    field_x.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    field_x.count = 1;
+    sensor_msgs::msg::PointField field_y;
+    field_y.name = "y";
+    field_y.offset = 4;
+    field_y.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    field_y.count = 1;
+    sensor_msgs::msg::PointField field_z;
+    field_z.name = "z";
+    field_z.offset = 8;
+    field_z.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    field_z.count = 1;
+    sensor_msgs::msg::PointField field_intensity;
+    field_intensity.name = "intensity";
+    field_intensity.offset = 12;
+    field_intensity.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    field_intensity.count = 1;
+    msg.fields = {field_x, field_y, field_z, field_intensity};
+    msg.data.resize(msg.row_step * msg.height);
+    // Localization cloud is kept in the LiDAR frame; transform with the (smoothed) odometry
+    // pose. No per-point deskew here: fast_location voxel-downsamples to 0.2 m and stacks
+    // several frames, so the whole-frame approximation (a "global shutter" cloud) is well
+    // within its tolerance at nav speeds.
+    const Eigen::Isometry3f T_world_lidar = frame->T_world_lidar.cast<float>();
+    const bool has_intensity = !dense->intensities.empty();
+    for (size_t i = 0; i < num_points; i++) {
+        Eigen::Vector3f pt = dense->points[i].head<3>().cast<float>();
+        pt = T_world_lidar * pt;
+        const float intensity = has_intensity ? static_cast<float>(dense->intensities[i]) : 0.0f;
         std::memcpy(msg.data.data() + i * 16, pt.data(), sizeof(pt));
         std::memcpy(msg.data.data() + i * 16 + 12, &intensity, sizeof(intensity));
     }
