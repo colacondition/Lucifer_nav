@@ -4,7 +4,7 @@ RoboMaster 哨兵导航工作空间，ROS 2 Humble + Gazebo Classic 11，支持�
 
 仿真效果演示：
 
-<video src="docs/sim_demo.webm" controls width="100%"></video>
+![仿真效果演示](docs/sim_demo.gif)
 
 ## 一. 项目介绍
 
