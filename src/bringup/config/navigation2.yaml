@@ -31,9 +31,13 @@ rm_global_planner:
     unknown_cost: 1.4
     obstacle_threshold: 100
     apply_internal_inflation: false
+    # A* 格代价映射：cellCost = 1 + map_cost_weight * (格值/100)^map_cost_exponent。
+    # weight 越大越绕开高代价格（越不贴墙）；exponent <1 抬高低代价、>1 放大高代价。
     map_cost_weight: 20.0
     map_cost_exponent: 2.0
     planner_tolerance: 0.5
+    # 净空偏好：离障碍距离 < desired 时加 weight*((desired-dist)/desired)²。
+    # 让路径尽量离墙 desired 远。weight 越大越远离墙（但更绕）。
     use_clearance_cost: true
     clearance_desired_distance: 0.4
     clearance_cost_weight: 3.0
@@ -41,7 +45,11 @@ rm_global_planner:
     replan_on_source_update: false
     min_replan_distance: 0.20
     replan_request_topic: /navigation2/replan_request
+    # 转向惩罚：turn_cost = turn_penalty * (1 - cos(转向角))。越大路径越直（少
+    # 拐弯、少蛇形），但可能绕更远；越小越贴近几何最短但拐角多。
     turn_penalty: 0.12
+    # 局部缝合：重规划时在旧路径前方 stitch_min_lookahead_distance 处接新路径，
+    # 避免整条路径跳变；缝合段最长 stitch_max_distance。车头路径抖优先看这里。
     local_stitch_enabled: true
     stitch_min_lookahead_distance: 0.8
     stitch_max_distance: 3.0
@@ -205,6 +213,12 @@ rm_local_costmap:
     reuse_previous_grid: true
     previous_obstacle_decay: 8
 
+# 到点接近控制器：插在 MPC 与 velocity_smoother 之间，负责「快到目标时的减速与对准」。
+# MPC 的输出（/cmd_vel_nav_raw）经过这里再交给 velocity_smoother。三段式：
+#   dist >  approach_distance         原样转发 MPC 指令（含朝向）
+#   dist <= approach_distance         限速到 approach_velocity，方向不动
+#   dist <= direct_approach_distance  P 控制对准目标（速度 = dist * kp，越近越慢）
+#   dist <= goal_tolerance            到达，无条件发零 Twist
 goal_approach_controller:
   ros__parameters:
     use_sim_time: true
@@ -214,24 +228,32 @@ goal_approach_controller:
     output_cmd_vel_topic: /cmd_vel_nav
     path_topic: /plan
     approach_enabled_topic: /goal_approach_controller/enabled
+    # 距离目标多远开始限速（m）。调小=更晚减速、冲得更近；调大=更早收住。
     approach_distance: 1.5
+    # 接近段速度上限（m/s）。调小=到点更慢更稳，调大=冲得更快。
     approach_velocity: 0.5
+    # 直接对准段半径（m）：小于此值后用 P 控制直接对准目标（角度速度置零）。
     direct_approach_distance: 0.5
+    # 对准段 P 增益：目标速度 = dist * kp。越大到点越果断，过大易过冲、摆动。
     direct_approach_kp: 1.0
+    # 到达判定半径（m）。必须 <= 上游 MPC 的 goal_tolerance(0.25)，否则 MPC 还
+    # 在发速度、这里已经按住车不动，会到点反复蠕动。当前两者一致消除死区。
     goal_tolerance: 0.25
 
+# 速度平滑器：对上游指令做限幅 + 平滑，输出最终 /cmd_vel。车「一顿一顿」或
+# 「起步/刹车太猛」优先查这里。
 rm_velocity_smoother:
   ros__parameters:
     use_sim_time: true
     input_cmd_vel_topic: /cmd_vel_nav
     output_cmd_vel_topic: /cmd_vel
-    smoothing_frequency: 20.0
-    velocity_timeout: 0.5
-    max_velocity: [2.0, 2.0, 3.0]
-    min_velocity: [-2.0, -2.0, -3.0]
-    max_accel: [4.0, 4.0, 6.0]
-    max_decel: [-4.0, -4.0, -6.0]
-    deadband_velocity: [0.0, 0.0, 0.0]
+    smoothing_frequency: 20.0   # 平滑器输出频率（Hz）
+    velocity_timeout: 0.5       # 输入超时（s）：超过此时长无输入即归零停车
+    max_velocity: [2.0, 2.0, 3.0]     # 速度上限 [x, y, yaw]（m/s, rad/s）
+    min_velocity: [-2.0, -2.0, -3.0]  # 速度下限（负值 = 允许倒车/反向转）
+    max_accel: [4.0, 4.0, 6.0]        # 加速度上限 [x, y, yaw]（m/s², rad/s²）
+    max_decel: [-4.0, -4.0, -6.0]     # 减速度上限（负值，越负刹车越急）
+    deadband_velocity: [0.0, 0.0, 0.0]  # 死区：绝对值小于此值强制归零（抑制微抖）
 
 rm_nav2_compat:
   ros__parameters:
@@ -257,9 +279,14 @@ rm_mpc_controller:
     # 之间形成死区：本节点还认为「没到」继续求解发速度，下游已无条件发零
     # Twist 把车按住，白算一场。两者一致时死区消失。
     goal_tolerance: 0.25
+    # 跟踪残差超过此值判为「跟丢」（触发 tracker 丢失 / 恢复链）。调大=更容忍
+    # 路径偏差（不易报丢但可能偏离路线），调小=更严格（频繁报丢）。
     max_track_error: 0.5
+    # 终点盲区（m）：路径终点附近此半径内跳过参考点（避免终点数值抖动）。
     blind_radius: 0.1
+    # 指令延迟补偿（s）：odom 相对当前时刻的延迟，>0 时外推位姿。默认关。
     delay_time: 0.0
+    # 无参考航向时的默认角速度（rad/s）。一般保持 0。
     default_wz: 0.0
     # Prediction horizon (MPC): steps * predict_dt seconds ahead.
     predict_steps: 30
@@ -267,7 +294,10 @@ rm_mpc_controller:
     max_speed: 2.0
     max_accel: 4.0
     turtle_max_speed: 1.0
-    # QP weights: Q=position tracking, R=control magnitude, Rd=control smoothness.
+    # QP 权重：Q=位置跟踪、R=控制量大小、Rd=控制平滑度。
+    #   轨迹贴不贴        → 调 Q（大=贴得紧，但易震荡/超调）
+    #   速度敢不敢给      → 调 R（大=越省力越保守，速度上不去）
+    #   速度/角速度抖不抖 → 调 Rd（大=越平滑，但响应滞后）
     Q: [15.0, 15.0]
     R: [0.1, 0.1]
     Rd: [1.0, 0.05]

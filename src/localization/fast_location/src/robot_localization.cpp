@@ -117,7 +117,7 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     recovery_alpha_ = this->get_parameter("recovery_alpha").as_double();
     this->declare_parameter<int>("degenerate_enter_streak", 3);
     degenerate_enter_streak_ = this->get_parameter("degenerate_enter_streak").as_int();
-    this->declare_parameter<int>("coarse_every", 5);
+    this->declare_parameter<int>("coarse_every", 3);
     coarse_every_ = static_cast<int>(
         std::max<int64_t>(1, this->get_parameter("coarse_every").as_int()));
     use_fast_gicp_ = this->get_parameter("use_fast_gicp").as_bool();
@@ -726,12 +726,17 @@ bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess
         // 会把这种随机逃逸变成逐拍抖动（重复几何里每拍收敛到不同局部最优），
         // 所以降频穿插，只定期拉回漂移，其余拍交给稳定的单尺度 + EMA 平滑。
         ++frame_counter_;
+        coarse_escape_ = false;
         if (frame_counter_ >= coarse_every_) {
             frame_counter_ = 0;
             Eigen::Matrix4f T_coarse = this->runICP(
                 scan_for_icp, submap, pose_guess, 2.0, gicp_max_iterations_track_, fitness);
             T_final = this->runICP(
                 scan_for_icp, submap, T_coarse, 1.0, gicp_max_iterations_track_, fitness);
+            // 校正拍彻底吸收：跳出局部最优后的大修正若仍用 0.7 的 EMA，每拍会
+            // 剩 30% 累积成漂移。用 recovery_alpha_ 一次到位（漂移本就慢，校正
+            // 量小，不会产生可见跳变）。
+            coarse_escape_ = true;
         } else {
             T_final = this->runICP(
                 scan_for_icp, submap, pose_guess, 1.0, gicp_max_iterations_track_, fitness);
@@ -779,6 +784,7 @@ bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess
         // 本拍失败不会进入 acceptLocalizationResult，出洞标志若残留会在下一拍
         // 被误当成"几何恢复直接接受"。这里清零，避免跨拍泄漏。
         degeneracy_recovery_ = false;
+        coarse_escape_ = false;
         degenerate_streak_ = 0;
         handleTrackingFailure();
     }
@@ -797,8 +803,9 @@ bool RobotLocalizationNode::acceptLocalizationResult(
     // 出洞/几何恢复拍用高 α 快速收敛：退化期间沿退化轴交回 LIO，LIO 累积的
     // 漂移在几何恢复后由 ICP 一次性找回；若仍走 0.7 的 EMA 会抹成数秒爬行。
     // 保留少量平滑（recovery_alpha_≈0.95）防止本拍单点噪声完全外露成抖动。
-    const bool recovered = degeneracy_recovery_;
+    const bool recovered = degeneracy_recovery_ || coarse_escape_;
     degeneracy_recovery_ = false;
+    coarse_escape_ = false;
     {
         std::lock_guard<std::mutex> lock(tf_mutex);
         // EMA 平滑：防止定位更新在低频（0.5Hz）下产生 map→odom 的突变跳帧。

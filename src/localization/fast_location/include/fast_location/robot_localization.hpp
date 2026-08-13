@@ -149,6 +149,9 @@ private:
     // 本拍 ICP 修正是找回退化期间累积的漂移，应用高 α 快速收敛而非 0.7 爬行。
     bool last_degenerate_{false};
     bool degeneracy_recovery_{false};
+    // 粗→细校正拍：本拍跳出了单尺度局部最优，修正应彻底吸收（否则每拍剩
+    // 30% 会累积成漂移）。与出洞恢复共用 recovery_alpha_ 快速收敛。
+    bool coarse_escape_{false};
     // 连续退化拍数（迟滞）：单拍条件数在阈值附近抖动会频繁误触发出洞。
     // 连续 degenerate_enter_streak_ 拍退化才认定"在洞里"，之后出洞才触发恢复。
     int degenerate_streak_{0};
