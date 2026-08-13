@@ -81,7 +81,19 @@
     gicp_max_iterations_track: 70   # 跟踪阶段 GICP 最大迭代次数
 
     # ========== 全局重定位参数 ==========
-    enable_global_search: true
+    # 出生点固定，不需要全场搜索。全场搜索是纯暴力撒点 + 最近邻命中率打分、
+    # 没有任何出生先验，在对称场地（RMUL 两角几何相似）会以一定概率误锁到对角。
+    #
+    # 关掉后，出生定位走 globalLocalization(initial_pcd_to_odom)：初始猜测是
+    # 单位阵 = PCD 原点 = 出生点。成立的前提是 small_glim 的 world 原点锚在
+    # 开机雷达平面，且建图（mapping）和小跑（nav）都从同一个固定出生点起，
+    # 于是 PCD 原点就是出生点。多尺度 ICP 从出生点局部收敛，对角的候选离得
+    # 很远、根本不会被评估到，也就不会跳对角。
+    #
+    # 代价：跟踪丢失后 handleTrackingFailure 把 initialized 置回 false，下一拍
+    # 不再全场重定位，而是从出生点（单位阵）重新做局部 ICP —— 车离出生点远时
+    # 可能收不回来。要恢复「被抱走后全场重定位」，再把这个开关打开。
+    enable_global_search: false
     global_search_xy_step: 2.0
     global_search_yaw_step_deg: 30.0
     global_search_score_distance: 0.45

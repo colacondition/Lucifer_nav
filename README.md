@@ -96,6 +96,7 @@ map/<world>.pgm + .yaml                      slam_toolbox 建图、map_saver_cli
 PCD/<world>.pcd                              fast_location 的先验点云图（small_glim 建）
 tools/pgm_to_navmap.py                       pgm+yaml → msgpack 转换
 tools/semantic_map_editor.py                 语义地图人工标注：刷隧道、画轴线、填 spec
+tools/lidar_extrinsic_calibration.py         雷达外参标定（base_link2livox_frame）
 rviz/navigation.rviz                         nav 模式（Fixed Frame = map，含云台状态显示）
 rviz/mapping.rviz                            mapping 模式（Fixed Frame = world）
 ```
@@ -279,3 +280,37 @@ ros2 launch bringup real.launch.py world:=RMUL mode:=nav
 注意 `host_ip` 填的是**工控机自己的 IP，不是雷达 IP**（雷达是另一个网段的设备，
 驱动按目标端口收包即可）。三处任何一处不一致，表现都是
 `ros2 topic hz /livox/lidar/pointcloud` 无数据。
+
+### 4.5 标定雷达外参（base_link2livox_frame）
+
+`base_link2livox_frame`（`config/{simulation,reality}/measurement_params_*.yaml`）是
+雷达相对 base_link 的固定外参。雷达装在云台 yaw 轴上、车是全向轮，整个结构等价于
+「一个云台在地上走」，base_link 原点就是旋转中心。于是让车**原地打转**，雷达轨迹
+就是绕 base_link 原点的一个圆：圆拟合出圆心 = 旋转中心、半径 = 水平偏移，x/y 就能
+恢复出来；z 和安装 yaw 原地打转观测不到，只能手填。
+
+```sh
+# 1) 原地打转 1~3 圈（全向轮，让雷达绕 base_link 原点画圆），同时录 /lio/robo/odom
+ros2 bag record -o lidar_calib /lio/robo/odom
+
+# 2) 离线标定。z 是雷达离地高度的唯一来源：仿真 0.175（默认），实车 0.49
+python3 src/bringup/tools/lidar_extrinsic_calibration.py lidar_calib --mount-z 0.49 --mount-yaw-deg 0
+```
+
+脚本打印圆拟合圆心/半径、平移 `[x, y, z]`，并生成 `lidar_extrinsic_result.yaml`；
+把其中 `base_link2livox_frame.xyz/rpy` 粘回 `config/reality/measurement_params_real.yaml`
+（仿真粘 `config/simulation/measurement_params_sim.yaml`）即可。**只改 yaml**：launch
+启动时从 yaml 读值、以 `xyz:=`/`rpy:=` 传给 xacro 覆盖默认值，xacro 里的 `default=`
+只在手工单独渲染 URDF 时生效。
+
+要点：
+
+- x/y 是脚本从圆拟合里**估出来的**，不用手填；z（离地高度）和 yaw 手填。
+- 订阅 `/lio/robo/odom`：small_glim 把雷达位姿当 `base_link` 发出来（child=base_link
+  实为雷达位姿），脚本据此恢复雷达相对 base_link 的偏移。
+- roll/pitch 是「绕垂直轴旋转 + 固定倾角」下的 circular mean。倾角绕 y 轴（pitch）
+  时结果精确；实车 URDF 现在写的是 `rpy="0.7854 0 0"`（绕 x 轴 roll=45°），绕 x 轴
+  的倾角在原地打转时 roll/pitch 会随 yaw 一起变，标出来的 roll/pitch 要结合雷达实际
+  安装朝向人工核对，别直接照抄。
+- 输出是 `base_link2livox_frame`，不是 small_glim 的 `sensors.T_lidar_imu`，别覆盖
+  内部 IMU 外参。
