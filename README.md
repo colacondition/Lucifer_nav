@@ -59,6 +59,8 @@ src/perception/cpp_lidar_filter              去车身点云 + 降采样
 src/perception/linefit_ground_segmentation_ros2
                                              地面分割（linefit_ground_segmentation
                                              + _ros 两个包）
+src/perception/pointcloud_to_laserscan       建图链：去地面障碍点云 → 2D 扫描
+                                             （喂给 slam_toolbox）
 src/localization/small_glim                  LIO 里程计与建图（GLIM 精简版，
                                              GTSAM ISAM2 + GICP/iVox）
 src/localization/fast_location               点云对先验 PCD 的主定位
@@ -81,11 +83,14 @@ launch/sim.launch.py                         仿真入口
 launch/real.launch.py                        实车入口
 config/navigation2.yaml                      导航参数（launch 实际加载的是这份）
 config/fast_location_main.yaml               定位参数
+config/mapper_params_online_async.yaml       slam_toolbox 建图参数（mapping 模式）
 config/{simulation,reality}/                 分环境的外参、分割、LIO 参数
 urdf/sentry_robot_{sim,real}.xacro            机器人模型
 map/<world>.msgpack                          语义地图（唯一真源，/map 由它生成）
-PCD/<world>.pcd                              fast_location 的先验点云图
-tools/pcd_to_navmap.py                       点云 → msgpack 转换（pgm 链路已整体删除）
+map/<world>.pgm + .yaml                      slam_toolbox 建图、map_saver_cli 存出的栅格
+PCD/<world>.pcd                              fast_location 的先验点云图（small_glim 建）
+tools/pcd_to_navmap.py                       点云 → msgpack 转换（旧链，地面起伏大会误判）
+tools/pgm_to_navmap.py                       pgm+yaml → msgpack 转换（主链）
 tools/semantic_map_editor.py                 语义地图人工标注：刷隧道、画轴线、填 spec
 rviz/navigation.rviz                         nav 模式（Fixed Frame = map，含云台状态显示）
 rviz/mapping.rviz                            mapping 模式（Fixed Frame = world）
@@ -132,6 +137,15 @@ sudo apt install -y ros-humble-asio-cmake-module libasio-dev
   `-DBUILD_WITH_MARCH_NATIVE=OFF` 且**不开 ASAN**，与 small_glim 的编译旗标一致
   （ABI 陷阱），装到 `/usr/local` 并 `ldconfig`。GTSAM 4.3a0 已装 `/usr/local`，无则同旗标重编。
 
+建图链（slam_toolbox 栅格）的依赖都是标准 rosdep 包，`rosdep install` 自动装齐，
+无需手工编译：
+
+- **`slam_toolbox`**（`ros-humble-slam-toolbox`）—— 建图，mapping 模式起
+  `async_slam_toolbox_node`。
+- **`nav2_map_server`** —— 存图用 `map_saver_cli`，随 Navigation2 一起装。
+- **`pointcloud_to_laserscan`** —— 本仓库源码包（`src/perception/`），把去地面障碍
+  点云转 `/scan` 喂 slam_toolbox，由 `./build.sh` 编译。
+
 > 实车**不再需要** Livox SDK2：`mid360_driver` 是纯 asio UDP 收包，不链接
 > `/usr/local/lib/liblivox_lidar_sdk_shared.so`。`livox_ros_driver2` 仅保留在编译列表里，
 > 给仿真插件 `ros2_livox_simulation` 提供 CustomMsg 消息定义。
@@ -154,6 +168,13 @@ sudo apt install -y ros-humble-asio-cmake-module libasio-dev
 
 ### 4.2 建图
 
+mapping 模式同时跑两条链、产出两张图，nav 模式各用一张：
+
+| 图 | 谁建 | nav 里谁用 | 落盘 |
+| :- | :- | :- | :- |
+| 点云 PCD | small_glim | `fast_location` 点云定位 | `PCD/<world>.pcd` |
+| 栅格 pgm | slam_toolbox | `rm_map_server` 占据栅格 + 语义地图 | `map/<world>.pgm` + `.yaml` |
+
 仿真：
 
 ```sh
@@ -170,8 +191,18 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/cm
 ros2 launch bringup real.launch.py world:=RMUL mode:=mapping nav_rviz:=True
 ```
 
-建好的点云在 `PCD/<world>.pcd`。
-添加slamtoolbox插件保存`pgm`+`yaml`
+跑完一圈后：
+
+1. 先存栅格 —— slam_toolbox 还活着时另开终端执行（它订阅 `/map` 存当前图）：
+
+   ```sh
+   ros2 run nav2_map_server map_saver_cli -f src/bringup/map/RMUL
+   ```
+
+   产出 `map/RMUL.pgm` + `map/RMUL.yaml`。
+
+2. 再 **Ctrl-C 退出建图** —— small_glim 的 PCD 合并发生在节点析构时，不干净退出
+   `PCD/<world>.pcd` 不会合并落盘，fast_location 就没图可用。
 
 ### 4.2.1 生成语义地图
 

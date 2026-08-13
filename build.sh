@@ -22,6 +22,7 @@ PACKAGES=(
   "cpp_lidar_filter"
   "linefit_ground_segmentation"
   "linefit_ground_segmentation_ros"
+  "pointcloud_to_laserscan"  # 建图链：去地面障碍点云 → /scan → slam_toolbox
   "navigation2"
   "goal_approach_controller"
   "fake_vel_transform"
@@ -30,6 +31,7 @@ PACKAGES=(
   "decision"
   "pb_rm_simulation"
   "ros2_livox_simulation"
+  "simulated_gimbal"        # 仿真云台模拟器（依赖 decision_interfaces，已在前）
   "bringup"
 )
 
