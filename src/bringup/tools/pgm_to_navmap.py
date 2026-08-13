@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """把 slam_toolbox 建图、map_saver_cli 存出的 pgm+yaml 转成 rm_map_server 读的语义地图 msgpack。
 
-为什么有这条链：pcd_to_navmap.py 的全局高度切片对地面起伏大的点云会满图误判
+为什么有这条链：原来的 PCD 直转链（全局高度切片）对地面起伏大的点云会满图误判
 （实测 RMUL.pcd 地面起伏 ~0.4 m，任何全局 z 阈值都同时切在某些区域的地面上和
 另一些区域的墙下面）。slam_toolbox 逐帧做射线更新，激光穿过的格子被反复标空闲，
 孤立噪点自然被洗掉，输出的栅格干净得多。完整流程：
@@ -11,8 +11,8 @@
     semantic_map_editor.py 人工标隧道
 
 行序是唯一的坑：pgm 第 0 行是图像顶部（y 最大的一行），msgpack 的 terrain 是
-index = y*width + x、从 y 最小行排起，所以必须上下翻转一次 —— 正是
-pcd_to_navmap.py 注释里说的「pgm 那条链才需要的翻转」。
+index = y*width + x、从 y 最小行排起，所以必须上下翻转一次（PCD 直转链没有
+pgm 这一步，就不需要翻转）。
 
 灰度→占据度沿用 nav2 map_server 的 trinary 约定（negate=0 时
 occ = (maxval-pixel)/maxval）：

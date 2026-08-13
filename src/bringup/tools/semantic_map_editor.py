@@ -12,7 +12,7 @@ Lucifer 的 rm_map_server 只读 msgpack，这个 GUI 就是它的唯一编辑�
     逐格通道。保存前按 semantic_map.cpp 的 loadSemanticMap 同一套不变量自检，
     坏图直接拒绝写出 —— 宁可在这里炸，也不要让车开进墙里。
 
-不依赖 open3d：读 PCD 复用同目录的 pcd_to_navmap（纯 numpy）。
+不依赖 open3d：读 PCD 复用同目录的 pcd_reader（纯 numpy）。
 
 用法：
     python3 semantic_map_editor.py [地图.msgpack]
@@ -34,8 +34,8 @@ from PIL import Image, ImageTk
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    # PCD 解析（read_pcd_xyz）现在住在 pcd_to_navmap 里，pgm 那套已删。
-    import pcd_to_navmap as p2g
+    # PCD 解析（read_pcd_xyz）住在同目录的 pcd_reader 里。
+    import pcd_reader
     _HAS_PCD = True
 except ImportError:
     _HAS_PCD = False
@@ -752,14 +752,14 @@ class EditorApp:
     # ---- PCD 高度底图 ----
     def _load_pcd(self) -> None:
         if not _HAS_PCD:
-            messagebox.showerror("载入PCD", "找不到 pcd_to_navmap.py，无法解析 PCD")
+            messagebox.showerror("载入PCD", "找不到 pcd_reader.py，无法解析 PCD")
             return
         path = filedialog.askopenfilename(
             title="选择 PCD", filetypes=[("PCD", "*.pcd"), ("所有文件", "*")])
         if not path:
             return
         try:
-            xyz = p2g.read_pcd_xyz(path)
+            xyz = pcd_reader.read_pcd_xyz(path)
         except (OSError, ValueError) as error:
             messagebox.showerror("载入PCD", f"读取失败: {error}")
             return

@@ -190,7 +190,7 @@ def generate_launch_description():
         arguments=common_log_arguments)
 
     # ===== 4.5 建图链：点云转激光 + slam_toolbox（仅 mode:=mapping）=====
-    # 为什么不用 pcd_to_navmap 的高度切片出图：实测 RMUL.pcd 地面起伏 ~0.4 m，
+    # 为什么不用 PCD 直转的高度切片出图：实测 RMUL.pcd 地面起伏 ~0.4 m，
     # 全局 z 阈值必然满图误判。slam_toolbox 逐帧做射线更新，激光穿过的格子被
     # 反复标空闲，孤立噪点自然被洗掉。输入用去地面后的障碍点云
     # （/segmentation/obstacle），坡道/高地的地面点不会进图；odom->base_link 的

@@ -86,12 +86,11 @@ config/navigation2.yaml                      导航参数（launch 实际加载�
 config/fast_location_main.yaml               定位参数
 config/mapper_params_online_async.yaml       slam_toolbox 建图参数（mapping 模式）
 config/{simulation,reality}/                 分环境的外参、分割、LIO 参数
-urdf/sentry_robot_{sim,real}.xacro            机器人模型
+urdf/sentry_robot_{sim,real}.xacro           机器人模型
 map/<world>.msgpack                          语义地图（唯一真源，/map 由它生成）
 map/<world>.pgm + .yaml                      slam_toolbox 建图、map_saver_cli 存出的栅格
 PCD/<world>.pcd                              fast_location 的先验点云图（small_glim 建）
-tools/pcd_to_navmap.py                       点云 → msgpack 转换（旧链，地面起伏大会误判）
-tools/pgm_to_navmap.py                       pgm+yaml → msgpack 转换（主链）
+tools/pgm_to_navmap.py                       pgm+yaml → msgpack 转换
 tools/semantic_map_editor.py                 语义地图人工标注：刷隧道、画轴线、填 spec
 rviz/navigation.rviz                         nav 模式（Fixed Frame = map，含云台状态显示）
 rviz/mapping.rviz                            mapping 模式（Fixed Frame = world）
