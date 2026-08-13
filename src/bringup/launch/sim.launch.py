@@ -54,6 +54,8 @@ def generate_launch_description():
     navigation_params = os.path.join(bringup_dir, 'config', 'navigation2.yaml')
     fast_location_params = os.path.join(bringup_dir, 'config', 'fast_location_main.yaml')
     seg_params = os.path.join(bringup_dir, 'config', 'simulation', 'segmentation_sim.yaml')
+    # slam_toolbox 建图参数，实车/仿真共用一份（HL 的 real/sim 两份 diff 为空）。
+    mapper_params = os.path.join(bringup_dir, 'config', 'mapper_params_online_async.yaml')
     # small_glim 的参数分两层：包内 config/params_*.yaml 是全量默认值（glob 加载，
     # 与上游 launch 的行为一致），bringup 的 small_glim_sim.yaml 只放仿真差异项。
     small_glim_default_params = sorted(glob.glob(os.path.join(
@@ -186,6 +188,48 @@ def generate_launch_description():
         parameters=[seg_params, {'use_sim_time': use_sim_time}],
         arguments=common_log_arguments)
 
+    # ===== 3.5 建图链：点云转激光 + slam_toolbox（仅 mode:=mapping）=====
+    # 与 real.launch.py 同一套（说明也见那边）：去地面障碍点云转 2D 扫描，
+    # slam_toolbox 逐帧射线更新出干净的占据栅格。建完图另开终端：
+    #   ros2 run nav2_map_server map_saver_cli -f src/bringup/map/<world>
+    #   python3 tools/pgm_to_navmap.py map/<world>.yaml
+    cloud_to_scan_node = Node(
+        condition=LaunchConfigurationEquals('mode', 'mapping'),
+        package='pointcloud_to_laserscan',
+        executable='pointcloud_to_laserscan_node',
+        name='pointcloud_to_laserscan',
+        output=node_output,
+        remappings=[
+            ('cloud_in', '/segmentation/obstacle'),
+            ('scan', '/scan'),
+        ],
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            # 投影到底盘系：侧倾时仍输出重力对齐的 2D 扫描（同 HL 的做法）。
+            'target_frame': 'base_link',
+            'transform_tolerance': 0.05,
+            'min_height': 0.05,
+            'max_height': 1.2,
+            'angle_min': -3.14159,
+            'angle_max': 3.14159,
+            'angle_increment': 0.0043,
+            'scan_time': 0.3333,
+            'range_min': 0.45,
+            'range_max': 10.0,
+            'use_inf': True,
+            'inf_epsilon': 1.0,
+        }],
+        arguments=common_log_arguments)
+
+    slam_mapping_node = Node(
+        condition=LaunchConfigurationEquals('mode', 'mapping'),
+        package='slam_toolbox',
+        executable='async_slam_toolbox_node',
+        name='slam_toolbox',
+        output=node_output,
+        parameters=[mapper_params, {'use_sim_time': use_sim_time}],
+        arguments=common_log_arguments)
+
     # ===== 4. fast_location 主定位 =====
     fast_loc_node = Node(
         condition=LaunchConfigurationEquals('mode', 'nav'),
@@ -301,6 +345,8 @@ def generate_launch_description():
         tf_odom_to_world,
         lidar_filter_node,
         ground_seg_node,
+        cloud_to_scan_node,
+        slam_mapping_node,
         fast_loc_node,
         start_navigation,
         simulated_gimbal_node,

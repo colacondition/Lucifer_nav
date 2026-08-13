@@ -14,7 +14,8 @@ import time
 import unittest
 
 from decision_interfaces.msg import GimbalPosture, SemanticMap, TunnelSpec
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
+from nav_msgs.msg import Path as NavPath
 import launch
 import launch_ros
 import launch_testing
@@ -51,6 +52,11 @@ INSIDE_XY = (0.75, 0.0)
 # 远到搜索框（run_up + 滞回 = 0.8）都够不着，用来把节点状态复位成 false。
 FAR_XY = (-2.0, 0.0)
 
+# 横穿隧道的规划路径：y=0 沿轴线穿过，中间有点落进本体格（x=0.75）。
+CROSSING_PATH = [(-1.0, 0.0), (0.0, 0.0), (0.75, 0.0), (1.5, 0.0), (2.0, 0.0)]
+# 贴着洞口上方路过（y=0.5 > 隧道上边界 0.15）：不穿洞。
+BYPASS_PATH = [(-1.0, 0.5), (0.0, 0.5), (0.75, 0.5), (1.5, 0.5), (2.0, 0.5)]
+
 
 @pytest.mark.launch_test
 def generate_test_description():
@@ -64,6 +70,7 @@ def generate_test_description():
             'global_frame': 'map',
             'robot_base_frame': 'base_link_fake',
             'semantic_map_topic': '/map_server/semantic_map',
+            'path_topic': '/plan',
             'posture_topic': '/gimbal_posture',
             'update_frequency': 20.0,
             'hysteresis': HYSTERESIS,
@@ -135,6 +142,12 @@ class Harness(Node):
             GimbalPosture, '/gimbal_posture',
             lambda m: self.requests.append(m.lower), state_qos)
 
+        # 规划路径：判定「是不是真要穿洞」。可靠 + KeepLast(1)，和节点订阅侧一致。
+        self.path_pub = self.create_publisher(
+            NavPath, '/plan',
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
+        self._path = None
+
         # 动态 tf：位姿要在测试过程中改，静态广播做不到。
         self.tf_broadcaster = TransformBroadcaster(self)
         self.semantic_pub.publish(_make_semantic_map())
@@ -149,12 +162,33 @@ class Harness(Node):
         tf.transform.rotation.w = 1.0
         self.tf_broadcaster.sendTransform(tf)
 
+    def set_path(self, points):
+        """把规划路径设成这些 (x, y) 点；None 表示还没收到路径."""
+        if points is None:
+            self._path = None
+            return
+        path = NavPath()
+        path.header.frame_id = 'map'
+        for x, y in points:
+            pose = PoseStamped()
+            pose.header.frame_id = 'map'
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.orientation.w = 1.0
+            path.poses.append(pose)
+        self._path = path
+
+    def publish_path(self):
+        if self._path is not None:
+            self.path_pub.publish(self._path)
+
     def settle_at(self, x, y, timeout=20.0):
         """把车放到 (x, y)，返回稳定之后的请求值."""
         deadline = time.time() + timeout
         self.requests.clear()
         while time.time() < deadline:
             self.publish_pose(x, y)
+            self.publish_path()
             rclpy.spin_once(self, timeout_sec=0.02)
             # 头几帧可能是位姿更新之前算的，取之后的。
             if len(self.requests) >= 8:
@@ -174,6 +208,8 @@ class TestTunnelPostureNode(unittest.TestCase):
 
     def setUp(self):
         self.harness = Harness()
+        # 默认路径横穿隧道，覆盖进洞/出洞的常规场景。
+        self.harness.set_path(CROSSING_PATH)
         # 节点状态跨测试方法保留（进程只起一次），每条测试先复位成 false。
         self.assertIs(
             self.harness.settle_at(*FAR_XY), False,
@@ -199,6 +235,22 @@ class TestTunnelPostureNode(unittest.TestCase):
         self.assertIs(
             self.harness.settle_at(TUNNEL_EXIT_X + 1.2, 0.0), False,
             '离开隧道后请求没有收回，云台会一直放着')
+
+    def test_does_not_lower_when_path_skips_tunnel(self):
+        # 路径贴着洞口上方路过（不穿洞）：车靠近洞口也不该收云台。这是这次改动的核心，
+        # 触发条件从「附近有隧道」改成「规划路径要穿过隧道」。
+        self.harness.set_path(BYPASS_PATH)
+        self.assertIs(
+            self.harness.settle_at(*APPROACH_XY), False,
+            '路径不穿洞却靠近洞口就收了云台 —— 触发条件还是「附近有隧道」而非「要穿隧道」')
+
+    def test_lowers_inside_tunnel_even_without_crossing_path(self):
+        # inside 兜底：车已经进到本体里，即使路径不穿洞（或还没收到路径）也必须收。
+        # 路径过期/重规划漏发时车在洞里云台却立着，撞顶板的代价不可逆。
+        self.harness.set_path(None)
+        self.assertIs(
+            self.harness.settle_at(*INSIDE_XY), True,
+            '车在隧道本体内却没有请求收云台 —— inside 兜底丢了，路径过期时云台会撞顶板')
 
 
 @launch_testing.post_shutdown_test()

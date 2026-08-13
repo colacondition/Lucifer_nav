@@ -221,6 +221,12 @@ public:
     // 隧道限速窗口：速度剖面在洞内的样本按 TunnelSpec 的 [vmin, vmax] 夹。收不到
     // 语义地图或图里没隧道时 tunnelSpecAtPoint 返回 nullptr，窗口不生效。
     tunnel_speed_window_enabled_ = declare_parameter<bool>("tunnel_speed_window.enable", true);
+    // 隧道影响区边距，用于 ESDF 整车碰撞检查里跳过顶板/门楣点云。语义与
+    // global/local_costmap_node 的同名参数一致 —— 代价地图在 processPointCloud 里
+    // 按影响区把顶板点滤掉，但 MPC 的 RC-ESDF 直接吃 /segmentation/obstacle 原始点云，
+    // 不滤的话顶板（z≈0.3，投影到 xy 平面）会落在车体足迹正上方被判成碰撞，车停在
+    // 洞口或蹭进洞后动不了。
+    tunnel_margin_m_ = declare_parameter<double>("tunnel_margin_m", 0.20);
     semantic_map_topic_ = declare_parameter<std::string>(
       "semantic_map_topic", "/map_server/semantic_map");
     if (tunnel_speed_window_enabled_) {
@@ -407,16 +413,19 @@ public:
         has_gimbal_state_ = true;
       });
 
-    // 语义地图：只用来查隧道限速窗口。同源同 QoS（transient_local），收不到时
-    // 窗口静默失效。整帧不自洽时保留上一张好图。
-    if (tunnel_speed_window_enabled_) {
+    // 语义地图两处用：隧道限速窗口 + ESDF 的顶板点云豁免。同源同 QoS
+    // （transient_local），收不到时两者都静默失效。整帧不自洽时保留上一张好图。
+    if (tunnel_speed_window_enabled_ || esdf_enabled_) {
       const auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
       semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
         semantic_map_topic_, map_qos,
         [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
           std::lock_guard<std::mutex> lk(map_mutex_);
           try {
-            receiver_.update(*msg);
+            if (receiver_.update(*msg)) {
+              // 内容真变了才重建影响区，供 ESDF 逐点查表跳过顶板/门楣。
+              tunnel_region_ = TunnelRegionGrid::build(receiver_.map(), tunnel_margin_m_);
+            }
           } catch (const std::exception & ex) {
             RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
           }
@@ -1075,6 +1084,19 @@ private:
     const double cos_yaw = std::cos(robot_yaw);
     const double sin_yaw = std::sin(robot_yaw);
 
+    // 顶板/门楣点云落在隧道影响区内。RC-ESDF 只查 xy 平面，不滤的话这些点
+    // （z≈clear_height 但 xy 在车体正上方）会被投影成 xy 障碍，把洞口和洞内都判成
+    // 碰撞 —— 正是「云台已绿却停在洞口 / 蹭进去后动不了」的成因。代价地图在
+    // processPointCloud 里用同一张影响区把这些点滤掉了，这里必须跟它保持一致。
+    // 影响区只在语义地图更新时重建，拷贝一份到局部变量后逐点查表即可，避免每点
+    // 都抢 map_mutex_。
+    TunnelRegionGrid tunnel_region;
+    {
+      std::lock_guard<std::mutex> lk(map_mutex_);
+      tunnel_region = tunnel_region_;
+    }
+    const bool has_tunnel_region = !tunnel_region.empty();
+
     try {
       sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
       sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
@@ -1088,9 +1110,14 @@ private:
         // base_link -> map
         const double bx = static_cast<double>(*iter_x);
         const double by = static_cast<double>(*iter_y);
-        obs_world.emplace_back(
-          robot_pos.x() + cos_yaw * bx - sin_yaw * by,
-          robot_pos.y() + sin_yaw * bx + cos_yaw * by);
+        const double wx = robot_pos.x() + cos_yaw * bx - sin_yaw * by;
+        const double wy = robot_pos.y() + sin_yaw * bx + cos_yaw * by;
+        if (has_tunnel_region && tunnel_region.specNearPoint(wx, wy) != nullptr) {
+          // 隧道结构（顶板/门楣/侧壁上沿）不该参与整车碰撞，通行由静态地图的
+          // 壁面致命格决定，与代价地图的语义一致。
+          continue;
+        }
+        obs_world.emplace_back(wx, wy);
       }
     } catch (const std::exception & ex) {
       RCLCPP_WARN_THROTTLE(
@@ -1230,8 +1257,13 @@ private:
   // 两者可能不同线程（单容器多线程执行器），用独立的 map_mutex_ 护住 receiver_ ——
   // 与控制状态的 mtx_ 分开，避免把地图订阅和控制环相互阻塞。
   bool tunnel_speed_window_enabled_{true};
+  double tunnel_margin_m_{0.20};
   std::string semantic_map_topic_;
   SemanticMapReceiver receiver_;
+  // 隧道影响区（本体 + tunnel_margin_m_ 边距），随语义地图重建。ESDF 整车碰撞
+  // 检查用它跳过顶板/门楣点云，语义与代价地图的 inTunnelRegion 一致。空表时
+  // specNearPoint 恒返回 nullptr，等价于「没有隧道」。
+  TunnelRegionGrid tunnel_region_;
   std::mutex map_mutex_;
 
   std::mutex mtx_;

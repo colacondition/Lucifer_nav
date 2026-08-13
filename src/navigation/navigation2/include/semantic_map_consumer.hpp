@@ -72,6 +72,41 @@ std::vector<float> makeInflationRadiusLimit(
   const nav_msgs::msg::OccupancyGrid & grid, const SemanticMap & map, double default_radius,
   double robot_radius);
 
+// 隧道影响区：本体格向外扩 margin_m 的一圈，摊平成语义栅格大小的查表。
+//
+// 为什么本体格不够：门楣/顶板前沿的点云落点和洞口正前方的格子都在本体格边界外
+// 一到两格。只认本体格时，这排点被标成致命格横在洞口上、洞口格又吃到两侧墙的
+// 全量膨胀，洞口整体被封死 —— 车停在洞口，云台绿灯也进不去。扩一圈边距后，
+// 顶板豁免和膨胀上限都覆盖到洞口，能不能过只由壁面自己的致命格决定。
+//
+// 预先摊平的理由与 TunnelAxisGrid 相同：查询跑在点云逐点循环里（每帧上万次），
+// 每点做半径搜索不可接受；语义地图一张只变一次，构建一次之后查询只是一次查表。
+class TunnelRegionGrid
+{
+public:
+  // 本体格向外做圆形膨胀 margin_m。map 无效或没有隧道时返回空表。
+  static TunnelRegionGrid build(const SemanticMap & map, double margin_m);
+
+  bool empty() const noexcept { return spec_index_.empty(); }
+
+  // 世界坐标落在任一隧道的影响区（本体 + 边距）内时返回该隧道的通行参数，
+  // 否则返回 nullptr。多条隧道的边距重叠时取距离最近的那条。
+  const TunnelSpec * specNearPoint(double world_x, double world_y) const noexcept;
+
+private:
+  GridGeometry geometry_;
+  // 每格所属隧道的 id + 1（0 = 不在任何影响区内）。
+  std::vector<std::uint8_t> spec_index_;
+  // 自持一份 TunnelSpec 拷贝，查询结果的生命周期跟随本对象而不是构建时的那张图。
+  std::vector<TunnelSpec> tunnels_;
+};
+
+// 带影响区的版本：区内（本体 + 边距）的格子吃 clearance 上限，让洞口不再被两侧
+// 墙的膨胀涂满。region 为空时退回上面只认本体格的版本。
+std::vector<float> makeInflationRadiusLimit(
+  const nav_msgs::msg::OccupancyGrid & grid, const SemanticMap & map, double default_radius,
+  double robot_radius, const TunnelRegionGrid & region);
+
 // 按消费端栅格格号索引的隧道轴线表，给栅格搜索用。
 //
 // 为什么要预先摊平成数组：A* 每弹出一格要问 8 次「这一步允许吗」，每次都做

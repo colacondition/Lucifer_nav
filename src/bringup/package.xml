@@ -25,6 +25,11 @@
   <exec_depend>xacro</exec_depend>
   <exec_depend>pb_rm_simulation</exec_depend>
   <exec_depend>ros2_livox_simulation</exec_depend>
+  <!-- 建图链（mode:=mapping）：去地面障碍点云转 2D 扫描 + slam_toolbox 出栅格，
+       建完用 nav2_map_server 的 map_saver_cli 存 pgm，再 pgm_to_navmap.py 转 msgpack -->
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>

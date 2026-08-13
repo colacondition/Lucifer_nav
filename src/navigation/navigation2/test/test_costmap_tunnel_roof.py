@@ -1,11 +1,17 @@
-# 集成测试：隧道顶板不得进代价地图，洞内的真障碍必须照常进。
+# 集成测试：隧道影响区内的点云不得进代价地图，区外的必须照常进。
 #
-# 这条测试锁的是隧道语义的第一个致命失败：顶板和侧壁在点云里跟墙毫无区别，按常规
-# 高度带（上限 2 m）判定会把整个洞口涂成致命格，规划器彻底看不到通路 —— 而且没有
-# 任何报错，表现只是「车不去走那条唯一的路」。参数调不出来，必须有先验语义。
+# 这条测试锁的是隧道语义的第一个致命失败：顶板、门楣、侧壁上沿在点云里跟墙毫无
+# 区别，按常规高度带（上限 2 m）判定会把整个洞口涂成致命格，规划器彻底看不到通路
+# —— 而且没有任何报错，表现只是「车不去走那条唯一的路」。参数调不出来，必须有
+# 先验语义。
 #
-# 反方向同样重要：不能变成「隧道内不看点云」。洞里真有个箱子的时候还得躲，否则语义
-# 层就成了一个开在墙上的洞，什么都能穿过去。所以测试同时验证阈值之下的点照常标记。
+# 放行的判据是「落在隧道影响区（本体格 + tunnel_margin_m 边距）内」，跟高度无关。
+# 任何高度阈值都在「滤掉结构」和「漏掉真障碍」之间赌；净高够不够、姿态收没收是电控
+# 的职责，导航只负责把车沿轴线送进洞，能不能进由静态地图的壁面致命格决定。所以洞里
+# 低矮的点也一并不标 —— 这是确认过的设计，别改回按高度分层。
+#
+# 反方向同样重要：放行不能泄漏出影响区，否则等于把高度上限整个调没了。下面用同 x、
+# 同高度、只差 y 的点钉住边距的边界。
 #
 # 高度全部相对机器人底盘（point.z - robo_z），理由见 test_costmap_height_frame.py：
 # map 的 z=0 是雷达平面而不是地面。这里也让机器人在 map 里沉下去，确认隧道判定不是
@@ -40,11 +46,12 @@ ROBOT_MAP_Z = -0.30
 SEM_W, SEM_H = 100, 100
 SEM_ORIGIN = (-2.5, -2.5)
 
-# 顶板放行的阈值是节点参数，不是 TunnelSpec 里的净高 —— 净高从地面量、这里的高度
-# 相对 base_link，差一个未知的底盘离地偏置。净高故意给一个跟阈值明显不同的值，这样
-# 「代码又拿净高当阈值」这种回退会被下面的断言抓到。
-TUNNEL_GATE_HEIGHT = 0.20
-TUNNEL_CLEAR_HEIGHT = 0.60
+# 影响区边距，跟节点参数 tunnel_margin_m 一致：本体格向外扩这么多米。
+TUNNEL_MARGIN = 0.20
+# 净高在这里不该是任何判据 —— 它从地面量，点云高度相对 base_link，中间差一个未知的
+# 底盘离地偏置。故意取一个夹在下面两个取样高度中间的值：谁把它（或任何别的高度阈值）
+# 接回放行判据，「洞里低点也不标」那条必然挂。
+TUNNEL_CLEAR_HEIGHT = 0.30
 TUNNEL_CLEAR_WIDTH = 0.30
 
 TERRAIN_FLAT = 0
@@ -55,14 +62,21 @@ TERRAIN_TUNNEL = 2
 TUNNEL_X_RANGE = (0.5, 1.0)
 TUNNEL_Y_RANGE = (-0.15, 0.15)
 
-# 洞内取样点：顶板（净高之上）和箱子（净高之下）放在同一 xy，逼着判定只能靠高度区分。
+# 本体格内的取样点。顶板和低矮的点放在同一 xy，只差高度：两个都必须被放行，这是
+# 「判据与高度无关」唯一能被钉死的地方。
 IN_TUNNEL_XY = (0.75, 0.0)
-# 洞外的墙：同样的高度，必须照常被标记 —— 证明放行只发生在隧道格里。
+# 影响区内、本体格外 —— 门楣和顶板前沿的点云正落在这一圈。本体行中心最远到
+# y = 0.125，这个点所在格中心 y = 0.275，距离 0.15 < 边距 0.20。
+IN_MARGIN_XY = (0.75, 0.28)
+# 刚出影响区：所在格中心 y = 0.375，距离 0.25 > 边距 0.20，必须照常标记。差这两格
+# 就是「边距是有边的」和「边距把半张图都放行了」的分界。
+OUTSIDE_MARGIN_XY = (0.75, 0.36)
+# 洞外的墙：同样的高度，必须照常被标记 —— 证明放行只发生在影响区里。
 OUTSIDE_XY = (0.75, 1.0)
 
-# 顶板高度落在阈值 0.20 和净高 0.60 之间：拿阈值判就该被滤掉，拿净高判就会漏进来。
+# 结构点：净高之上，常规高度带（上限 2.0）照收，只能靠语义放行。
 ROOF_HEIGHT = 0.45
-# 洞内真障碍，在阈值之下。
+# 洞里低矮的点：净高之下，同样不标。见开头，别改回按高度分层。
 BOX_HEIGHT = 0.12
 
 
@@ -94,7 +108,7 @@ def generate_test_description():
             # 关键：上限 2.0 就是原来会把顶板当障碍的那个值。测试不放宽它 ——
             # 顶板必须靠语义放行，而不是靠把高度带调小（那样会漏掉真的高障碍）。
             'obstacle_z_max_to_robo': 2.0,
-            'tunnel_obstacle_z_max_to_robo': TUNNEL_GATE_HEIGHT,
+            'tunnel_margin_m': TUNNEL_MARGIN,
             'observation_timeout': 2.0,
             'update_on_new_observation_only': False,
             'reuse_previous_grid': False,
@@ -260,38 +274,56 @@ class TestCostmapTunnelRoof(unittest.TestCase):
     def tearDown(self):
         self.harness.destroy_node()
 
-    def test_roof_is_ignored_but_wall_and_box_are_not(self):
+    def test_region_points_are_ignored_but_points_outside_it_are_not(self):
         grid = self.harness.spin_until_grid([
             (IN_TUNNEL_XY[0], IN_TUNNEL_XY[1], ROOF_HEIGHT),
+            (IN_MARGIN_XY[0], IN_MARGIN_XY[1], ROOF_HEIGHT),
+            (OUTSIDE_MARGIN_XY[0], OUTSIDE_MARGIN_XY[1], ROOF_HEIGHT),
             (OUTSIDE_XY[0], OUTSIDE_XY[1], ROOF_HEIGHT),
         ])
         self.assertIsNotNone(grid, '没有收到 /local_costmap/costmap_raw')
 
-        # 顶板在隧道阈值之上且落在隧道本体内，必须被滤掉，否则洞口被封死。
-        # 它同时在净高（0.60）之下：如果代码回退成拿净高当阈值，这条就会失败。
+        # 本体格内的结构点必须被滤掉，否则洞口被封死。
         self.assertEqual(
             cell_value(grid, *IN_TUNNEL_XY), 0,
-            '隧道顶板被标成障碍了，洞口会被封死。检查 tunnelHeightLimit：语义地图收到了吗？'
-            '隧道格的 direction_magnitude 有没有超过本体阈值 0.95？'
-            '阈值有没有被误接成 TunnelSpec.clear_height？')
+            '隧道本体格里的点被标成障碍了，洞口会被封死。语义地图收到了吗？'
+            '隧道格的 direction_magnitude 有没有超过本体阈值 0.95？')
 
-        # 同样高度、同样距离，只是不在隧道里 —— 必须照常标记。否则说明放行泄漏到了
-        # 隧道以外，等于把整个高度上限调没了。
+        # 门楣/顶板前沿的点云落在本体格外一到两格。只认本体格时它们被原样标成致命格，
+        # 横在洞口上把洞封死 —— tunnel_margin_m 就是为了把放行扩出这一圈。
+        self.assertEqual(
+            cell_value(grid, *IN_MARGIN_XY), 0,
+            '影响区边距内的点被标成障碍了：门楣点云会横在洞口上。'
+            'tunnel_margin_m 传进节点了吗？TunnelRegionGrid 是按这个边距建的吗？')
+
+        # 边距外两格，同 x、同高度 —— 必须照常标记。否则说明边距没有边界，
+        # 洞口附近的真墙也会被无视。
+        self.assertEqual(
+            cell_value(grid, *OUTSIDE_MARGIN_XY), 100,
+            '影响区边距外的障碍也被滤掉了：放行范围泄漏出了影响区')
+
+        # 离洞更远的墙同理，钉住泄漏不是「只多漏一格」那种量级。
         self.assertEqual(
             cell_value(grid, *OUTSIDE_XY), 100,
-            '隧道外的同高度障碍也被滤掉了：放行范围泄漏出了隧道本体')
+            '隧道外的同高度障碍也被滤掉了：放行范围泄漏出了影响区')
 
-    def test_obstacle_inside_tunnel_below_clear_height_is_marked(self):
+    def test_low_point_inside_the_tunnel_is_ignored_too(self):
         grid = self.harness.spin_until_grid([
             (IN_TUNNEL_XY[0], IN_TUNNEL_XY[1], BOX_HEIGHT),
+            (OUTSIDE_XY[0], OUTSIDE_XY[1], BOX_HEIGHT),
         ])
         self.assertIsNotNone(grid, '没有收到 /local_costmap/costmap_raw')
 
-        # 阈值之下的点是洞里真的障碍物，不是隧道结构。放过它等于「隧道内不看点云」，
-        # 车会直接撞上去。
+        # 同一个 xy、只是高度换到净高之下：判据与高度无关，照样不标。这条挂了就说明
+        # 有人把某个高度阈值接回了放行判据（净高、tunnel_obstacle_z_max_to_robo 之类）。
         self.assertEqual(
-            cell_value(grid, *IN_TUNNEL_XY), 100,
-            '洞内阈值以下的障碍被滤掉了：隧道语义不能退化成「洞里不看点云」')
+            cell_value(grid, *IN_TUNNEL_XY), 0,
+            '洞内低矮的点被标成障碍了：放行判据不该跟高度有关，见文件开头')
+
+        # 同样的低点在洞外必须照常标 —— 否则上面那条可能只是因为整个高度带失效。
+        self.assertEqual(
+            cell_value(grid, *OUTSIDE_XY), 100,
+            '洞外的低矮障碍也被滤掉了：高度带本身出了问题，不是隧道语义在起作用')
 
 
 @launch_testing.post_shutdown_test()

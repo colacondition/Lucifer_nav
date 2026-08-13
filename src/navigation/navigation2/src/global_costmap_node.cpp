@@ -61,6 +61,9 @@ public:
           RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
           return;
         }
+        // 隧道影响区（本体 + 边距）随地图重建。顶板豁免和膨胀上限都按它判定：
+        // 门楣点云和洞口格都在本体格外一到两格，只认本体格会把洞口整体封死。
+        tunnel_region_ = TunnelRegionGrid::build(receiver_.map(), tunnel_margin_m_);
         RCLCPP_INFO(
           get_logger(), "Global costmap got semantic map: %zu tunnels",
           receiver_.map().tunnels().size());
@@ -146,10 +149,10 @@ private:
     // map 系的 z=0 是雷达平面不是地面，详见 local_costmap_node.cpp 里的说明。
     obstacle_z_min_to_robo_ = declare_parameter<double>("obstacle_z_min_to_robo", 0.1);
     obstacle_z_max_to_robo_ = declare_parameter<double>("obstacle_z_max_to_robo", 2.0);
-    // 隧道本体内的高度带上限，同样相对底盘。语义与 local_costmap_node.cpp 的同名
-    // 参数一致，两边必须一起改。
-    tunnel_obstacle_z_max_to_robo_ =
-      declare_parameter<double>("tunnel_obstacle_z_max_to_robo", 0.20);
+    // 隧道影响区边距：本体格向外扩这么多米。区内点云一律不标记（见
+    // processPointCloud），膨胀上限也压到通道余量。语义与 local_costmap_node.cpp
+    // 的同名参数一致，两边必须一起改。
+    tunnel_margin_m_ = declare_parameter<double>("tunnel_margin_m", 0.20);
     transform_tolerance_ = declare_parameter<double>("transform_tolerance", 0.2);
     observation_timeout_ = declare_parameter<double>("observation_timeout", 1.0);
     reuse_previous_grid_ = declare_parameter<bool>("reuse_previous_grid", true);
@@ -286,23 +289,18 @@ private:
     }
   }
 
-  // 该点所在位置允许的最大障碍高度（相对底盘）。
+  // 该点是否落在隧道影响区（本体 + 边距）内。区内点云一律不标记：顶板、门楣、
+  // 侧壁上沿在点云里跟墙没有区别，任何高度阈值都在「滤掉结构」和「漏掉真障碍」
+  // 之间赌 —— 而净高够不够、姿态收没收是电控的职责，导航只负责把车沿轴线送进
+  // 洞。能不能进完全由静态地图的壁面致命格决定。
   //
-  // 隧道顶板和侧壁在点云里跟墙没有区别，照常规高度带（上限 2 m）判定会把整个洞口
-  // 涂成致命格，规划器彻底看不到通路。所以在隧道本体内把上限压低：顶板在阈值之上，
-  // 被滤掉；洞里真有个箱子的话仍然在阈值之下，照常标为障碍 —— 这不是「隧道内不看
-  // 点云」，只是不把隧道自己的结构当障碍。
-  //
-  // 阈值用独立参数而不是 TunnelSpec::clear_height：净高是从地面量的，而这里的高度
-  // 相对 base_link，两者差一个未知的底盘离地偏置。直接拿净高当阈值等于默认这个偏置
-  // 为 0，错的方向恰好是危险的那一侧（阈值偏高 → 顶板没被滤掉 → 洞口照旧封死）。
-  // clear_height 只用来告诉电控要收多低。
-  double tunnelHeightLimit(double world_x, double world_y) const
+  // 判定用影响区而不是只认本体格：门楣/顶板前沿的点云 xy 落在本体格边界外一到
+  // 两格，只认本体格时这排点被原样标成致命格，横在洞口上把洞封死。语义与
+  // local_costmap_node.cpp 的同名函数一致，两边必须一起改 —— 只在一边放行会让
+  // 全局规划出的路在局部层被判为撞墙。
+  bool inTunnelRegion(double world_x, double world_y) const
   {
-    if (tunnelSpecAtPoint(receiver_.map(), world_x, world_y) == nullptr) {
-      return std::numeric_limits<double>::infinity();
-    }
-    return tunnel_obstacle_z_max_to_robo_;
+    return tunnel_region_.specNearPoint(world_x, world_y) != nullptr;
   }
 
   void processPointCloud(
@@ -363,7 +361,7 @@ private:
         {
           continue;
         }
-        if (height_to_robo > tunnelHeightLimit(point.x, point.y)) {
+        if (inTunnelRegion(point.x, point.y)) {
           continue;
         }
 
@@ -446,8 +444,10 @@ private:
     {
       return inflation_radius_limit_;
     }
-    inflation_radius_limit_ =
-      makeInflationRadiusLimit(grid, receiver_.map(), inflation_radius_, robot_radius_);
+    // 传影响区版本：洞口格（本体外一小圈）同样吃 clearance 上限，不再被两侧墙的
+    // 全量膨胀涂满。
+    inflation_radius_limit_ = makeInflationRadiusLimit(
+      grid, receiver_.map(), inflation_radius_, robot_radius_, tunnel_region_);
     return inflation_radius_limit_;
   }
 
@@ -527,7 +527,7 @@ private:
   double obstacle_max_range_{3.0};
   double obstacle_z_min_to_robo_{0.1};
   double obstacle_z_max_to_robo_{2.0};
-  double tunnel_obstacle_z_max_to_robo_{0.20};
+  double tunnel_margin_m_{0.20};
   double transform_tolerance_{0.2};
   double observation_timeout_{1.0};
   bool reuse_previous_grid_{true};
@@ -540,6 +540,9 @@ private:
   // 没收到语义地图时 receiver_.map() 是空图（valid() == false），所有隧道查询退化成
   // 「没有隧道」，行为与改动前完全一致。
   SemanticMapReceiver receiver_;
+  // 隧道影响区（本体 + tunnel_margin_m_ 边距）的查表，随语义地图重建。空表时
+  // specNearPoint 恒返回 nullptr，与「没有隧道」等价。
+  TunnelRegionGrid tunnel_region_;
   std::vector<float> inflation_radius_limit_;
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;

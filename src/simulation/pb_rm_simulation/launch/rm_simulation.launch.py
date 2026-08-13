@@ -34,11 +34,11 @@ def get_world_config(world_type):
             'world_path': 'RMUC2024_world/rmuc_map_light.world'
         },
         WorldType.RMUL: {
-            'x': '1.8',
-            'y': '-0.35',
-            'z': '0.163',    # base_link 在地面上方（轮子接触地面）
+            'x': '4.1',
+            'y': '-2.25',
+            'z': '0.170',    # base_link 在地面上方（轮子接触地面）
             'yaw': '1.57',
-            'world_path': 'RMUL2024_world/RMUL.world'
+            'world_path': 'RMUL2024_world/rmul27.world'
             # 'world_path': 'RMUL2024_world/RMUL2024_world_dynamic_obstacles.world'
         }
     }

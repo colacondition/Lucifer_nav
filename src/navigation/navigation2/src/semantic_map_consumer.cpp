@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -133,6 +134,134 @@ std::vector<float> makeInflationRadiusLimit(
       // 中线也会被涂上代价。取 0 下限是因为「洞比车还窄」时该由变形后的车宽去
       // 保证能过，膨胀层不该在这里替规划器做否决 —— 真过不去会在壁面的致命格上
       // 挡住，而不是靠膨胀。
+      const double clearance = std::max(0.0, spec->clear_width * 0.5 - robot_radius);
+      limits[gridIndex(grid, x, y)] =
+        static_cast<float>(std::min(default_radius, clearance));
+    }
+  }
+
+  if (!any_tunnel) {
+    return {};
+  }
+  return limits;
+}
+
+TunnelRegionGrid TunnelRegionGrid::build(const SemanticMap & map, double margin_m)
+{
+  TunnelRegionGrid result;
+  if (!map.valid() || map.tunnels().empty()) {
+    return result;
+  }
+
+  const auto & geometry = map.geometry();
+  const int width = geometry.width;
+  const int height = geometry.height;
+  const std::size_t cells = geometry.cellCount();
+
+  // 边距按物理距离换成格数，向上取整（截断会让恰好在边距上的格掉出影响区，
+  // 与 nearestTunnelBody 的 span 取整理由相同）。margin_m <= 0 时退化成只有本体格。
+  const int span = std::max(
+    0, static_cast<int>(std::ceil(std::max(0.0, margin_m) / geometry.resolution)));
+  const double margin_sq_m =
+    std::max(0.0, margin_m) * std::max(0.0, margin_m);
+
+  std::vector<std::uint8_t> spec_index(cells, 0);
+  // 多条隧道的边距可能重叠，逐格记录到最近本体格的距离，近者胜。
+  std::vector<float> best_sq(cells, std::numeric_limits<float>::infinity());
+  bool any = false;
+
+  for (int sy = 0; sy < height; ++sy) {
+    for (int sx = 0; sx < width; ++sx) {
+      if (!map.isTunnelBodyCell(sx, sy)) {
+        continue;
+      }
+      const TunnelSpec * spec = map.tunnelSpecAtCell(sx, sy);
+      if (spec == nullptr) {
+        continue;
+      }
+      any = true;
+      // tunnelSpecAtCell 返回的指针指向 map.tunnels() 内部，可直接还原下标。
+      const std::uint8_t id = static_cast<std::uint8_t>(
+        (spec - map.tunnels().data()) + 1);
+
+      const int y0 = std::max(0, sy - span);
+      const int y1 = std::min(height - 1, sy + span);
+      const int x0 = std::max(0, sx - span);
+      const int x1 = std::min(width - 1, sx + span);
+      for (int ny = y0; ny <= y1; ++ny) {
+        for (int nx = x0; nx <= x1; ++nx) {
+          const double dx = static_cast<double>(nx - sx) * geometry.resolution;
+          const double dy = static_cast<double>(ny - sy) * geometry.resolution;
+          const double dist_sq = dx * dx + dy * dy;
+          if (dist_sq > margin_sq_m && !(nx == sx && ny == sy)) {
+            continue;
+          }
+          const std::size_t index = geometry.index(nx, ny);
+          if (static_cast<float>(dist_sq) >= best_sq[index]) {
+            continue;
+          }
+          best_sq[index] = static_cast<float>(dist_sq);
+          spec_index[index] = id;
+        }
+      }
+    }
+  }
+
+  if (!any) {
+    return result;
+  }
+  result.geometry_ = geometry;
+  result.spec_index_ = std::move(spec_index);
+  result.tunnels_ = map.tunnels();
+  return result;
+}
+
+const TunnelSpec * TunnelRegionGrid::specNearPoint(
+  const double world_x, const double world_y) const noexcept
+{
+  if (spec_index_.empty()) {
+    return nullptr;
+  }
+  const auto cell = geometry_.containingCell(Eigen::Vector2d(world_x, world_y));
+  if (!cell) {
+    return nullptr;
+  }
+  const std::uint8_t id = spec_index_[geometry_.index(cell->x(), cell->y())];
+  if (id == 0 || static_cast<std::size_t>(id - 1) >= tunnels_.size()) {
+    return nullptr;
+  }
+  return &tunnels_[static_cast<std::size_t>(id - 1)];
+}
+
+std::vector<float> makeInflationRadiusLimit(
+  const nav_msgs::msg::OccupancyGrid & grid, const SemanticMap & map, double default_radius,
+  double robot_radius, const TunnelRegionGrid & region)
+{
+  if (region.empty()) {
+    // 没建影响区（margin 关掉或图里没隧道）时退回只认本体格的版本。
+    return makeInflationRadiusLimit(grid, map, default_radius, robot_radius);
+  }
+  if (!map.valid() || map.tunnels().empty() || grid.data.empty() ||
+    grid.info.resolution <= 0.0F)
+  {
+    return {};
+  }
+
+  std::vector<float> limits(grid.data.size(), static_cast<float>(default_radius));
+  bool any_tunnel = false;
+
+  for (int y = 0; y < static_cast<int>(grid.info.height); ++y) {
+    for (int x = 0; x < static_cast<int>(grid.info.width); ++x) {
+      double world_x = 0.0;
+      double world_y = 0.0;
+      mapToWorld(grid, x, y, world_x, world_y);
+      const TunnelSpec * spec = region.specNearPoint(world_x, world_y);
+      if (spec == nullptr) {
+        continue;
+      }
+      any_tunnel = true;
+      // 与本体格版本同一套语义：区内只留通道自身的横向余量，洞口不再被两侧墙的
+      // 全量膨胀涂满。壁面格自己仍是致命的，压小半径不等于放开碰撞。
       const double clearance = std::max(0.0, spec->clear_width * 0.5 - robot_radius);
       limits[gridIndex(grid, x, y)] =
         static_cast<float>(std::min(default_radius, clearance));

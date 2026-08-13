@@ -13,9 +13,11 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <decision_interfaces/msg/gimbal_posture.hpp>
 #include <decision_interfaces/msg/semantic_map.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2/exceptions.h>
 #include <tf2/time.h>
@@ -39,6 +41,7 @@ public:
     robot_base_frame_ = declare_parameter<std::string>("robot_base_frame", "base_link_fake");
     semantic_map_topic_ =
       declare_parameter<std::string>("semantic_map_topic", "/map_server/semantic_map");
+    path_topic_ = declare_parameter<std::string>("path_topic", "/plan");
     posture_topic_ = declare_parameter<std::string>("posture_topic", "/gimbal_posture");
     update_frequency_ = declare_parameter<double>("update_frequency", 10.0);
     hysteresis_ = declare_parameter<double>("hysteresis", 0.3);
@@ -65,6 +68,20 @@ public:
     // 该收的时候没收。晚起的电控节点也应当立刻拿到当前请求。
     posture_pub_ = create_publisher<decision_interfaces::msg::GimbalPosture>(
       posture_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
+
+    // 规划路径：判定「车是不是真的要穿洞」。只关心 xy，抽出后查本体格。
+    // 收不到路径时 points 为空，will_cross 恒 false —— 只有车已在本体内（inside
+    // 兜底）才会收，贴着洞口路过不会再误收。
+    path_sub_ = create_subscription<nav_msgs::msg::Path>(
+      path_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
+      [this](nav_msgs::msg::Path::SharedPtr msg) {
+        std::vector<Eigen::Vector2d> points;
+        points.reserve(msg->poses.size());
+        for (const auto & pose : msg->poses) {
+          points.emplace_back(pose.pose.position.x, pose.pose.position.y);
+        }
+        path_points_ = std::move(points);
+      });
 
     const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, update_frequency_));
     timer_ = create_wall_timer(
@@ -103,9 +120,12 @@ private:
       return;
     }
 
+    // 只有规划路径穿过隧道本体才收（inside 兜底在 decider 里判）。
+    const bool will_cross = pathCrossesTunnel(receiver_.map(), path_points_);
     publish(
       decider_.update(
-        receiver_.map(), transform.transform.translation.x, transform.transform.translation.y));
+        receiver_.map(), transform.transform.translation.x, transform.transform.translation.y,
+        will_cross));
   }
 
   void publish(bool lower)
@@ -124,16 +144,19 @@ private:
   std::string global_frame_;
   std::string robot_base_frame_;
   std::string semantic_map_topic_;
+  std::string path_topic_;
   std::string posture_topic_;
   double update_frequency_{10.0};
   double hysteresis_{0.3};
 
   SemanticMapReceiver receiver_;
   GimbalLowerDecider decider_;
+  std::vector<Eigen::Vector2d> path_points_;
   bool last_lower_{false};
   bool has_published_{false};
 
   rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Publisher<decision_interfaces::msg::GimbalPosture>::SharedPtr posture_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 

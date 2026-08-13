@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """把 Super-LIO 建好的 PCD 点云直接转成 rm_map_server 读的语义地图 msgpack。
 
-取代原先的两步链（先出 pgm+yaml，再把 pgm 转 msgpack）。rm_map_server 现在只读
-msgpack，/map 的占据栅格由 terrain 通道里的 OBSTACLE 推导，所以没有单独存 pgm 的
-理由，pgm 那套已整体删除。换新场地的流程就是「建 PCD → 本脚本转 msgpack →
-用 semantic_map_editor.py 人工标隧道」，和 HW 那套一致。
+注意：这条链只适合地面平整的点云。全局高度切片对地面起伏大的场地会满图误判
+（实测 RMUL.pcd 地面起伏 ~0.4 m，任何全局 z 阈值都同时切在某些区域的地面上和
+另一些区域的墙下面）。主链已换成 slam_toolbox 建图：mode:=mapping 起建图链
+（见 real/sim launch），map_saver_cli 存 pgm+yaml，再用 pgm_to_navmap.py 转
+msgpack。本脚本保留作为平整场地/快速验证的备用路径。
 
 terrain 三态直接来自点云高度切片（见下方 build_grid）：
   * 障碍点足够多的格子 → OBSTACLE(1)

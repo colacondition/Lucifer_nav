@@ -18,10 +18,12 @@ install(DIRECTORY
 )
 
 # 换场地时离线跑的工具，装成可执行方便 ros2 run 之外直接调用。
-#   pcd_to_navmap       —— PCD 点云直接转语义地图 msgpack（内含 PCD 解析，不再出 pgm）
+#   pcd_to_navmap       —— PCD 点云直接转语义地图 msgpack（高度切片，适合地面平整的点云）
+#   pgm_to_navmap       —— slam_toolbox/map_saver_cli 存出的 pgm+yaml 转 msgpack（主链）
 #   semantic_map_editor —— msgpack 语义地图标注 GUI，人工补围栏、标隧道
 install(PROGRAMS
   tools/pcd_to_navmap.py
+  tools/pgm_to_navmap.py
   tools/semantic_map_editor.py
   DESTINATION lib/${PROJECT_NAME}
 )
@@ -35,6 +37,8 @@ if(BUILD_TESTING)
   set(ENV{PYTEST_DISABLE_PLUGIN_AUTOLOAD} 1)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_pcd_to_navmap test/test_pcd_to_navmap.py
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
+  ament_add_pytest_test(test_pgm_to_navmap test/test_pgm_to_navmap.py
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
 endif()
 

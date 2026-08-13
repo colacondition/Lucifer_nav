@@ -152,9 +152,10 @@ if(BUILD_TESTING)
   # transformPoint 之前比原始 z 是 +0.025，在 map 里跟固定 z=0 比也只有 +0.025
   # （map 的 z=0 是雷达平面，不是地面）。
   add_launch_test(test/test_costmap_height_frame.py TIMEOUT 120)
-  # 锁住隧道顶板不进代价地图、洞内真障碍照进这两条。顶板和墙在点云里没有区别，按
-  # 常规高度带判定会把整个洞口涂成致命格，规划器彻底看不到通路 —— 无报错，表现只是
-  # 「车不走那条唯一的路」。反向也测：不能退化成「隧道内不看点云」。
+  # 锁住隧道影响区（本体 + tunnel_margin_m 边距）内的点云不进代价地图、区外的照进。
+  # 顶板、门楣和墙在点云里没有区别，按常规高度带判定会把整个洞口涂成致命格，规划器
+  # 彻底看不到通路 —— 无报错，表现只是「车不走那条唯一的路」。反向也测边距的边界：
+  # 放行泄漏出影响区等于把高度上限整个调没了。
   add_launch_test(test/test_costmap_tunnel_roof.py TIMEOUT 120)
   # 锁住收云台请求在节点层是通的。判定本身有 gtest，这里管接线：语义地图的 QoS、
   # tf 的坐标系、话题名。这三处错的表现完全一样 —— 标志位永远 false，日志里没有报错，
@@ -170,6 +171,11 @@ if(BUILD_TESTING)
   # 锁住 RC-ESDF 是真的在跑。障碍点云喂一个挡路的点，esdfPathSafe 返回 false，
   # MPC 进恢复。反向测试：注掉 esdf_map_.query 那行，测试必须失败。
   add_launch_test(test/test_esdf_obstacle_cloud.py TIMEOUT 90)
+  # 锁住 RC-ESDF 的隧道顶板豁免：影响区内的顶板/门楣点云不得触发整车碰撞，区外的
+  # 同高度点必须照常拦车。ESDF 直接吃原始障碍点云、只查 xy，不补这层豁免会把顶板
+  # （z≈clear_height 但 xy 在车体正上方）投影成 xy 障碍，洞口和洞内被误判碰撞 ——
+  # 正是「云台已绿却停在洞口 / 蹭进去后动不了」。必须跟代价地图用同一张影响区。
+  add_launch_test(test/test_esdf_tunnel_ceiling.py TIMEOUT 90)
 endif()
 
 ament_auto_package(

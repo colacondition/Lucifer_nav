@@ -3,17 +3,16 @@
 
 // 「什么时候该让电控收云台」的判定。
 //
-// 导航侧只负责这一个布尔量：车即将进洞或正在洞里。收云台本身、收到多低、到位反馈
+// 导航侧只负责这一个布尔量：车即将穿洞或正在洞里。收云台本身、收到多低、到位反馈
 // 都归电控。所以这里不需要任何车体参数 —— 不需要知道云台多高、底盘离地多少。
 //
-// 判定只用位姿和语义地图，不用规划路径。路径会过期、会因为重规划抖动，而漏发一次
-// 「收」的代价是云台撞在顶板上。用「附近有没有隧道」这个纯几何条件换来的是：没有
-// 时序依赖，没有 stale 状态，任何一帧都能独立算出正确答案。
-//
-// 代价是贴着洞口开过去（并不进洞）也会收云台，损失的是这段时间的火力。两个失败
-// 方向不对等，所以偏向收。
+// 判定靠「是否真要穿洞」：规划路径穿过隧道本体（will_cross）才收。贴着洞口路过
+// （并不进洞）不收 —— 这正是跟旧「附近有没有隧道」纯几何判据的区别。唯一例外是
+// 车已经进到隧道本体内：此时无论路径怎么判都强制收，兜住路径过期/重规划漏发的安全
+// 缺口（车在洞里而云台立着，撞顶板的代价不可逆）。
 
 #include <optional>
+#include <vector>
 
 #include "semantic_map.hpp"
 
@@ -36,18 +35,27 @@ struct TunnelProximity
 std::optional<TunnelProximity> nearestTunnelBody(
   const SemanticMap & map, double world_x, double world_y, double search_radius);
 
+// 路径是否穿过任何一条隧道本体：任意路径点落在隧道本体格内即返回 true。
+// 这是「收云台」的真正判据 —— 只有要穿洞才需要收，贴着洞口路过（不进洞）不该收。
+bool pathCrossesTunnel(const SemanticMap & map, const std::vector<Eigen::Vector2d> & points);
+
 // 带滞回的收云台判定。
 //
 // 滞回是必需的：判定跑在 10~20 Hz 上，边界附近若无滞回，标志位会在真假之间抖动，
 // 电控那边就变成云台反复抬落。抬起的门槛比落下的高一档。
+//
+// will_cross 是「是否要穿洞」的判据（来自规划路径是否穿过隧道本体）。false 时即使
+// 车靠近洞口也不收 —— 这正是跟旧「附近有没有隧道」纯几何判据的区别。唯一例外是
+// 车已经进到隧道本体内：此时无论路径怎么判都强制收，兜住路径过期/重规划漏发的安全
+// 缺口（车在洞里而云台立着，撞顶板的代价不可逆）。
 class GimbalLowerDecider
 {
 public:
   explicit GimbalLowerDecider(double hysteresis_m = 0.3)
   : hysteresis_m_(hysteresis_m) {}
 
-  // 用当前位姿刷新判定，返回刷新后的结果。
-  bool update(const SemanticMap & map, double world_x, double world_y);
+  // 用当前位姿 + 是否穿洞刷新判定，返回刷新后的结果。
+  bool update(const SemanticMap & map, double world_x, double world_y, bool will_cross = true);
 
   bool lower() const noexcept { return lower_; }
 

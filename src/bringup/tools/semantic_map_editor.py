@@ -69,7 +69,7 @@ TWO_PI = 2.0 * math.pi
 TUNNEL_FIELDS = [
     ("clear_height", "净高 clear_height (m)", 0.30),
     ("clear_width", "净宽 clear_width (m)", 0.50),
-    ("run_up", "提前量 run_up (m)", 0.50),
+    ("run_up", "提前量 run_up (m)", 1.20),
     ("velocity_min", "限速下限 velocity_min (m/s)", 0.0),
     ("velocity_max", "限速上限 velocity_max (m/s)", 0.0),
 ]

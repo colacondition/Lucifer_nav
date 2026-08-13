@@ -260,6 +260,87 @@ TEST(SemanticMapConsumer, PerCellLimitKeepsTunnelInteriorFreeOfDistantInflation)
   EXPECT_EQ(with_limit.data[gridIndex(grid, 10, 4)], 100);
 }
 
+// ---- 隧道影响区：本体 + 边距的 O(1) 查表 --------------------------------
+// 顶板豁免和膨胀上限都按它判定。门楣/顶板前沿的点云和洞口正前方的格子都落在
+// 本体格外一到两格，只认本体格会把洞口整体封死 —— 这层查表就是为了把豁免范围
+// 扩出去那一小圈。
+
+TEST(TunnelRegionGridTest, IsEmptyWithoutTunnels)
+{
+  // 没有语义地图、或图里没标隧道时表必须是空的：specNearPoint 恒返回 nullptr，
+  // 行为与「没有隧道」等价，常见情形零开销。
+  EXPECT_TRUE(TunnelRegionGrid::build(SemanticMap{}, 0.2).empty());
+
+  auto msg = makeTunnelMsg(10, 6, 0.05, 0.0, 0.0, 3, 0.4, 0.6);
+  msg.terrain.assign(msg.terrain.size(), kFlat);
+  msg.direction_magnitude.assign(msg.direction_magnitude.size(), 0);
+  msg.tunnel_ids.assign(msg.tunnel_ids.size(), 0);
+  msg.tunnels.clear();
+  EXPECT_TRUE(TunnelRegionGrid::build(semanticMapFromMsg(msg), 0.2).empty());
+}
+
+TEST(TunnelRegionGridTest, CoversBodyAndMarginButNotBeyond)
+{
+  // 隧道行 y=3，格中心在世界 y=0.175。边距 0.10 m（两格）应覆盖到中心距离
+  // 0.05（y=2）和 0.10（y=1）的行；y=0 行中心距离 0.15，在边距之外。
+  const auto msg = makeTunnelMsg(10, 6, 0.05, 0.0, 0.0, 3, 0.4, 0.6);
+  const auto region = TunnelRegionGrid::build(semanticMapFromMsg(msg), 0.10);
+  ASSERT_FALSE(region.empty());
+
+  // 本体格内：返回的就是这条隧道的通行参数。
+  const TunnelSpec * body = region.specNearPoint(0.22, 0.175);
+  ASSERT_NE(body, nullptr);
+  EXPECT_DOUBLE_EQ(body->clear_width, 0.6);
+  // 边距内（本体行上下一到两格）—— 正是门楣点云和洞口格所在的位置。
+  EXPECT_NE(region.specNearPoint(0.22, 0.125), nullptr);
+  EXPECT_NE(region.specNearPoint(0.22, 0.075), nullptr);
+  // 边距外不豁免，否则洞口旁边的真墙也会被无视。
+  EXPECT_EQ(region.specNearPoint(0.22, 0.025), nullptr);
+  // 图外返回 nullptr 而不是崩。
+  EXPECT_EQ(region.specNearPoint(100.0, 100.0), nullptr);
+}
+
+TEST(TunnelRegionGridTest, ZeroMarginDegeneratesToBodyOnly)
+{
+  const auto msg = makeTunnelMsg(10, 6, 0.05, 0.0, 0.0, 3, 0.4, 0.6);
+  const auto region = TunnelRegionGrid::build(semanticMapFromMsg(msg), 0.0);
+  ASSERT_FALSE(region.empty());
+
+  EXPECT_NE(region.specNearPoint(0.22, 0.175), nullptr);
+  // 邻行不在区内 —— 与旧的 tunnelSpecAtPoint 行为一致。
+  EXPECT_EQ(region.specNearPoint(0.22, 0.125), nullptr);
+}
+
+TEST(SemanticMapConsumer, RegionLimitCoversTheTunnelMouth)
+{
+  // 带影响区的膨胀上限：洞口格（本体外一小圈）也要吃 clearance 上限，不再被
+  // 两侧墙的全量膨胀涂满。
+  const auto msg = makeTunnelMsg(10, 6, 0.05, 0.0, 0.0, 3, 0.4, 0.6);
+  const SemanticMap map = semanticMapFromMsg(msg);
+  const auto region = TunnelRegionGrid::build(map, 0.10);
+
+  auto grid = makeGrid(10, 6, 0.05, 0.0, 0.0);
+  const double default_radius = 0.5;
+  const double robot_radius = 0.25;
+  const auto limits =
+    makeInflationRadiusLimit(grid, map, default_radius, robot_radius, region);
+  ASSERT_EQ(limits.size(), grid.data.size());
+
+  // 净宽 0.6 减车宽 0.5 后余量 0.05。本体行和边距内的行都被压到余量。
+  EXPECT_FLOAT_EQ(limits[gridIndex(grid, 5, 3)], 0.05F);
+  EXPECT_FLOAT_EQ(limits[gridIndex(grid, 5, 2)], 0.05F);
+  EXPECT_FLOAT_EQ(limits[gridIndex(grid, 5, 1)], 0.05F);
+  // 边距外仍是全局半径 —— 压小半径不能泄漏到影响区之外。
+  EXPECT_FLOAT_EQ(limits[gridIndex(grid, 5, 0)], static_cast<float>(default_radius));
+
+  // 空影响区时退回只认本体格的版本：邻行不再被压。
+  const auto fallback =
+    makeInflationRadiusLimit(grid, map, default_radius, robot_radius, TunnelRegionGrid{});
+  ASSERT_EQ(fallback.size(), grid.data.size());
+  EXPECT_FLOAT_EQ(fallback[gridIndex(grid, 5, 3)], 0.05F);
+  EXPECT_FLOAT_EQ(fallback[gridIndex(grid, 5, 2)], static_cast<float>(default_radius));
+}
+
 // ---- 轴线表：A* 的「只沿轴穿隧道」判据 ----------------------------------
 
 TEST(TunnelAxisGrid, IsEmptyWithoutASemanticMap)

@@ -118,6 +118,28 @@ TEST(NearestTunnelBody, DoesNotCrashWhenRobotIsOutsideTheMap)
   EXPECT_FALSE(nearestTunnelBody(map, -100.0, -100.0, 1.0).has_value());
 }
 
+TEST(PathCrossesTunnel, ReturnsTrueWhenAnyPointIsInsideTheTunnelBody)
+{
+  const SemanticMap map = makeMap(60, 60, 0.05, 0.0, 0.0, 20, 20, 30, 0.5);
+  const double tunnel_y = 20.5 * 0.05;
+  // 横穿：洞口前 → 洞中 → 出洞后，中间那个点落在本体格内。
+  const std::vector<Eigen::Vector2d> crossing{
+    {19.0 * 0.05, tunnel_y}, {25.0 * 0.05, tunnel_y}, {31.0 * 0.05, tunnel_y}};
+  EXPECT_TRUE(pathCrossesTunnel(map, crossing));
+}
+
+TEST(PathCrossesTunnel, ReturnsFalseWhenPathSkipsTheTunnel)
+{
+  const SemanticMap map = makeMap(60, 60, 0.05, 0.0, 0.0, 20, 20, 30, 0.5);
+  // 贴着洞口上方路过：y 抬高 0.5 米，没有任何点落进本体格。
+  const double bypass_y = 20.5 * 0.05 + 0.5;
+  const std::vector<Eigen::Vector2d> bypass{
+    {19.0 * 0.05, bypass_y}, {25.0 * 0.05, bypass_y}, {31.0 * 0.05, bypass_y}};
+  EXPECT_FALSE(pathCrossesTunnel(map, bypass));
+  // 还没收到 /plan：空路径也不该算穿洞。
+  EXPECT_FALSE(pathCrossesTunnel(map, {}));
+}
+
 TEST(GimbalLowerDecider, LowersRunUpMetresBeforeTheTunnel)
 {
   // run_up 0.5：距本体 0.5 米内就该请求收云台。
@@ -193,6 +215,43 @@ TEST(GimbalLowerDecider, UsesPerTunnelRunUp)
   GimbalLowerDecider decider(0.3);
   EXPECT_TRUE(decider.update(map, entrance_x - 1.8, tunnel_y));
   EXPECT_FALSE(decider.update(map, entrance_x - 2.6, tunnel_y));
+}
+
+TEST(GimbalLowerDecider, DoesNotLowerNearTunnelWhenPathSkipsIt)
+{
+  // 车贴到洞口但路径不穿洞（will_cross=false）：不该收。这正是跟旧「附近有没有隧道」
+  // 纯几何判据的区别 —— 贴着洞口路过（不进洞）不该损失火力。
+  const SemanticMap map = makeMap(60, 60, 0.05, 0.0, 0.0, 20, 20, 30, 0.5);
+  const double tunnel_y = 20.5 * 0.05;
+  const double entrance_x = 20.0 * 0.05;
+
+  GimbalLowerDecider decider(0.3);
+  EXPECT_FALSE(decider.update(map, entrance_x - 0.4, tunnel_y, /*will_cross=*/false));
+}
+
+TEST(GimbalLowerDecider, LowersNearTunnelWhenPathCrossesIt)
+{
+  // will_cross=true 时保留旧行为：run_up 内收。这里显式传参，锁住「穿洞」是收的充分
+  // 条件（加上 inside 兜底才是必要条件）。
+  const SemanticMap map = makeMap(60, 60, 0.05, 0.0, 0.0, 20, 20, 30, 0.5);
+  const double tunnel_y = 20.5 * 0.05;
+  const double entrance_x = 20.0 * 0.05;
+
+  GimbalLowerDecider decider(0.3);
+  EXPECT_FALSE(decider.update(map, entrance_x - 1.2, tunnel_y, /*will_cross=*/true));
+  EXPECT_TRUE(decider.update(map, entrance_x - 0.4, tunnel_y, /*will_cross=*/true));
+}
+
+TEST(GimbalLowerDecider, LowersInsideTunnelEvenWhenPathDoesNotCross)
+{
+  // inside 兜底：车已经在本体里，路径判 false 也必须收。路径过期/重规划漏发时，
+  // 车在洞里而云台立着撞顶板的代价不可逆，这个兜底不能丢。
+  const SemanticMap map = makeMap(60, 60, 0.05, 0.0, 0.0, 20, 20, 30, 0.5);
+  const double tunnel_y = 20.5 * 0.05;
+  const double mid_x = 25.0 * 0.05;
+
+  GimbalLowerDecider decider(0.3);
+  EXPECT_TRUE(decider.update(map, mid_x, tunnel_y, /*will_cross=*/false));
 }
 
 }  // namespace

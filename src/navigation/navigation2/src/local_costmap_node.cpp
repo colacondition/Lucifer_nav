@@ -67,6 +67,9 @@ public:
           RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
           return;
         }
+        // 隧道影响区（本体 + 边距）随地图重建。顶板豁免和膨胀上限都按它判定：
+        // 门楣点云和洞口格都在本体格外一到两格，只认本体格会把洞口整体封死。
+        tunnel_region_ = TunnelRegionGrid::build(receiver_.map(), tunnel_margin_m_);
         RCLCPP_INFO(
           get_logger(), "Local costmap got semantic map: %zu tunnels",
           receiver_.map().tunnels().size());
@@ -133,10 +136,12 @@ private:
     // bottom_z_to_robo_z / top_z_to_robo_z。
     obstacle_z_min_to_robo_ = declare_parameter<double>("obstacle_z_min_to_robo", 0.05);
     obstacle_z_max_to_robo_ = declare_parameter<double>("obstacle_z_max_to_robo", 2.0);
-    // 隧道本体内的高度带上限，同样相对底盘。语义与 global_costmap_node.cpp 的同名
-    // 参数一致，两边必须一起改。
-    tunnel_obstacle_z_max_to_robo_ =
-      declare_parameter<double>("tunnel_obstacle_z_max_to_robo", 0.20);
+    // 隧道影响区边距：本体格向外扩这么多米。区内点云一律不标记（见
+    // processPointCloud），膨胀上限也压到通道余量。门楣/顶板前沿的点云和洞口
+    // 正前方的格子都落在本体格外一到两格，0 边距时这排点被标成致命格横在洞口
+    // 上、洞口格又吃到两侧墙的全量膨胀，洞口整体被封死。语义与
+    // global_costmap_node.cpp 的同名参数一致，两边必须一起改。
+    tunnel_margin_m_ = declare_parameter<double>("tunnel_margin_m", 0.20);
     transform_tolerance_ = declare_parameter<double>("transform_tolerance", 0.2);
     observation_timeout_ = declare_parameter<double>("observation_timeout", 0.5);
     snap_origin_to_grid_ = declare_parameter<bool>("snap_origin_to_grid", true);
@@ -653,18 +658,18 @@ private:
     }
   }
 
-  // 该点所在位置允许的最大障碍高度（相对底盘）。隧道本体内压到
-  // tunnel_obstacle_z_max_to_robo_，把顶板滤掉；该阈值以下的真障碍照常标记。
+  // 该点是否落在隧道影响区（本体 + 边距）内。区内点云一律不标记：顶板、门楣、
+  // 侧壁上沿在点云里跟墙没有区别，任何高度阈值都在「滤掉结构」和「漏掉真障碍」
+  // 之间赌 —— 而净高够不够、姿态收没收是电控的职责，导航只负责把车沿轴线送进
+  // 洞。能不能进完全由静态地图的壁面致命格决定。
   //
-  // 阈值不取 TunnelSpec::clear_height：净高从地面量，这里的高度相对 base_link，
-  // 差一个未知的底盘离地偏置。语义与 global_costmap_node.cpp 的同名函数一致，两边
-  // 必须一起改 —— 只在一边放行会让全局规划出的路在局部层被判为撞墙。
-  double tunnelHeightLimit(double world_x, double world_y) const
+  // 判定用影响区而不是只认本体格：门楣/顶板前沿的点云 xy 落在本体格边界外一到
+  // 两格，只认本体格时这排点被原样标成致命格，横在洞口上把洞封死。语义与
+  // global_costmap_node.cpp 的同名函数一致，两边必须一起改 —— 只在一边放行会让
+  // 全局规划出的路在局部层被判为撞墙。
+  bool inTunnelRegion(double world_x, double world_y) const
   {
-    if (tunnelSpecAtPoint(receiver_.map(), world_x, world_y) == nullptr) {
-      return std::numeric_limits<double>::infinity();
-    }
-    return tunnel_obstacle_z_max_to_robo_;
+    return tunnel_region_.specNearPoint(world_x, world_y) != nullptr;
   }
 
   void processPointCloud(
@@ -720,7 +725,7 @@ private:
         {
           continue;
         }
-        if (height_to_robo > tunnelHeightLimit(point.x, point.y)) {
+        if (inTunnelRegion(point.x, point.y)) {
           continue;
         }
         int map_x = 0;
@@ -849,10 +854,12 @@ private:
 
     auto inflated_grid = raw_grid;
     // 局部栅格跟车滚动，origin 每帧都变，逐格上限不能跨帧缓存。地图里没有隧道时
-    // makeInflationRadiusLimit 直接返回空，不用逐格扫。
+    // makeInflationRadiusLimit 直接返回空，不用逐格扫。传影响区版本：洞口格
+    // （本体外一小圈）同样吃 clearance 上限，不再被两侧墙的全量膨胀涂满。
     applyInflationCostGradient(
       inflated_grid, inflation_radius_, 50, inflation_cost_scaling_factor_,
-      makeInflationRadiusLimit(raw_grid, receiver_.map(), inflation_radius_, robot_radius_));
+      makeInflationRadiusLimit(
+        raw_grid, receiver_.map(), inflation_radius_, robot_radius_, tunnel_region_));
     markRobotFootprintFree(inflated_grid, robot_transform);
     previous_inflated_grid_ = inflated_grid;
 
@@ -891,7 +898,7 @@ private:
   double obstacle_max_range_{6.0};
   double obstacle_z_min_to_robo_{0.05};
   double obstacle_z_max_to_robo_{2.0};
-  double tunnel_obstacle_z_max_to_robo_{0.20};
+  double tunnel_margin_m_{0.20};
   double transform_tolerance_{0.2};
   double observation_timeout_{0.5};
   bool snap_origin_to_grid_{true};
@@ -911,6 +918,9 @@ private:
   // 未收到语义地图时 receiver_.map() 是空图，隧道查询全部退化成「没有隧道」，
   // 行为与改动前一致。
   SemanticMapReceiver receiver_;
+  // 隧道影响区（本体 + tunnel_margin_m_ 边距）的查表，随语义地图重建。空表时
+  // specNearPoint 恒返回 nullptr，与「没有隧道」等价。
+  TunnelRegionGrid tunnel_region_;
 
   rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;

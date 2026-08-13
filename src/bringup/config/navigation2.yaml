@@ -70,7 +70,7 @@ rm_global_costmap:
     global_frame: map
     robot_base_frame: base_link_fake
     map_topic: /map
-    # 语义地图：隧道格的净高用来在点云高度判定里放过顶板，净宽用来把该格的膨胀
+    # 语义地图：隧道本体向外扩 tunnel_margin_m 的影响区内点云一律不标记，膨胀
     # 半径压到通道容得下的值。没收到这个话题时行为退回纯几何，不会报错。
     semantic_map_topic: /map_server/semantic_map
     scan_topic: /scan
@@ -102,16 +102,13 @@ rm_global_costmap:
     # 既滤掉地面分割残留（负值会把残留变成虚假障碍把车围死），又保住 20cm 台阶。
     obstacle_z_min_to_robo: 0.1
     obstacle_z_max_to_robo: 2.0
-    # 隧道本体内的上限，同样相对底盘。压到 0.20 是为了把顶板和侧壁的上半段滤掉，
-    # 否则洞口会被涂成致命格、规划器看不到唯一的通路。
-    #
-    # 为什么不用 TunnelSpec 里的净高：净高是从地面量的，这个阈值相对 base_link，
-    # 两者差一个底盘离地偏置。宁可给一个偏保守的固定值，也不要拿量纲不同的量
-    # 硬凑 —— 算高了顶板就滤不掉，洞口照旧封死。净高只用来告诉电控要收多低。
-    #
-    # 代价是洞里高于 0.20 的矮障碍会被当成隧道结构放过。隧道净空本来就不高，
-    # 这个高度上真有东西的话车也过不去，所以先按结构处理。
-    tunnel_obstacle_z_max_to_robo: 0.20
+    # 隧道影响区边距：本体格向外扩这么多米。区内点云一律不标记 —— 顶板、门楣在
+    # 点云里跟墙没有区别，任何高度阈值都在「滤掉结构」和「漏掉真障碍」之间赌；
+    # 净高够不够、姿态收没收归电控，导航只负责把车沿轴线送进洞，能不能进由静态
+    # 地图的壁面致命格决定。0 边距时门楣点云（落在本体格外一到两格）会被标成致命
+    # 格横在洞口上、洞口格又吃到两侧墙的全量膨胀，洞口整体封死。
+    # 语义与 rm_local_costmap 的同名参数一致，两边必须一起改。
+    tunnel_margin_m: 0.20
     transform_tolerance: 0.2
     observation_timeout: 1.0
     reuse_previous_grid: true
@@ -165,7 +162,7 @@ rm_local_costmap:
     robot_base_frame: base_link_fake
     scan_topic: /scan
     pointcloud_topic: /segmentation/obstacle
-    # 语义地图：隧道格的净高用来在点云高度判定里放过顶板，净宽用来把该格的膨胀
+    # 语义地图：隧道本体向外扩 tunnel_margin_m 的影响区内点云一律不标记，膨胀
     # 半径压到通道容得下的值。没收到这个话题时行为退回纯几何，不会报错。
     semantic_map_topic: /map_server/semantic_map
     costmap_topic: /local_costmap/costmap
@@ -194,9 +191,9 @@ rm_local_costmap:
     # 小于最矮台阶高度，见 config/{simulation,reality}/segmentation_*.yaml。
     obstacle_z_min_to_robo: 0.05
     obstacle_z_max_to_robo: 2.0
-    # 隧道本体内的上限，语义见 rm_global_costmap 里的同名参数。两边必须一致：
+    # 隧道影响区边距，语义见 rm_global_costmap 里的同名参数。两边必须一致：
     # 只在一边放行会让全局规划出的路在局部层被判为撞墙。
-    tunnel_obstacle_z_max_to_robo: 0.20
+    tunnel_margin_m: 0.20
     transform_tolerance: 0.2
     observation_timeout: 2.0
     snap_origin_to_grid: true
@@ -291,6 +288,11 @@ rm_mpc_controller:
     # 车在进洞前就减到位，而不是洞口瞬间跳变（跳变的参考 MPC 跟不上）。
     # 收不到语义地图或图里没隧道时静默失效。设 enable=false 关闭。
     tunnel_speed_window.enable: true
+    # 隧道影响区边距，供 MPC 的 RC-ESDF 整车碰撞检查跳过顶板/门楣点云。必须与
+    # rm_global_costmap / rm_local_costmap 的同名参数一致 —— 代价地图在点云里按这张
+    # 影响区把顶板滤掉，ESDF 直接吃 /segmentation/obstacle 原始点云，不一致的话会
+    # 出现「云台已绿却停在洞口、或蹭进去后动不了」的假碰撞。
+    tunnel_margin_m: 0.20
     semantic_map_topic: /map_server/semantic_map
     # 弧长域速度剖面。替代全程恒定的 expected_speed，在弯道自动减速，
     # 避免 MPC 参考轨迹本身就不可跟踪（过弯不减速 → 参考跑到弯道外 → 切角）。
@@ -395,6 +397,9 @@ rm_tunnel_posture:
     global_frame: map
     robot_base_frame: base_link_fake
     semantic_map_topic: /map_server/semantic_map
+    # 规划路径（map 系）。判定「是不是真要穿洞」：路径穿过隧道本体才收云台，贴着
+    # 洞口路过（不进洞）不收。收不到路径时只靠 inside 兜底。
+    path_topic: /plan
     # 发给电控的收云台请求。true = 车即将进洞或正在洞里，云台必须收下来。
     posture_topic: /gimbal_posture
     # 判定频率。提前量是距离量（TunnelSpec.run_up），不是时间量，所以这里不需要跟

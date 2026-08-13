@@ -56,7 +56,23 @@ std::optional<TunnelProximity> nearestTunnelBody(
   return best;
 }
 
-bool GimbalLowerDecider::update(const SemanticMap & map, double world_x, double world_y)
+bool pathCrossesTunnel(
+  const SemanticMap & map, const std::vector<Eigen::Vector2d> & points)
+{
+  if (!map.valid() || map.tunnels().empty()) {
+    return false;
+  }
+  for (const auto & p : points) {
+    const auto cell = map.geometry().containingCell(p);
+    if (cell && map.isTunnelBodyCell(cell->x(), cell->y())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool GimbalLowerDecider::update(
+  const SemanticMap & map, double world_x, double world_y, bool will_cross)
 {
   // 搜索框要覆盖任何一条隧道的 run_up，加上滞回那一档。逐隧道的 run_up 只有找到
   // 隧道之后才知道，所以先按图里最大的 run_up 搜，再逐条比自己的阈值。
@@ -71,11 +87,15 @@ bool GimbalLowerDecider::update(const SemanticMap & map, double world_x, double 
     return lower_;
   }
 
+  // 车已进到隧道本体内：无论路径怎么判都强制收，兜住路径过期/重规划漏发的缺口。
+  const auto own_cell = map.geometry().containingCell(Eigen::Vector2d(world_x, world_y));
+  const bool inside = own_cell && map.isTunnelBodyCell(own_cell->x(), own_cell->y());
+
   // 落下用 run_up，抬起要多退 hysteresis_m_ 才算离开。10~20 Hz 下没有滞回会让
   // 标志位在边界上抖，电控那边就是云台反复抬落。
   const double threshold =
     lower_ ? nearest->spec->run_up + hysteresis_m_ : nearest->spec->run_up;
-  lower_ = nearest->distance <= threshold;
+  lower_ = (will_cross || inside) && nearest->distance <= threshold;
   return lower_;
 }
 

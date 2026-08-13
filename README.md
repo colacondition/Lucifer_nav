@@ -171,18 +171,19 @@ ros2 launch bringup real.launch.py world:=RMUL mode:=mapping nav_rviz:=True
 ```
 
 建好的点云在 `PCD/<world>.pcd`。
+添加slamtoolbox插件保存`pgm`+`yaml`
 
-### 4.2.1 由点云生成语义地图
+### 4.2.1 生成语义地图
 
 `rm_map_server` 只读 `map/<world>.msgpack`：`/map` 占据栅格由其中 `terrain` 通道的
 OBSTACLE 格推导，隧道等「能站但要摆姿态才能进」的先验也存在同一张图里。
 
 ```sh
-# 1) 点云直接转 msgpack（三态 terrain：障碍 / 空地 / 未知，隧道格留空）
-ros2 run bringup pcd_to_navmap.py PCD/RMUL.pcd -o map/RMUL.msgpack
+# 1) pgm转 msgpack（三态 terrain：障碍 / 空地 / 未知，隧道格留空）
+python3 src/bringup/tools/pgm_to_navmap.py src/bringup/map/RMUL.yaml
 
 # 2) 人工标注：补激光扫不到的围栏、删观众席噪点，把通道标成隧道并画轴线
-ros2 run bringup semantic_map_editor.py map/RMUL.msgpack
+ros2 run bringup semantic_map_editor.py src/bringup/map/RMUL.msgpack
 ```
 
 隧道靠人工标：点云里顶板/横梁和墙没有区别，几何上分不出「能钻过去」。编辑器里把
@@ -192,7 +193,7 @@ ros2 run bringup semantic_map_editor.py map/RMUL.msgpack
 ### 4.2.2 隧道与云台收放
 
 标注进 msgpack 的隧道在导航时由 `rm_tunnel_posture` 驱动云台：车距最近隧道本体格
-≤ `run_up`（spec 里配，默认 0.5 m）发「收」，洞里全程保持，距隧道退开
+≤ `run_up`（spec 里配，默认 1.2 m）发「收」，洞里全程保持，距隧道退开
 `run_up + hysteresis`（0.3 m）才发「抬」。判据只看距离，跟轴线端点/车头朝向无关。
 
 云台链路（实车）：
