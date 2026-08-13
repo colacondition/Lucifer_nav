@@ -2,6 +2,10 @@
 
 RoboMaster 哨兵导航工作空间，ROS 2 Humble + Gazebo Classic 11，支持仿真与实车。
 
+仿真效果演示：
+
+<video src="docs/sim_demo.webm" controls width="100%"></video>
+
 ## 一. 项目介绍
 
 传感器是 Livox Mid360（雷达 + 内置 IMU），场地支持 RMUC / RMUL。
@@ -133,9 +137,21 @@ sudo apt install -y gcc-13 g++-13 libstdc++-13-dev
 sudo apt install -y ros-humble-asio-cmake-module libasio-dev
 ```
 
-- **gtsam_points v1.2.0** 源码编译（当前在 `/home/cola/gtsam_points`）：**必须**
-  `-DBUILD_WITH_MARCH_NATIVE=OFF` 且**不开 ASAN**，与 small_glim 的编译旗标一致
-  （ABI 陷阱），装到 `/usr/local` 并 `ldconfig`。GTSAM 4.3a0 已装 `/usr/local`，无则同旗标重编。
+```sh
+# 3. gtsam_points v1.2.0（small_glim 的 GICP/iVox 配准库；GTSAM 4.3a0 需先装 /usr/local）
+git clone https://github.com/koide3/gtsam_points.git
+cd gtsam_points && git checkout v1.2.0
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_WITH_MARCH_NATIVE=OFF
+make -j$(nproc)
+sudo make install
+sudo ldconfig
+```
+
+> **gtsam_points 的 ABI 陷阱**：`-DBUILD_WITH_MARCH_NATIVE=OFF` 必须与 small_glim
+> 的编译旗标一致（`-march=native` 两边不一致会在运行期出 ABI 问题），也不要额外加
+> ASAN 旗标。装到 `/usr/local` 后必须 `sudo ldconfig` —— 放本地前缀 colcon 找不到，
+> 运行期也解析不到 `.so`。GTSAM 4.3a0 同样装 `/usr/local`，缺的话按同旗标先编 GTSAM。
 
 建图链（slam_toolbox 栅格）的依赖都是标准 rosdep 包，`rosdep install` 自动装齐，
 无需手工编译：
