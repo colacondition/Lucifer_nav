@@ -37,6 +37,19 @@ def generate_launch_description():
     log_level = LaunchConfiguration('log_level')
     node_output = LaunchConfiguration('node_output')
     waypoint_file = LaunchConfiguration('waypoint_file')
+    mode = LaunchConfiguration('mode')
+    mapping_nav = LaunchConfiguration('mapping_nav')
+
+    # 建图模式下也跑导航（SLAM-navigation）：map 帧与 /map 由 slam_toolbox 边扫边
+    # 发，语义地图缺席（还没有 .msgpack 可读），隧道相关逻辑全部退化失效，仅作普通
+    # 2D 导航用。默认开，mode:=mapping 即生效；mapping_nav:=False 退回纯净建图。
+    nav_condition = IfCondition(PythonExpression([
+        "'", mode, "' == 'nav' or ('", mode, "' == 'mapping' and '",
+        mapping_nav, "' == 'True')"
+    ]))
+    mapping_nav_condition = IfCondition(PythonExpression([
+        "'", mode, "' == 'mapping' and '", mapping_nav, "' == 'True'"
+    ]))
 
     # 测量参数 (URDF 中 base_link 到 livox_frame 的外参)
     measurement_params = os.path.join(
@@ -65,9 +78,13 @@ def generate_launch_description():
     # RViz 配置按 mode 选：navigation.rviz 的 Fixed Frame 是 map，而 map 只有
     # nav 模式下的 fast_location / map_server 才发；建图模式下用 mapping.rviz
     # （Fixed Frame=world，带 /Laser_map 显示）。见 rviz/mapping.rviz 顶部说明。
+    # 建图 + 导航（mapping_nav）用专门的 mapping_nav.rviz：Fixed Frame 取 map
+    # （slam_toolbox 发），带 GoalTool 和 /map 显示，同时保留 /Laser_map（world 系）。
     rviz_config = PythonExpression([
+        "'", os.path.join(bringup_dir, 'rviz', 'mapping_nav.rviz'), "'",
+        " if ('", mode, "' == 'mapping' and '", mapping_nav, "' == 'True') else ",
         "'", os.path.join(bringup_dir, 'rviz', 'mapping.rviz'), "'",
-        " if '", LaunchConfiguration('mode'), "' == 'mapping' else ",
+        " if '", mode, "' == 'mapping' else ",
         "'", os.path.join(bringup_dir, 'rviz', 'navigation.rviz'), "'",
     ])
     nav_map_file = [PathJoinSubstitution([bringup_dir, 'map', world]), '.msgpack']
@@ -89,6 +106,9 @@ def generate_launch_description():
     # ===== 参数声明 =====
     declare_world = DeclareLaunchArgument('world', default_value='RMUL')
     declare_mode = DeclareLaunchArgument('mode', default_value='nav')
+    declare_mapping_nav = DeclareLaunchArgument(
+        'mapping_nav', default_value='True',
+        description='Run the nav stack while mapping (SLAM-navigation, map from slam_toolbox)')
     declare_use_sim_time = DeclareLaunchArgument('use_sim_time', default_value='True')
     declare_nav_rviz = DeclareLaunchArgument('nav_rviz', default_value='True')
     declare_gazebo_gui = DeclareLaunchArgument('gazebo_gui', default_value='True')
@@ -267,13 +287,27 @@ def generate_launch_description():
             'start_mpc_controller': 'True',
         }.items())
 
+    # 建图模式下的 SLAM-navigation：map 直接吃 slam_toolbox 的 /map，不起
+    # RmMapServer（它会跟 slam_toolbox 抢 /map，而且还没有 .msgpack 可加载、没有
+    # 语义地图可发）。隧道相关（收云台 / 限速 / 滤顶板）全部离线，仅普通 2D 导航。
+    start_navigation_mapping = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(navigation2_launch_dir, 'bringup.launch.py')),
+        condition=mapping_nav_condition,
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'params_file': navigation_params,
+            'start_map_server': 'False',
+            'start_mpc_controller': 'True',
+        }.items())
+
     # ===== 6.5 仿真云台模拟器 =====
     # 实车的 /gimbal_posture_state 由 serial_driver 转发电控的持续回传；仿真没有
     # 电控，由这个节点顶替：收到收/放请求后等 action_delay（默认 0.5s）翻转内部
     # 姿态，并以固定频率（默认 20Hz）持续回传当前姿态 —— 跟电控的上报行为一致，
     # 让 MPC 的「等云台收下来再进洞」和 RViz 云台状态显示在仿真里都跑通。
     simulated_gimbal_node = Node(
-        condition=LaunchConfigurationEquals('mode', 'nav'),
+        condition=nav_condition,
         package='simulated_gimbal',
         executable='simulated_gimbal_node',
         name='simulated_gimbal',
@@ -286,7 +320,7 @@ def generate_launch_description():
 
     # ===== 7. 速度转换 =====
     vel_transform_node = Node(
-        condition=LaunchConfigurationEquals('mode', 'nav'),
+        condition=nav_condition,
         package='fake_vel_transform',
         executable='fake_vel_transform_node',
         name='fake_vel_transform',
@@ -335,7 +369,7 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     for action in [
-        declare_world, declare_mode, declare_use_sim_time,
+        declare_world, declare_mode, declare_mapping_nav, declare_use_sim_time,
         declare_nav_rviz, declare_gazebo_gui, declare_log_level, declare_node_output,
         declare_software_rendering, declare_waypoint_file, declare_map_save_dir,
         enable_software_gl,
@@ -349,6 +383,7 @@ def generate_launch_description():
         slam_mapping_node,
         fast_loc_node,
         start_navigation,
+        start_navigation_mapping,
         simulated_gimbal_node,
         vel_transform_node,
         waypoint_follow_executor,

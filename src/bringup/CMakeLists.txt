@@ -18,13 +18,20 @@ install(DIRECTORY
 )
 
 # 换场地时离线跑的工具，装成可执行方便 ros2 run 之外直接调用。
-#   pcd_to_navmap       —— PCD 点云直接转语义地图 msgpack（高度切片，适合地面平整的点云）
 #   pgm_to_navmap       —— slam_toolbox/map_saver_cli 存出的 pgm+yaml 转 msgpack（主链）
 #   semantic_map_editor —— msgpack 语义地图标注 GUI，人工补围栏、标隧道
 install(PROGRAMS
-  tools/pcd_to_navmap.py
   tools/pgm_to_navmap.py
   tools/semantic_map_editor.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# pcd_reader 不是可执行，是被 semantic_map_editor 同目录 import 的模块
+# （read_pcd_xyz，纯 numpy 读 PCD）。装成 FILES 跟 editor 落到同一目录，
+# 否则装在 install/ 里的 editor 靠 sys.path.insert(parent) 找不到它，
+# 会退化掉「载入 PCD」功能（try/except 兜底，不崩但用不了）。
+install(FILES
+  tools/pcd_reader.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -36,7 +43,7 @@ if(BUILD_TESTING)
   # set(ENV{}) 影响 configure 期的 execute_process，ENV 参数影响实际跑测试时。
   set(ENV{PYTEST_DISABLE_PLUGIN_AUTOLOAD} 1)
   find_package(ament_cmake_pytest REQUIRED)
-  ament_add_pytest_test(test_pcd_to_navmap test/test_pcd_to_navmap.py
+  ament_add_pytest_test(test_pcd_reader test/test_pcd_reader.py
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
   ament_add_pytest_test(test_pgm_to_navmap test/test_pgm_to_navmap.py
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)

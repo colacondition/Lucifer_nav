@@ -28,11 +28,15 @@ PACKAGES=(
   "fake_vel_transform"
   "waypoint_editor"
   "serial_driver"
-  "decision"
   "pb_rm_simulation"
   "ros2_livox_simulation"
   "simulated_gimbal"        # 仿真云台模拟器（依赖 decision_interfaces，已在前）
   "bringup"
+  # decision exec_depend 了 bringup（它的路点 CSV 存在 bringup/config/waypoints 下），
+  # 必须放在 bringup 之后：干净重建时 bringup 还没 build，colcon 会报
+  # 「Failed to find package.sh」。之前它排在 serial_driver 之后，增量编译时
+  # bringup 已在 install/ 里所以没暴露，rm -rf build install 干净重建就炸了。
+  "decision"
 )
 
 # 检查 src 下是否有没写进上面列表的包

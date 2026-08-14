@@ -37,6 +37,18 @@ def generate_launch_description():
     waypoint_file = LaunchConfiguration('waypoint_file')
     use_serial_driver = LaunchConfiguration('use_serial_driver')
     use_decision = LaunchConfiguration('use_decision')
+    mapping_nav = LaunchConfiguration('mapping_nav')
+
+    # 建图模式下也跑导航（SLAM-navigation）：map 帧与 /map 由 slam_toolbox 边扫边
+    # 发，语义地图缺席（还没有 .msgpack 可读），隧道相关逻辑全部退化失效，仅作普通
+    # 2D 导航用。默认开，mode:=mapping 即生效；mapping_nav:=False 退回纯净建图。
+    nav_condition = IfCondition(PythonExpression([
+        "'", mode, "' == 'nav' or ('", mode, "' == 'mapping' and '",
+        mapping_nav, "' == 'True')"
+    ]))
+    mapping_nav_condition = IfCondition(PythonExpression([
+        "'", mode, "' == 'mapping' and '", mapping_nav, "' == 'True'"
+    ]))
 
     # 实车测量参数 (URDF 外参)
     measurement_params = os.path.join(
@@ -65,7 +77,11 @@ def generate_launch_description():
     mid360_driver_params = os.path.join(
         bringup_dir, 'config', 'reality', 'mid360_driver_real.yaml')
     # 与 sim.launch.py 保持一致：mapping 模式没有 map 帧，用专门的 mapping.rviz。
+    # 建图 + 导航（mapping_nav）用专门的 mapping_nav.rviz：Fixed Frame 取 map
+    # （slam_toolbox 发），带 GoalTool 和 /map 显示，同时保留 /Laser_map（world 系）。
     rviz_config = PythonExpression([
+        "'", os.path.join(bringup_dir, 'rviz', 'mapping_nav.rviz'), "'",
+        " if ('", mode, "' == 'mapping' and '", mapping_nav, "' == 'True') else ",
         "'", os.path.join(bringup_dir, 'rviz', 'mapping.rviz'), "'",
         " if '", mode, "' == 'mapping' else ",
         "'", os.path.join(bringup_dir, 'rviz', 'navigation.rviz'), "'",
@@ -87,6 +103,9 @@ def generate_launch_description():
     # ===== 参数声明 =====
     declare_world = DeclareLaunchArgument('world', default_value='RMUL')
     declare_mode = DeclareLaunchArgument('mode', default_value='nav')
+    declare_mapping_nav = DeclareLaunchArgument(
+        'mapping_nav', default_value='True',
+        description='Run the nav stack while mapping (SLAM-navigation, map from slam_toolbox)')
     declare_use_sim_time = DeclareLaunchArgument('use_sim_time', default_value='False')
     declare_nav_rviz = DeclareLaunchArgument('nav_rviz', default_value='False')
     declare_log_level = DeclareLaunchArgument('log_level', default_value='warn')
@@ -275,9 +294,23 @@ def generate_launch_description():
             'start_mpc_controller': 'True',
         }.items())
 
+    # 建图模式下的 SLAM-navigation：map 直接吃 slam_toolbox 的 /map，不起
+    # RmMapServer（它会跟 slam_toolbox 抢 /map，而且还没有 .msgpack 可加载、没有
+    # 语义地图可发）。隧道相关（收云台 / 限速 / 滤顶板）全部离线，仅普通 2D 导航。
+    start_navigation_mapping = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(navigation2_launch_dir, 'bringup.launch.py')),
+        condition=mapping_nav_condition,
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'params_file': navigation_params,
+            'start_map_server': 'False',
+            'start_mpc_controller': 'True',
+        }.items())
+
     # ===== 7. 速度转换 =====
     vel_transform_node = Node(
-        condition=LaunchConfigurationEquals('mode', 'nav'),
+        condition=nav_condition,
         package='fake_vel_transform',
         executable='fake_vel_transform_node',
         name='fake_vel_transform',
@@ -365,7 +398,7 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     for action in [
-        declare_world, declare_mode, declare_use_sim_time,
+        declare_world, declare_mode, declare_mapping_nav, declare_use_sim_time,
         declare_nav_rviz, declare_log_level, declare_node_output,
         declare_waypoint_file, declare_map_save_dir,
         declare_use_serial_driver, declare_use_decision,
@@ -380,6 +413,7 @@ def generate_launch_description():
         slam_mapping_node,
         fast_loc_node,
         start_navigation,
+        start_navigation_mapping,
         vel_transform_node,
         waypoint_follow_executor,
         waypoint_patrol_executor,
