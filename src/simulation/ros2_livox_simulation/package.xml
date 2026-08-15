@@ -17,6 +17,10 @@
 
   <depend>gazebo</depend>
   <depend>gazebo_ros</depend>
+  <!-- CMake 显式 find_package 的构建依赖，旧实现未声明，依赖传递才能编译。 -->
+  <depend>gazebo_dev</depend>
+  <depend>boost</depend>
+  <depend>protobuf</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>tf2_ros</depend>

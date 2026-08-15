@@ -78,11 +78,38 @@ std::vector<Eigen::Matrix4f> generatePlanarCandidates(
   const auto yaw_count = std::max(
     1, static_cast<int>(std::ceil((2.0f * kPi) / config.yaw_step)));
   const float actual_yaw_step = (2.0f * kPi) / static_cast<float>(yaw_count);
-  const float epsilon = config.xy_step * 1e-4f;
-  std::vector<Eigen::Matrix4f> candidates;
 
-  for (float x = bounds.min_x; x <= bounds.max_x + epsilon; x += config.xy_step) {
-    for (float y = bounds.min_y; y <= bounds.max_y + epsilon; y += config.xy_step) {
+  // 候选数上限保护：地图出现飞点/异常边界时，xy 网格 × yaw 网格会让候选数量
+  // 爆炸（500m×500m、0.5m 步长、30° yaw ≈ 1200 万），评分阶段每个候选都要做
+  // KD 树查询，一次重定位可能 OOM 或阻塞数分钟。这里预先估算候选数，超限则
+  // 倍增 xy_step 直到估算值回到上限以内，牺牲分辨率保住实时性与内存安全。
+  const std::size_t max_candidates = std::max<std::size_t>(config.max_candidates, 1);
+  float xy_step = config.xy_step;
+  while (true) {
+    const double nx = std::ceil(
+      static_cast<double>(bounds.max_x - bounds.min_x) / xy_step) + 1.0;
+    const double ny = std::ceil(
+      static_cast<double>(bounds.max_y - bounds.min_y) / xy_step) + 1.0;
+    const double estimated = nx * ny * static_cast<double>(yaw_count);
+    if (estimated <= static_cast<double>(max_candidates)) {
+      break;
+    }
+    // 候选数与步长平方成反比：乘以 sqrt(estimated/max) 一步压回上限附近。
+    const double scale = std::sqrt(estimated / static_cast<double>(max_candidates));
+    const float grown = xy_step * static_cast<float>(std::max(scale, 1.05));
+    if (!(grown > xy_step) || !std::isfinite(grown)) {
+      break;  // 浮点饱和兜底，避免死循环。
+    }
+    xy_step = grown;
+  }
+
+  const float epsilon = xy_step * 1e-4f;
+  std::vector<Eigen::Matrix4f> candidates;
+  candidates.reserve(
+    std::min<std::size_t>(max_candidates, static_cast<std::size_t>(1) << 24));
+
+  for (float x = bounds.min_x; x <= bounds.max_x + epsilon; x += xy_step) {
+    for (float y = bounds.min_y; y <= bounds.max_y + epsilon; y += xy_step) {
       for (int yaw_index = 0; yaw_index < yaw_count; ++yaw_index) {
         const float yaw = -kPi + actual_yaw_step * static_cast<float>(yaw_index);
         const auto pcd_from_base = planarPoseMatrix({x, y, yaw});

@@ -3,8 +3,9 @@ import os
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, RegisterEventHandler, TimerAction
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes
 from launch_ros.descriptions import ComposableNode
@@ -74,6 +75,76 @@ def generate_launch_description():
         output='screen',
     )
 
+    # 组件加载 action 做成工厂：启动时执行一次，容器每次退出（被 respawn 重建）
+    # 后也要重新执行。Humble 的 LoadComposableNodes 只在其 execute() 时调度一次
+    # 加载序列；ComposableNodeContainer 的 respawn=True 只会重启容器进程，不会
+    # 重跑这些平级 action —— 不补这层事件处理，崩溃自愈起来的是个空容器。
+    def make_load_actions():
+        return [
+            nav_component(
+                'navigation2::RmMapServer', 'rm_map_server', start_map_server,
+                {'map_filename': map_file}),
+            nav_component('navigation2::RmGlobalCostmap', 'rm_global_costmap',
+                          start_global_costmap),
+            nav_component('navigation2::RmGlobalPlanner', 'rm_global_planner',
+                          start_global_planner),
+            nav_component('navigation2::RmMincoPathSmoother', 'rm_minco_path_smoother',
+                          start_path_smoother),
+            nav_component('navigation2::RmLocalCostmap', 'rm_local_costmap',
+                          start_local_costmap),
+            nav_component('navigation2::RmMpcController', 'rm_mpc_controller',
+                          start_mpc_controller),
+            nav_component('navigation2::RmVelocitySmoother', 'rm_velocity_smoother',
+                          start_velocity_smoother),
+            nav_component('navigation2::RmNav2Compat', 'rm_nav2_compat',
+                          start_nav2_compat),
+            # 隧道云台请求：图里没有隧道时它只是每 0.1 s 发一个 false，成本可忽略，
+            # 所以默认开着 —— 忘记开的代价是云台撞在顶板上。
+            nav_component('navigation2::RmTunnelPosture', 'rm_tunnel_posture',
+                          start_tunnel_posture),
+            # 云台状态可视化：只读电控回传和请求，不碰控制，纯显示。实车仿真都要看，
+            # 默认开。忘开的代价只是 RViz 里看不到云台状态，不影响行驶。
+            nav_component('navigation2::RmGimbalVisualizer', 'rm_gimbal_visualizer',
+                          start_gimbal_visualizer),
+            # goal_approach_controller lives in its own package (PCL-free, separate deps)
+            # but composes into the same container.
+            LoadComposableNodes(
+                condition=IfCondition(start_goal_approach_controller),
+                target_container=container_name,
+                composable_node_descriptions=[
+                    ComposableNode(
+                        package='goal_approach_controller',
+                        plugin='goal_approach_controller::GoalApproachControllerNode',
+                        name='goal_approach_controller',
+                        parameters=common_params,
+                    )
+                ],
+            ),
+        ]
+
+    # 容器每次退出（崩溃被 respawn 或正常退出）都重新调度组件加载。组件加载
+    # action 内部会 wait_for_service 直到新容器起来；launch 整体 shutdown 时会
+    # 因 context.is_shutdown 放弃等待，不会卡住退出流程。
+    #
+    # 两个实现细节：
+    # 1) OnProcessExit 的 target_action 只能匹配 ExecuteProcess 实例，而这里只有
+    #    ComposableNodeContainer（Node action），直接传 container 不触发，所以用
+    #    可调用 handler 按 cmd 判断。
+    # 2) 不能立刻加载：容器刚死时 rclpy 的图缓存里旧 load_node 服务仍然可见，
+    #    wait_for_service 会立即返回 True，随后 call_async 发到已死进程并永久
+    #    挂起（Humble launch_ros 的 _load_node 没有调用超时）。用 TimerAction
+    #    等 respawn_delay(2s) + 图缓存刷新之后再调度加载，新服务的 service 才是
+    #    真实可达的。实测 kill -9 容器后 4s 延迟可稳定完成组件重载。
+    def reload_on_exit(event, context):
+        cmd = getattr(event, 'cmd', None)
+        if cmd and any('nav_container_mt' in str(part) for part in cmd):
+            return [TimerAction(period=4.0, actions=make_load_actions())]
+        return None
+
+    reload_components = RegisterEventHandler(
+        OnProcessExit(on_exit=reload_on_exit)
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('map', default_value=''),
@@ -94,38 +165,6 @@ def generate_launch_description():
         DeclareLaunchArgument('container_name', default_value='nav_container'),
 
         container,
-
-        nav_component(
-            'navigation2::RmMapServer', 'rm_map_server', start_map_server,
-            {'map_filename': map_file}),
-        nav_component('navigation2::RmGlobalCostmap', 'rm_global_costmap', start_global_costmap),
-        nav_component('navigation2::RmGlobalPlanner', 'rm_global_planner', start_global_planner),
-        nav_component('navigation2::RmMincoPathSmoother', 'rm_minco_path_smoother', start_path_smoother),
-        nav_component('navigation2::RmLocalCostmap', 'rm_local_costmap', start_local_costmap),
-        nav_component('navigation2::RmMpcController', 'rm_mpc_controller', start_mpc_controller),
-        nav_component('navigation2::RmVelocitySmoother', 'rm_velocity_smoother',
-                      start_velocity_smoother),
-        nav_component('navigation2::RmNav2Compat', 'rm_nav2_compat', start_nav2_compat),
-        # 隧道云台请求：图里没有隧道时它只是每 0.1 s 发一个 false，成本可忽略，
-        # 所以默认开着 —— 忘记开的代价是云台撞在顶板上。
-        nav_component('navigation2::RmTunnelPosture', 'rm_tunnel_posture', start_tunnel_posture),
-        # 云台状态可视化：只读电控回传和请求，不碰控制，纯显示。实车仿真都要看，
-        # 默认开。忘开的代价只是 RViz 里看不到云台状态，不影响行驶。
-        nav_component('navigation2::RmGimbalVisualizer', 'rm_gimbal_visualizer',
-                      start_gimbal_visualizer),
-
-        # goal_approach_controller lives in its own package (PCL-free, separate deps)
-        # but composes into the same container.
-        LoadComposableNodes(
-            condition=IfCondition(start_goal_approach_controller),
-            target_container=container_name,
-            composable_node_descriptions=[
-                ComposableNode(
-                    package='goal_approach_controller',
-                    plugin='goal_approach_controller::GoalApproachControllerNode',
-                    name='goal_approach_controller',
-                    parameters=common_params,
-                )
-            ],
-        ),
+        reload_components,
+        *make_load_actions(),
     ])

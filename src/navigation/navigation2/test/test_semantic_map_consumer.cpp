@@ -512,4 +512,81 @@ TEST(TunnelAxisGrid, DiagonalTunnelAcceptsTheStepsThatFollowItsAxis)
 }
 
 }  // namespace
+
+// 真实地图回归：rm_map_server 加载 RMUL.msgpack → inflate → 编码成 SemanticMap
+// 消息 → 消费端 semanticMapFromMsg 必须无损接受并重建隧道影响区。该链路任一环
+// 校验过严，隧道顶板豁免就会静默失效，洞口被点云重新封死。
+TEST(SemanticMapConsumerTest, RealWorldMapRoundTripAccepted)
+{
+  const std::string path = "/home/cola/Lucifer_nav/src/bringup/map/RMUL.msgpack";
+  const SemanticMapData data = loadSemanticMap(path);
+
+  InflationParams inflation;
+  inflation.resolution = data.geometry.resolution;
+  inflation.full_cost_radius_m = 0.10;
+  inflation.cutoff_radius_m = 0.30;
+  inflation.decay_rate_per_m = 24.0;
+  inflation.non_body_magnitude_cap = kMaxInflatedMagnitude;
+  const SemanticMap map = SemanticMap::inflate(data, inflation);
+
+  decision_interfaces::msg::SemanticMap msg;
+  msg.width = static_cast<std::uint32_t>(map.geometry().width);
+  msg.height = static_cast<std::uint32_t>(map.geometry().height);
+  msg.resolution = map.geometry().resolution;
+  msg.origin_x = map.geometry().origin.x();
+  msg.origin_y = map.geometry().origin.y();
+  msg.terrain = map.terrain();
+  msg.cost = map.cost();
+
+  const std::size_t cells = map.terrain().size();
+  msg.direction_angle.assign(cells, 0);
+  msg.direction_magnitude.assign(cells, 0);
+  for (int y = 0; y < map.geometry().height; ++y) {
+    for (int x = 0; x < map.geometry().width; ++x) {
+      const std::size_t index = map.geometry().index(x, y);
+      const Eigen::Vector2d direction = map.directionAtCell(x, y);
+      const double magnitude = direction.norm();
+      if (magnitude < 1e-12) {
+        continue;
+      }
+      double angle = std::atan2(direction.y(), direction.x());
+      if (angle < 0.0) {
+        angle += 2.0 * M_PI;
+      }
+      msg.direction_angle[index] = static_cast<std::uint8_t>(
+        std::clamp(std::lround(angle / (2.0 * M_PI) * 255.0), 0L, 255L));
+      msg.direction_magnitude[index] = static_cast<std::uint8_t>(
+        std::clamp(std::lround(std::min(magnitude, 1.0) * 255.0), 0L, 255L));
+    }
+  }
+
+  for (const TunnelSpec & spec : map.tunnels()) {
+    decision_interfaces::msg::TunnelSpec entry;
+    entry.clear_height = spec.clear_height;
+    entry.clear_width = spec.clear_width;
+    entry.run_up = spec.run_up;
+    entry.velocity_min = spec.velocity_min;
+    entry.velocity_max = spec.velocity_max;
+    msg.tunnels.push_back(entry);
+  }
+  msg.tunnel_ids = map.tunnelIds();
+
+  const SemanticMap parsed = semanticMapFromMsg(msg);
+  EXPECT_EQ(parsed.terrain(), map.terrain());
+  EXPECT_EQ(parsed.tunnels().size(), map.tunnels().size());
+
+  const GridGeometry geometry = parsed.geometry();
+  const auto region = TunnelRegionGrid::build(parsed, 0.20);
+  EXPECT_FALSE(region.empty());
+  bool found_tunnel_cell = false;
+  for (std::size_t i = 0; i < parsed.terrain().size(); ++i) {
+    if (parsed.terrain()[i] == kTunnel) {
+      found_tunnel_cell = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_tunnel_cell);
+  (void)geometry;
+}
+
 }  // namespace navigation2

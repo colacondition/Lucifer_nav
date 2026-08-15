@@ -1,4 +1,6 @@
 #pragma once
+#include <cmath>
+
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
@@ -33,6 +35,9 @@ inline geometry_msgs::msg::PoseStamped predict_pose(
   if (!std::isfinite(dt) || dt < 0.0) {
     dt = 0.0;
   }
+  if (max_dt < 0.0) {
+    max_dt = 0.0;
+  }
   if (dt > max_dt) {
     dt = max_dt;
   }
@@ -44,7 +49,11 @@ inline geometry_msgs::msg::PoseStamped predict_pose(
   q_pred.normalize();
 
   Eigen::Vector3d p_pred(px, py, pz);
-  p_pred += v * dt;
+  // ROS 的 Odometry.twist 按 REP 103 约定表达在 child_frame（车体系），外推前
+  // 必须先旋转到 header.frame_id 系。旧实现把车体速度直接加到世界位置，yaw 非零
+  // 时位置预测错误；该函数只在 TF 不可用的里程计回退路径使用，此处修正不影响
+  // 正常 TF 路径。
+  p_pred += (q * v) * dt;
 
   out.pose.position.x = p_pred.x();
   out.pose.position.y = p_pred.y();

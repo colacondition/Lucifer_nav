@@ -41,6 +41,33 @@ TEST(GlobalSearchTest, CoversMapBoundsAndFullYawRange)
   EXPECT_EQ(candidates.size(), 36u);
 }
 
+TEST(GlobalSearchTest, CapsCandidatesOnHugeBounds)
+{
+  // 500m×500m 的异常边界 × 12 个 yaw 原始候选数远超上限；上限保护必须自动
+  // 加大 xy 步长，避免一次全局重定位耗尽内存。
+  fast_location::PlanarBounds bounds{0.0f, 500.0f, 0.0f, 500.0f};
+  GlobalSearchConfig config;
+  config.xy_step = 0.5f;
+  config.yaw_step = static_cast<float>(M_PI / 6.0);
+  config.max_candidates = 20000;
+
+  const auto candidates = fast_location::generatePlanarCandidates(
+    bounds, Eigen::Matrix4f::Identity(), config);
+
+  ASSERT_LE(candidates.size(), config.max_candidates);
+  EXPECT_GT(candidates.size(), 0u);
+  // 正常边界下上限不影响分辨率：候选数应等于精确计算值。
+  fast_location::PlanarBounds small_bounds{-2.0f, 2.0f, -1.0f, 3.0f};
+  GlobalSearchConfig small_config;
+  small_config.xy_step = 2.0f;
+  small_config.yaw_step = static_cast<float>(M_PI_2);
+  small_config.max_candidates = 20000;
+  EXPECT_EQ(
+    fast_location::generatePlanarCandidates(
+      small_bounds, Eigen::Matrix4f::Identity(), small_config).size(),
+    36u);
+}
+
 TEST(GlobalSearchTest, RanksKnownSyntheticPoseFirst)
 {
   const auto global_map = makeAsymmetricMap();

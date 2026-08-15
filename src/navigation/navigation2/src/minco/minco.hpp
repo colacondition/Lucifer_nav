@@ -27,6 +27,7 @@
 #include <Eigen/Eigen>
 
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace minco {
@@ -38,6 +39,13 @@ namespace minco {
 // Banded LU factorization has O(N) time complexity.
 class BandedSystem {
 public:
+    BandedSystem() = default;
+    // 类持有裸 new[] 缓冲：拷贝会共享 ptrData 导致双重释放，必须禁用；
+    // 析构兜底 destroy()，避免漏调用时泄漏。
+    ~BandedSystem() { destroy(); }
+    BandedSystem(const BandedSystem&) = delete;
+    BandedSystem& operator=(const BandedSystem&) = delete;
+
     // The size of A, as well as the lower/upper
     // banded width p/q are needed
     inline void create(const int& n, const int& p, const int& q) {
@@ -165,6 +173,14 @@ public:
 };
 class BandedSystemNoTime { /// 1.0版本
 public:
+    BandedSystemNoTime() = default;
+    ~BandedSystemNoTime() { destroy(); }
+    // 深拷贝构造：编译器隐式生成的浅拷贝会与析构/operator= 共享 ptrData，
+    // 造成双重释放。
+    BandedSystemNoTime(const BandedSystemNoTime& bs) {
+        create(bs.N, bs.lowerBw, bs.upperBw);
+        memcpy(ptrData, bs.ptrData, N * (lowerBw + upperBw + 1) * sizeof(double));
+    }
     inline void create(const int& n, const int& p, const int& q) {
         // In case of re-creating before destroying
         destroy();

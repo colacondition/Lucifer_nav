@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -13,6 +17,7 @@
 #include <small_glim/preprocess/cloud_preprocessor.hpp>
 #include <small_glim/preprocess/time_keeper.hpp>
 #include <small_glim/odometry/async_odometry_estimation.hpp>
+#include <small_glim/odometry/imu_integration.hpp>
 #include <small_glim/mapping/async_mapping.hpp>
 
 namespace small_glim {
@@ -25,8 +30,19 @@ public:
     void timer_callback();
     void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
     size_t lidar_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+    // 高频里程计输出：在 10Hz 雷达帧之间用最新估计的 bias 与 IMU 数据前向传播，
+    // 以 high_rate_odom_hz 发布 /Odometry 与 lidar_odom->base_link TF。
+    // /lio/robo/odom 始终保留 10Hz 校正流，供 fast_location 与点云同源使用。
+    void high_rate_timer_callback();
 
     void pub_odometry(const EstimationFrame::ConstPtr frame);
+    void pub_propagated_odometry(
+        const Eigen::Isometry3d & T_world_imu, const Eigen::Vector3d & v_world_imu,
+        const Eigen::Isometry3d & T_lidar_imu, const rclcpp::Time & stamp);
+    void pub_odometry_impl(
+        const Eigen::Isometry3d & T_odom_lidar, const Eigen::Vector3d & v_body,
+        const rclcpp::Time & stamp, bool publish_tf, bool publish_primary_odom,
+        bool publish_robo_odom);
     void pub_cloud(const EstimationFrame::ConstPtr frame, const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher);
     void pub_localization_cloud(const EstimationFrame::ConstPtr frame, const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher);
     void wait();
@@ -52,6 +68,7 @@ private:
     std::string base_frame_id, odometry_frame_id, cloud_frame_id;
 
     rclcpp::TimerBase::SharedPtr timer;
+    rclcpp::TimerBase::SharedPtr high_rate_timer;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub;
@@ -59,6 +76,36 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr registered_cloud_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr ivox_cloud_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr localization_cloud_pub;
+
+    // ---- 高频里程计前向传播状态 ----
+    // 只用于在雷达帧之间补帧。传播状态始终“向前”推进，但每拍都从最近一次
+    // 校正基准重新预积分：基准之前保留的 IMU 数据在下一帧校正到来时被用于
+    // 把旧基准外推到校正时间戳，再与校正位姿做同时间戳的指数平滑。这样既能
+    // 压低 10Hz 校正跳变，又不会像旧实现那样把两帧雷达之间的运动一起“抹掉”。
+    // IMU 独立存一份给这个传播器（与里程计线程的输入队列解耦）。所有访问都
+    // 发生在节点的 executor 单线程里，无需加锁。
+    double high_rate_odom_hz{0.0};
+    double high_rate_smoothing_tau{0.1};
+    double high_rate_smoothing_tau_z{1.0};
+    double high_rate_max_window{0.2};
+    int high_rate_max_imu_queue{2000};
+    std::unique_ptr<IMUIntegration> imu_propagation;
+    EstimationFrame::ConstPtr latest_estimation_frame;
+    double latest_imu_stamp{0.0};
+    bool have_latest_imu{false};
+
+    // 平滑后的传播基准（位姿/速度都定义在 propagation_base_stamp 时刻）。
+    bool have_propagation_base{false};
+    Eigen::Isometry3d propagation_base_T{Eigen::Isometry3d::Identity()};
+    Eigen::Vector3d propagation_base_v{Eigen::Vector3d::Zero()};
+    double propagation_base_stamp{0.0};
+    // 最近一次已处理的校正帧时间戳。传播基准可能因队列安全阀被推进到比校正帧
+    // 更新的时刻，所以不能用 propagation_base_stamp 判断“是否来了新校正帧”。
+    double last_correction_stamp{0.0};
+    bool have_last_correction{false};
+    // 上一次发布的时间戳，只用于保证 TF 时间戳严格单调。
+    double last_high_rate_stamp{0.0};
+    bool have_last_high_rate_stamp{false};
 
     // Latest denser localization cloud (LiDAR frame), produced alongside the odometry
     // cloud and transformed by the odometry pose at publish time. Written in
@@ -84,6 +131,21 @@ SmallGlimNode::SmallGlimNode(const rclcpp::NodeOptions& options): Node("small_gl
 
     enable_tf_publish = config->param<bool>("node.enable_tf_publish");
     enable_mapping = config->param<bool>("node.enable_mapping");
+    high_rate_odom_hz = config->param<double>("node.high_rate_odom_hz");
+    if (!(high_rate_odom_hz >= 0.0)) {
+        logger::warn("node", "invalid high_rate_odom_hz, falling back to 0 Hz (disabled)");
+        high_rate_odom_hz = 0.0;
+    }
+    high_rate_smoothing_tau = std::max(0.0, config->param<double>("node.high_rate_smoothing_tau"));
+    high_rate_smoothing_tau_z = std::max(0.0, config->param<double>("node.high_rate_smoothing_tau_z"));
+    high_rate_max_window = std::max(0.01, config->param<double>("node.high_rate_max_window"));
+    high_rate_max_imu_queue = std::max(64, config->param<int>("node.high_rate_max_imu_queue"));
+    if (high_rate_odom_hz > 0.0) {
+        imu_propagation = std::make_unique<IMUIntegration>(config);
+        // 高频传播每 tick 从过去的估计帧时间开始积分，首段 gap 超限是正常现象，
+        // 静音该路径的 gap 警告；主里程计线程仍保留告警。
+        imu_propagation->set_suppress_gap_warnings(true);
+    }
 
     imu_time_offset = config->param<double>("node.imu_time_offset");
     lidar_time_offset = config->param<double>("node.lidar_time_offset");
@@ -137,6 +199,16 @@ SmallGlimNode::SmallGlimNode(const rclcpp::NodeOptions& options): Node("small_gl
 
     // Start timer
     timer = create_wall_timer(std::chrono::milliseconds(1), [this]() { timer_callback(); });
+
+    // 高频里程计补帧：10Hz 雷达帧之间用 IMU 前向传播，降低 MPC/TF 查询看到的
+    // 相位滞后（最坏 100ms → ~20ms）。0 关闭。发布走 wall timer 保证均匀节拍。
+    if (high_rate_odom_hz > 0.0) {
+        high_rate_timer = create_wall_timer(
+            std::chrono::duration<double>(1.0 / high_rate_odom_hz),
+            [this]() { high_rate_timer_callback(); });
+        logger::info(
+            "node", "high-rate odometry propagation enabled at {:.1f} Hz", high_rate_odom_hz);
+    }
 }
 
 SmallGlimNode::~SmallGlimNode() {
@@ -169,6 +241,11 @@ void SmallGlimNode::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
         return;
     }
     odometry_estimation->insert_imu(imu_stamp, linear_acc, angular_vel);
+    if (imu_propagation) {
+        imu_propagation->insert_imu(imu_stamp, linear_acc, angular_vel);
+        latest_imu_stamp = imu_stamp;
+        have_latest_imu = true;
+    }
 }
 
 size_t SmallGlimNode::lidar_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
@@ -224,6 +301,7 @@ void SmallGlimNode::timer_callback() {
     std::vector<EstimationFrame::ConstPtr> marginalized_frames;
     odometry_estimation->get_results(estimation_frames, target_ivox_frames, marginalized_frames);
     if (!estimation_frames.empty()) {
+        latest_estimation_frame = estimation_frames.back();
         pub_odometry(estimation_frames.back());
         // 点云只在有订阅者时才拼装/发布：/Laser_map（RViz 调试）常处于无人订阅
         // 状态，之前每帧都要把几万点拷成 PointCloud2 再序列化，纯浪费。
@@ -250,12 +328,40 @@ void SmallGlimNode::pub_odometry(const EstimationFrame::ConstPtr frame) {
     // carries the lidar pose, keeping the odom origin z anchored at the power-on lidar plane.
     const Eigen::Isometry3d T_odom_lidar = frame->T_world_imu * frame->T_lidar_imu.inverse();
     const Eigen::Vector3d v_body = T_odom_lidar.linear().transpose() * frame->v_world_imu;
+    // 高频模式下的数据流分工：
+    //   /Odometry          → 高频传播流（MPC 的 odom 回退与 TF 同一条流）
+    //   /lio/robo/odom     → 10Hz 校正流（fast_location 专用，必须与
+    //                        /Laser_map_dense 的校正位姿同流，否则 scan 和 odom
+    //                        不一致会让 map→odom 漂移，点云看起来跟着车走）
+    //   lidar_odom→base_link TF → 高频传播流
+    // 10Hz 硬校正值绝不进入 TF 和 /Odometry，传播值绝不进入 /lio/robo/odom。
+    const bool high_rate_enabled = high_rate_odom_hz > 0.0;
+    pub_odometry_impl(
+        T_odom_lidar, v_body, stamp,
+        enable_tf_publish && !high_rate_enabled,   // TF: 关闭高频时由校正流发
+        !high_rate_enabled,                        // /Odometry: 关闭高频时由校正流发
+        true);                                     // /lio/robo/odom: 始终发校正值
+}
 
-    // Dynamic lidar_odom -> base_link TF at the corrected (lidar) rate. This is the
-    // only edge connecting the odom tree (map->odom->lidar_odom) to the robot tree
-    // (base_link->livox_frame/imu_link/...); dropping it splits the TF graph and breaks
-    // costmap/amcl localization, not just RViz.
-    if (enable_tf_publish) {
+void SmallGlimNode::pub_propagated_odometry(
+    const Eigen::Isometry3d & T_world_imu, const Eigen::Vector3d & v_world_imu,
+    const Eigen::Isometry3d & T_lidar_imu, const rclcpp::Time & stamp
+) {
+    const Eigen::Isometry3d T_odom_lidar = T_world_imu * T_lidar_imu.inverse();
+    const Eigen::Vector3d v_body = T_odom_lidar.linear().transpose() * v_world_imu;
+    // 传播流只发 TF 和 /Odometry，不发 /lio/robo/odom。
+    pub_odometry_impl(T_odom_lidar, v_body, stamp, enable_tf_publish, true, false);
+}
+
+void SmallGlimNode::pub_odometry_impl(
+    const Eigen::Isometry3d & T_odom_lidar, const Eigen::Vector3d & v_body,
+    const rclcpp::Time & stamp, bool publish_tf, bool publish_primary_odom,
+    bool publish_robo_odom
+) {
+    // Dynamic lidar_odom -> base_link TF. This is the only edge connecting the odom tree
+    // (map->odom->lidar_odom) to the robot tree (base_link->livox_frame/imu_link/...);
+    // dropping it splits the TF graph and breaks costmap/amcl localization, not just RViz.
+    if (publish_tf) {
         geometry_msgs::msg::TransformStamped tf_base_to_odom;
         tf_base_to_odom.header.frame_id = odometry_frame_id;
         tf_base_to_odom.child_frame_id = base_frame_id;
@@ -264,16 +370,212 @@ void SmallGlimNode::pub_odometry(const EstimationFrame::ConstPtr frame) {
         tf_broadcaster->sendTransform(tf_base_to_odom);
     }
 
+    if (!publish_primary_odom && !publish_robo_odom) {
+        return;
+    }
+
     nav_msgs::msg::Odometry odom;
     odom.header.frame_id = odometry_frame_id;
     odom.child_frame_id = base_frame_id;
     odom.header.stamp = stamp;
     utils::convert(T_odom_lidar, odom.pose.pose);
     utils::convert(v_body, odom.twist.twist.linear);
-    // Lidar-rate odom for the MPC controller (super_lio's /lio/odom was also lidar-rate).
-    odometry_pub->publish(odom);
-    // Lidar-rate odom for fast_location (super_lio's /lio/robo/odom was also lidar-rate).
-    robo_odometry_pub->publish(odom);
+    if (publish_primary_odom) {
+        odometry_pub->publish(odom);
+    }
+    if (publish_robo_odom) {
+        robo_odometry_pub->publish(odom);
+    }
+}
+
+void SmallGlimNode::high_rate_timer_callback() {
+    if (!imu_propagation || !latest_estimation_frame || !have_latest_imu) {
+        return;
+    }
+
+    const auto & frame = latest_estimation_frame;
+    const gtsam::imuBias::ConstantBias bias(frame->imu_bias);
+
+    // ---- 校正帧状态机：首帧 / 新帧 / 乱序帧 / 迟到帧 ----
+    // 新校正帧是否出现，以 last_correction_stamp 判断，而不是 propagation_base_stamp：
+    // 队列安全阀可能已经把传播基准推进到比最新校正帧更晚的时刻。
+    auto reanchor = [&](const double stamp, const Eigen::Isometry3d & T,
+                        const Eigen::Vector3d & v) {
+        propagation_base_T = T;
+        propagation_base_v = v;
+        propagation_base_stamp = stamp;
+        have_propagation_base = true;
+
+        // 丢弃基准时间之前的 IMU，后续预积分从新基准时间开始。
+        size_t num_stale = 0;
+        imu_propagation->integrate_imu(stamp, stamp, bias, &num_stale);
+        if (num_stale > 0) {
+            imu_propagation->erase_imu_data(num_stale);
+        }
+    };
+
+    if (!have_propagation_base || !have_last_correction) {
+        // 正常首帧直接作为基准。
+        reanchor(frame->stamp, frame->T_world_imu, frame->v_world_imu);
+        last_correction_stamp = frame->stamp;
+        have_last_correction = true;
+    } else if (frame->stamp < last_correction_stamp) {
+        // 校正帧时间戳回退说明估计线程被重置过，直接吸附新值。
+        logger::warn(
+            "node",
+            "high-rate estimation frame timestamp rewind ({:.6f} -> {:.6f}), re-anchoring",
+            last_correction_stamp,
+            frame->stamp);
+        reanchor(frame->stamp, frame->T_world_imu, frame->v_world_imu);
+        last_correction_stamp = frame->stamp;
+    } else if (frame->stamp > last_correction_stamp) {
+        const double new_correction_stamp = frame->stamp;
+        last_correction_stamp = new_correction_stamp;
+
+        if (new_correction_stamp < propagation_base_stamp) {
+            // 迟到校正：队列安全阀已经把基准推到比校正帧更晚，IMU 历史已丢，
+            // 无法向后外推，这一帧只能硬吸附，下一帧恢复正常的同时间戳平滑。
+            logger::warn(
+                "node",
+                "late high-rate correction (correction={:.6f} < base={:.6f}), hard re-anchoring",
+                new_correction_stamp,
+                propagation_base_stamp);
+            reanchor(new_correction_stamp, frame->T_world_imu, frame->v_world_imu);
+        } else {
+            // ---- 新校正帧：同一时间戳上的预测值 vs 校正值 ----
+            // 关键修复：不能把“旧基准时刻的位姿”直接和“新校正时刻的位姿”插值。
+            // 先用保留在传播队列里的 IMU 把旧基准外推到 new_correction_stamp，得到
+            // pred_at_correction，再与校正值平滑；帧间运动由 IMU 完整保留，
+            // 平滑只吸收校正残差。
+            const double old_base_stamp = propagation_base_stamp;
+            const gtsam::NavState old_base_state(
+                gtsam::Pose3(propagation_base_T.matrix()), propagation_base_v);
+
+            Eigen::Isometry3d pred_T = propagation_base_T;
+            Eigen::Vector3d pred_v = propagation_base_v;
+            size_t num_integrated = 0;
+            imu_propagation->integrate_imu(
+                old_base_stamp, new_correction_stamp, bias, &num_integrated);
+            const auto predicted_at_correction =
+                imu_propagation->integrated_measurements().predict(old_base_state, bias);
+            if (predicted_at_correction.pose().matrix().allFinite()
+                && predicted_at_correction.velocity().allFinite()) {
+                pred_T = Eigen::Isometry3d(predicted_at_correction.pose().matrix());
+                pred_v = predicted_at_correction.velocity();
+            }
+
+            // 已经积分到 new_correction_stamp 的 IMU 不再需要：后续传播从新基准时刻重新开始。
+            if (num_integrated > 0) {
+                imu_propagation->erase_imu_data(num_integrated);
+            }
+
+            // 平滑系数按“两次校正的时间间隔”计算，与 high_rate_odom_hz 解耦。
+            // 旧实现用单个高频 tick 的墙钟 dt，100Hz 时每个校正只吸收 ~9.5%，
+            // 相当于把 10Hz 校正跳变几乎原样送进 TF。
+            // z 轴单独用更慢的 tau：地面机器人的 z 本来只该缓慢变化，而 LIO 在
+            // 运动/旋转时高度校正常有 cm 级抖动；若与 xy/yaw 共用 0.1s，这些抖动
+            // 会被逐拍吸收进高频 TF，表现为“反复下沉又弹回地面”。
+            const double correction_dt =
+                std::max(new_correction_stamp - old_base_stamp, 1e-3);
+            const double alpha = high_rate_smoothing_tau > 0.0
+                ? 1.0 - std::exp(-correction_dt / high_rate_smoothing_tau)
+                : 1.0;
+            const double alpha_z = high_rate_smoothing_tau_z > 0.0
+                ? 1.0 - std::exp(-correction_dt / high_rate_smoothing_tau_z)
+                : 1.0;
+            const double a = std::clamp(alpha, 0.0, 1.0);
+            const double a_z = std::clamp(alpha_z, 0.0, 1.0);
+
+            Eigen::Quaterniond q_pred(pred_T.linear());
+            Eigen::Quaterniond q_corr(frame->T_world_imu.linear());
+            if (q_pred.dot(q_corr) < 0.0) {
+                q_corr.coeffs() *= -1.0;
+            }
+
+            Eigen::Isometry3d blended = Eigen::Isometry3d::Identity();
+            blended.linear() = q_pred.slerp(a, q_corr).normalized().toRotationMatrix();
+            blended.translation() =
+                pred_T.translation() * (1.0 - a) +
+                frame->T_world_imu.translation() * a;
+            blended.translation().z() =
+                pred_T.translation().z() * (1.0 - a_z) +
+                frame->T_world_imu.translation().z() * a_z;
+
+            propagation_base_T = blended;
+            propagation_base_v = pred_v * (1.0 - a) + frame->v_world_imu * a;
+            propagation_base_v.z() =
+                pred_v.z() * (1.0 - a_z) + frame->v_world_imu.z() * a_z;
+            propagation_base_stamp = new_correction_stamp;
+        }
+    }
+
+    const gtsam::NavState base_state(
+        gtsam::Pose3(propagation_base_T.matrix()), propagation_base_v);
+
+    // ---- 积分外推到最新 IMU 时间 ----
+    // 外推窗口设上限：估计处理延迟大时，长窗口纯 IMU 外推会放大漂移/抖动。
+    double end_time = latest_imu_stamp;
+    if (end_time - propagation_base_stamp > high_rate_max_window) {
+        end_time = propagation_base_stamp + high_rate_max_window;
+    }
+
+    Eigen::Isometry3d out_T_world_imu = propagation_base_T;
+    Eigen::Vector3d out_v_world_imu = propagation_base_v;
+    double out_stamp = propagation_base_stamp;
+
+    if (end_time > propagation_base_stamp) {
+        size_t num_integrated = 0;
+        imu_propagation->integrate_imu(
+            propagation_base_stamp, end_time, bias, &num_integrated);
+        const auto predicted =
+            imu_propagation->integrated_measurements().predict(base_state, bias);
+        if (predicted.pose().matrix().allFinite() && predicted.velocity().allFinite()) {
+            out_T_world_imu = Eigen::Isometry3d(predicted.pose().matrix());
+            out_v_world_imu = predicted.velocity();
+            out_stamp = end_time;
+        } else {
+            logger::warn(
+                "node",
+                "high-rate odometry prediction non-finite, falling back to smoothed base");
+        }
+        // 注意：这里刻意不出队。当前基准到下一校正帧之间的 IMU 必须留在队列里，
+        // 下一帧校正到来时才能把基准重新外推到校正时间戳；校正分支里会统一出队。
+    }
+
+    // 安全阀：正常 10Hz 校正会让队列在校正分支持续出队，体积有界；但如果定位
+    // 卡住（长时间没有新校正帧）而 IMU 还在进来，队列会无上限增长。此时把基准
+    // 重锚到最近一次传播输出并丢掉更早的 IMU——若之后有迟到校正帧，rewind 分支
+    // 会硬吸附恢复。
+    if (out_stamp > propagation_base_stamp
+        && imu_propagation->imu_queue_size() > static_cast<size_t>(high_rate_max_imu_queue)) {
+        logger::warn(
+            "node",
+            "high-rate IMU propagation queue exceeded {} samples, re-anchoring at t={:.6f}",
+            high_rate_max_imu_queue,
+            out_stamp);
+        propagation_base_T = out_T_world_imu;
+        propagation_base_v = out_v_world_imu;
+        propagation_base_stamp = out_stamp;
+
+        size_t num_stale = 0;
+        imu_propagation->integrate_imu(
+            propagation_base_stamp, propagation_base_stamp, bias, &num_stale);
+        if (num_stale > 0) {
+            imu_propagation->erase_imu_data(num_stale);
+        }
+    }
+
+    // 时间戳必须严格单调：IMU 时间戳偶发乱序/重复时直接跳过这一拍，tf2 会
+    // 继续使用上一帧 TF，而不是拿到乱序时间戳后做错误插值。
+    if (have_last_high_rate_stamp && !(out_stamp > last_high_rate_stamp)) {
+        return;
+    }
+    last_high_rate_stamp = out_stamp;
+    have_last_high_rate_stamp = true;
+
+    pub_propagated_odometry(
+        out_T_world_imu, out_v_world_imu, frame->T_lidar_imu,
+        rclcpp::Time(static_cast<int64_t>(out_stamp * 1e9)));
 }
 
 void SmallGlimNode::pub_cloud(

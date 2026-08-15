@@ -15,15 +15,21 @@ void Bin::addPoint(const pcl::PointXYZ& point) {
 
 void Bin::addPoint(const double& d, const double& z) {
   has_point_ = true;
+  // 快速路径：绝大多数点 z 不小于当前最小值，不进锁。只有更小的候选才需要
+  // 在临界区内重新比较并原子地同时更新 (z, d)。
   if (z < min_z) {
-    min_z = z;
-    min_z_range = d;
+    std::lock_guard<std::mutex> lock(update_mutex_);
+    if (z < min_z) {
+      min_z = z;
+      min_z_range = d;
+    }
   }
 }
 
 Bin::MinZPoint Bin::getMinZPoint() {
   MinZPoint point;
 
+  std::lock_guard<std::mutex> lock(update_mutex_);
   if (has_point_) {
     point.z = min_z;
     point.d = min_z_range;
@@ -33,6 +39,7 @@ Bin::MinZPoint Bin::getMinZPoint() {
 }
 
 void Bin::reset() {
+  std::lock_guard<std::mutex> lock(update_mutex_);
   has_point_ = false;
   min_z = std::numeric_limits<double>::max();
   min_z_range = 0.0;

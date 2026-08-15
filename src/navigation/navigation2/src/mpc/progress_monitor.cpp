@@ -51,7 +51,8 @@ void ProgressMonitor::update(const Eigen::Vector2d & pos, double commanded_speed
   no_progress_ = stagnant_time_ >= std::max(params_.no_progress_timeout, 0.0);
 
   // 卡住这一路只在「正在下发指令」时累计：没指令时车不动是正常的。
-  const bool commanding = commanded_speed > std::max(params_.cmd_epsilon, 0.0);
+  // 用绝对值判断：调用方若传入带符号速度（倒车），负数同样是有效指令。
+  const bool commanding = std::abs(commanded_speed) > std::max(params_.cmd_epsilon, 0.0);
   if (commanding) {
     commanded_stagnant_time_ += step_dt;
     stuck_ = commanded_stagnant_time_ >= std::max(params_.stuck_timeout, 0.0);

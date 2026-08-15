@@ -31,6 +31,20 @@ public:
     deadband_velocity_ = toArray(declare_parameter<std::vector<double>>(
       "deadband_velocity", std::vector<double>{0.0, 0.0, 0.0}), {0.0, 0.0, 0.0});
 
+    // std::clamp 要求 lo <= hi；min > max 的配置在 debug 构建触发断言，
+    // release 下也会把速度夹到错误值。非法时回退默认边界而不是带病运行。
+    for (std::size_t i = 0; i < 3; ++i) {
+      if (!(min_velocity_[i] <= max_velocity_[i])) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "Invalid velocity bounds at axis %zu: min=%.3f > max=%.3f; "
+          "falling back to default limits", i, min_velocity_[i], max_velocity_[i]);
+        min_velocity_ = {-2.0, -2.0, -3.0};
+        max_velocity_ = {2.0, 2.0, 3.0};
+        break;
+      }
+    }
+
     // 订阅输入速度，输出平滑速度。
     // mt 容器下订阅与定时器共享 last_cmd_time_/latest cmd，串行化。
     cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);

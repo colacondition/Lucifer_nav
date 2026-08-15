@@ -159,6 +159,7 @@ def generate_launch_description():
     # /livox/lidar/pointcloud（无逐点时间戳，small_glim 自动生成伪时间戳）。
     # 参数顺序有意义：后面的覆盖前面的。
     lio_node = Node(
+        respawn=True, respawn_delay=2.0,  # 与 real.launch 对齐：LIO 崩溃自愈
         package='small_glim',
         executable='small_glim_node',
         output='log',
@@ -187,6 +188,7 @@ def generate_launch_description():
 
     # ===== 3. 感知链 =====
     lidar_filter_node = Node(
+        respawn=True, respawn_delay=2.0,
         package='cpp_lidar_filter',
         executable='lidar_filter_node',
         name='lidar_filter',
@@ -202,6 +204,7 @@ def generate_launch_description():
         arguments=common_log_arguments)
 
     ground_seg_node = Node(
+        respawn=True, respawn_delay=2.0,
         package='linefit_ground_segmentation_ros',
         executable='ground_segmentation_node',
         name='ground_segmentation',
@@ -255,6 +258,7 @@ def generate_launch_description():
     # ===== 4. fast_location 主定位 =====
     fast_loc_node = Node(
         condition=LaunchConfigurationEquals('mode', 'nav'),
+        respawn=True, respawn_delay=2.0,  # 定位崩溃自愈（重载 PCD 重新初始化）
         package='fast_location',
         executable='robot_localization_node',
         name='robot_localization_node',
@@ -270,7 +274,8 @@ def generate_launch_description():
             'submap_voxel_size_first': 0.20,
             'submap_voxel_size_track': 0.35,
             'fov_far': 12.0,
-            'localization_rate_hz': 4.0,
+            # 与 fast_location_main.yaml 保持一致：10Hz 雷达每帧都做一次 ICP。
+            'localization_rate_hz': 10.0,
             'gicp_num_threads': 2,
             'map_publish_rate_hz': 0.2,
         }],
@@ -310,6 +315,7 @@ def generate_launch_description():
     # 让 MPC 的「等云台收下来再进洞」和 RViz 云台状态显示在仿真里都跑通。
     simulated_gimbal_node = Node(
         condition=nav_condition,
+        respawn=True, respawn_delay=2.0,
         package='simulated_gimbal',
         executable='simulated_gimbal_node',
         name='simulated_gimbal',
@@ -323,6 +329,7 @@ def generate_launch_description():
     # ===== 7. 速度转换 =====
     vel_transform_node = Node(
         condition=nav_condition,
+        respawn=True, respawn_delay=2.0,
         package='fake_vel_transform',
         executable='fake_vel_transform_node',
         name='fake_vel_transform',

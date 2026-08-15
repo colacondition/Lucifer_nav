@@ -25,6 +25,7 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<int>("gicp_max_iterations_track", 20);
     this->declare_parameter<bool>("enable_global_search", true);
     this->declare_parameter<float>("global_search_xy_step", 2.0);
+    this->declare_parameter<int>("global_search_max_candidates", 2000000);
     this->declare_parameter<float>("global_search_yaw_step_deg", 30.0);
     this->declare_parameter<float>("global_search_score_distance", 0.45);
     this->declare_parameter<int>("global_search_score_stride", 4);
@@ -114,6 +115,8 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     enable_global_search_ = this->get_parameter("enable_global_search").as_bool();
     global_search_config_.xy_step = std::max(
         0.1, this->get_parameter("global_search_xy_step").as_double());
+    global_search_config_.max_candidates = static_cast<std::size_t>(std::max<int64_t>(
+        1000, this->get_parameter("global_search_max_candidates").as_int()));
     const double global_search_yaw_step_deg = std::max(
         1.0, this->get_parameter("global_search_yaw_step_deg").as_double());
     global_search_config_.yaw_step = static_cast<float>(global_search_yaw_step_deg * M_PI / 180.0);
@@ -557,8 +560,12 @@ bool RobotLocalizationNode::performGlobalSearch()
                 this->get_logger(),
                 "Refine ICP uses %zu accumulated points (target %d frames).",
                 scan_for_refine->size(), global_search_refine_accumulate_);
-            // 精化扫描换了,清掉之前的下采样缓存。
-            scan_downsample_cache_.clear();
+            // 精化扫描换了,清掉之前的下采样缓存（与 runICP/SubScan 共享，
+            // 清空必须持锁）。
+            {
+                std::lock_guard<std::mutex> lock(data_mutex_);
+                scan_downsample_cache_.clear();
+            }
         }
     }
 
@@ -573,7 +580,10 @@ bool RobotLocalizationNode::performGlobalSearch()
             continue;
         }
 
-        map_downsample_cache_.clear();
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            map_downsample_cache_.clear();
+        }
         float fitness = 0.0f;
         const auto first = runICP(
             scan_for_refine, submap, candidate.pcd_from_odom,
@@ -692,8 +702,11 @@ bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess
         return false;
     }
 
-    // 子图每次都会变，先清掉地图下采样缓存。
-    map_downsample_cache_.clear();
+    // 子图每次都会变，先清掉地图下采样缓存（缓存与 runICP 共享，清空必须持锁）。
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        map_downsample_cache_.clear();
+    }
 
     float fitness;
     Eigen::Matrix4f T_final;
@@ -943,28 +956,33 @@ Eigen::Matrix4f RobotLocalizationNode::runICP(PointCloudXYZI::Ptr src, PointClou
 
     auto downsample_start = std::chrono::high_resolution_clock::now();
 
-    // 用缓存避免重复下采样。
+    // 用缓存避免重复下采样。缓存与 SubScan 回调（锁内 clear）共享，必须同样
+    // 在 data_mutex_ 内访问：旧实现 runICP 无锁读写，与 SubScan 并发 clear
+    // 同一 unordered_map 属于数据竞争，会破坏哈希表结构。
     int scale_key = static_cast<int>(voxel_scale * 10);  // 转为整数键
 
     PointCloudXYZI::Ptr src_filtered;
-    if (scan_downsample_cache_.find(scale_key) != scan_downsample_cache_.end()) {
-        src_filtered = scan_downsample_cache_[scale_key];
-    } else {
-        src_filtered = voxelDownSample(src, scan_voxel_size_ * voxel_scale);
-        scan_downsample_cache_[scale_key] = src_filtered;
-    }
-
-    // 地图点云按尺度决定是否再下采样。
     PointCloudXYZI::Ptr tgt_filtered;
-    if (voxel_scale > 1.0) {
-        if (map_downsample_cache_.find(scale_key) != map_downsample_cache_.end()) {
-            tgt_filtered = map_downsample_cache_[scale_key];
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        if (scan_downsample_cache_.find(scale_key) != scan_downsample_cache_.end()) {
+            src_filtered = scan_downsample_cache_[scale_key];
         } else {
-            tgt_filtered = voxelDownSample(tgt, map_voxel_size_ * voxel_scale);
-            map_downsample_cache_[scale_key] = tgt_filtered;
+            src_filtered = voxelDownSample(src, scan_voxel_size_ * voxel_scale);
+            scan_downsample_cache_[scale_key] = src_filtered;
         }
-    } else {
-        tgt_filtered = tgt;
+
+        // 地图点云按尺度决定是否再下采样。
+        if (voxel_scale > 1.0) {
+            if (map_downsample_cache_.find(scale_key) != map_downsample_cache_.end()) {
+                tgt_filtered = map_downsample_cache_[scale_key];
+            } else {
+                tgt_filtered = voxelDownSample(tgt, map_voxel_size_ * voxel_scale);
+                map_downsample_cache_[scale_key] = tgt_filtered;
+            }
+        } else {
+            tgt_filtered = tgt;
+        }
     }
 
     auto downsample_end = std::chrono::high_resolution_clock::now();

@@ -79,13 +79,17 @@ public:
     samples_.back() = total;
 
     // 步骤 1：曲率估计 + 侧向加速度限速。
+    // std::clamp 要求 lo <= hi。expected_speed 被配得比 min_speed 还小（或为负）时
+    // 旧实现直接触发 UB/断言；这里先把边界压成合法区间，再按“弯道限速优先”夹。
+    const double profile_max = std::max(0.0, max_speed);
+    const double profile_min = std::min(std::max(0.0, params_.min_speed), profile_max);
     const auto kappas = computeCurvatures(ref);
     for (int i = 0; i < n; ++i) {
       const double kappa = kappas[i];
       const double v_curve = (kappa > 1e-6)
         ? std::sqrt(std::max(params_.max_lateral_accel / kappa, 0.0))
-        : max_speed;
-      speeds_[i] = std::clamp(v_curve, params_.min_speed, max_speed);
+        : profile_max;
+      speeds_[i] = std::clamp(v_curve, profile_min, profile_max);
     }
 
     // 步骤 1.5：隧道限速窗口。洞内的样本按 TunnelSpec 的 [vmin, vmax] 夹：vmax 压
@@ -109,7 +113,7 @@ public:
           speeds_[i] = std::min(speeds_[i], vmax);
         }
         if (vmin > 1e-6) {
-          speeds_[i] = std::max(speeds_[i], std::min(vmin, max_speed));
+          speeds_[i] = std::max(speeds_[i], std::min(vmin, profile_max));
         }
       }
     }

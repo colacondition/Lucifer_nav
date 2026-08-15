@@ -248,7 +248,18 @@ visualization_msgs::msg::InteractiveMarker WaypointEditorTool::createWaypointMar
 
 void WaypointEditorTool::processFeedback(const std::shared_ptr<const visualization_msgs::msg::InteractiveMarkerFeedback> &fb)
 {
-    int id = std::stoi(fb->marker_name);
+    // marker_name 是我们自己编码的航点下标，但反馈是异步的：删除/重建 marker
+    // 后迟到的旧反馈可能携带已不存在的 id。std::stoi 与 waypoints_[id] 都必须
+    // 防护，否则越界写会拖崩整个 RViz 插件。
+    int id = -1;
+    try {
+        id = std::stoi(fb->marker_name);
+    } catch (const std::exception &) {
+        return;
+    }
+    if (id < 0 || id >= static_cast<int>(waypoints_.size())) {
+        return;
+    }
 
     switch (fb->event_type)
     {
@@ -283,7 +294,12 @@ void WaypointEditorTool::processMenuControl(const std::shared_ptr<const visualiz
 {
     if (fb->event_type != visualization_msgs::msg::InteractiveMarkerFeedback::MENU_SELECT) { return; }
 
-    int id = std::stoi(fb->marker_name);
+    int id = -1;
+    try {
+        id = std::stoi(fb->marker_name);
+    } catch (const std::exception &) {
+        return;
+    }
     if (id < 0 || id >= static_cast<int>(waypoints_.size())) { return; }
 
     switch (fb->menu_entry_id) {

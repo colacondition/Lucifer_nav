@@ -160,6 +160,28 @@ EstimationFrame::ConstPtr InitialStateEstimation::initial_pose() {
         return estimated;
     }
 
+    // Graph-based (non-naive) initialization: insert_frame() 已经用 iVox+GICP
+    // 配准出 T_odom_lidar 序列，这里把最后一帧配准结果转成初始 T_world_imu。
+    // 旧实现此分支恒返回 nullptr（naive_initialization: false 时 LIO 永远停在
+    // "waiting for initial IMU state estimation"）。平移仍锚到开机雷达平面，
+    // 与 naive 分支及下游 ground_segmentation / costmap 的 z=0 约定一致。
+    if (!T_odom_lidar.empty()) {
+        const auto & [last_stamp, T_odom_lidar_last] = T_odom_lidar.back();
+        Eigen::Isometry3d init_T_world_imu = T_odom_lidar_last * T_lidar_imu;
+        init_T_world_imu.translation() =
+            -(init_T_world_imu.linear() * T_lidar_imu.inverse().translation());
+
+        EstimationFrame::Ptr estimated = std::make_shared<EstimationFrame>();
+        estimated->id = static_cast<size_t>(-1);
+        estimated->stamp = last_stamp;
+        estimated->T_lidar_imu = T_lidar_imu;
+        estimated->v_world_imu = Eigen::Vector3d::Zero();
+        estimated->imu_bias = imu_bias;
+        estimated->T_world_imu = init_T_world_imu;
+        estimated->T_world_lidar = init_T_world_imu * T_lidar_imu.inverse();
+        return estimated;
+    }
+
     return nullptr;
 }
 

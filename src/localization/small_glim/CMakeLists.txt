@@ -1,8 +1,21 @@
 cmake_minimum_required(VERSION 3.10)
+
+# 该包使用 C++23 <format>，需要 gcc-13 系列；显式传入 CMAKE_CXX_COMPILER 时尊重
+# 调用者的工具链（此时请自行保证编译器支持 <format>）。
+if(NOT CMAKE_CXX_COMPILER)
+  find_program(SMALL_GLIM_GXX13_EXECUTABLE NAMES g++-13)
+  if(SMALL_GLIM_GXX13_EXECUTABLE)
+    set(CMAKE_C_COMPILER gcc-13 CACHE FILEPATH "C compiler" FORCE)
+    set(CMAKE_CXX_COMPILER g++-13 CACHE FILEPATH "C++ compiler" FORCE)
+  else()
+    message(FATAL_ERROR
+      "small_glim requires g++-13 (C++23 <format>). Install g++-13 or pass "
+      "-DCMAKE_CXX_COMPILER=<compiler with <format> support>.")
+  endif()
+endif()
+
 project(small_glim)
 
-set(CMAKE_C_COMPILER "gcc-13")
-set(CMAKE_CXX_COMPILER "g++-13")
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

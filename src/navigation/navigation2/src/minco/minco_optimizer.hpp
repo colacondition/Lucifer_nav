@@ -2,6 +2,7 @@
 #define NAVIGATION2__MINCO_OPTIMIZER_HPP_
 
 #include <Eigen/Core>
+#include <functional>
 #include <memory>
 #include <vector>
 #include "minco.hpp"

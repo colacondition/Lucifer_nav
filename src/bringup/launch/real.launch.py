@@ -281,7 +281,9 @@ def generate_launch_description():
             'submap_voxel_size_first': 0.20,
             'submap_voxel_size_track': 0.35,
             'fov_far': 12.0,
-            'localization_rate_hz': 4.0,
+            # 与 fast_location_main.yaml 保持一致：10Hz 雷达每帧都做一次 ICP。
+            # 实车若单帧 GICP 超 100ms，改回 5.0 并降低 gicp 迭代/堆叠帧数。
+            'localization_rate_hz': 10.0,
             'gicp_num_threads': 2,
             # 全局地图只给 RViz 看，实车压到 0.2Hz 省带宽。
             'map_publish_rate_hz': 0.2,

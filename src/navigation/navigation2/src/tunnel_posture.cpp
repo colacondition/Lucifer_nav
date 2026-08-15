@@ -62,10 +62,32 @@ bool pathCrossesTunnel(
   if (!map.valid() || map.tunnels().empty()) {
     return false;
   }
-  for (const auto & p : points) {
+
+  const auto cellIsTunnel = [&map](const Eigen::Vector2d & p) {
     const auto cell = map.geometry().containingCell(p);
-    if (cell && map.isTunnelBodyCell(cell->x(), cell->y())) {
+    return cell && map.isTunnelBodyCell(cell->x(), cell->y());
+  };
+
+  // 只检查顶点会在路径稀疏时漏判：线段可能跨过隧道本体而两端顶点都在洞外。
+  // 这里按地图分辨率步进采样相邻顶点之间的线段，保证比隧道宽度更细。
+  const double step = std::max(map.geometry().resolution, 1e-3);
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    if (cellIsTunnel(points[i])) {
       return true;
+    }
+    if (i + 1 >= points.size()) {
+      break;
+    }
+    const Eigen::Vector2d delta = points[i + 1] - points[i];
+    const double length = delta.norm();
+    if (!std::isfinite(length) || length <= step) {
+      continue;
+    }
+    const int samples = static_cast<int>(std::floor(length / step));
+    for (int s = 1; s < samples; ++s) {
+      if (cellIsTunnel(points[i] + delta * (static_cast<double>(s) / samples))) {
+        return true;
+      }
     }
   }
   return false;

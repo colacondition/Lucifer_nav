@@ -67,12 +67,37 @@ void FakeVelTransform::localPoseCallback(const nav_msgs::msg::Path::ConstSharedP
 
   // Update current angle based on the difference between path yaw and base_link yaw.
   double path_yaw = tf2::getYaw(selected_pose.orientation);
-  if (!std::isfinite(path_yaw) || !std::isfinite(base_link_angle_)) {
+  if (!std::isfinite(path_yaw)) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "Received non-finite heading while updating base_link_fake orientation, skip.");
+      "Received non-finite path heading, skip base_link_fake orientation update.");
     return;
   }
+
+  // base_link_angle_ 只在 cmdVelCallback 里更新；/local_plan 先于第一条 /cmd_vel
+  // 到达（或 TF 刚恢复）时它还是 0，直接相减会把真实航向当成 0，底盘朝错误方向
+  // 运动。这里与 cmdVelCallback 走同一条 TF 查询路径更新它。
+  try {
+    const std::string planner_frame =
+      target_frame_.empty() ? DEFAULT_PLANNER_FRAME : target_frame_;
+    const auto transform_stamped = tf2_buffer_->lookupTransform(
+      planner_frame, "base_link", tf2::TimePointZero);
+    base_link_angle_ = tf2::getYaw(transform_stamped.transform.rotation);
+  } catch (tf2::TransformException & ex) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Cannot look up %s -> base_link for path heading, skip update: %s",
+      (target_frame_.empty() ? DEFAULT_PLANNER_FRAME : target_frame_).c_str(), ex.what());
+    return;
+  }
+
+  if (!std::isfinite(base_link_angle_)) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Lookup returned a non-finite base_link yaw, skip base_link_fake orientation update.");
+    return;
+  }
+
   current_angle_ = path_yaw - base_link_angle_;
   if (!std::isfinite(current_angle_)) {
     RCLCPP_WARN_THROTTLE(

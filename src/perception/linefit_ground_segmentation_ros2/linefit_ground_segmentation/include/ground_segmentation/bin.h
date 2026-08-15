@@ -2,6 +2,7 @@
 #define GROUND_SEGMENTATION_BIN_H_
 
 #include <atomic>
+#include <mutex>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -22,6 +23,9 @@ private:
   std::atomic<bool> has_point_;
   std::atomic<double> min_z;
   std::atomic<double> min_z_range;
+  // 保护「比较 z 并同时更新 (z, d)」的临界区：两个 double 分两次原子写会让
+  // 并发 addPoint 交错，使最小高度点与其距离来自不同点（地面线拟合用错点）。
+  mutable std::mutex update_mutex_;
 
 public:
 

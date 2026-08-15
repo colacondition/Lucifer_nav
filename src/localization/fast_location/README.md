@@ -28,7 +28,7 @@ small_glim 输出的纯 xyz PCD。
 
 ## 工作流程
 
-`locationThread` 以 `localization_rate_hz`（实车 4Hz）定时触发：
+`locationThread` 以 `localization_rate_hz`（当前实车/仿真 10Hz）定时触发：
 
 1. **初始定位**（未 `initialized`）：`enable_global_search=true` 时走
    `performGlobalSearch()` 自动重定位，否则用 `globalLocalization(initial_pcd_to_odom)`
@@ -102,9 +102,9 @@ small_glim 输出的纯 xyz PCD。
 
 | 参数 | 默认 | 说明 |
 | :- | :- | :- |
-| `localization_rate_hz` | 5.0（实车/仿真 4.0） | GICP 触发上限 |
-| `tf_publish_rate_hz` | 200.0 | map→odom TF 发布率 |
-| `map_publish_rate_hz` | 5.0（实车 0.2） | 全局图发布率 |
+| `localization_rate_hz` | 10.0（实车/仿真同） | GICP 触发上限 |
+| `tf_publish_rate_hz` | 50.0 | map→odom TF 发布率 |
+| `map_publish_rate_hz` | 5.0（实车/仿真 0.2） | 全局图发布率 |
 
 **GICP**
 

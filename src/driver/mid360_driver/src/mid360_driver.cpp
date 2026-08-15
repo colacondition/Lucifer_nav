@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cmath>
+#include <cstring>
 #include <mutex>
 #include <numbers>
 #include <rclcpp/rclcpp.hpp>
@@ -238,7 +239,8 @@ namespace mid360_driver {
                 continue;
             }
 
-            const auto &header = *reinterpret_cast<const DataHeader *>(buffer);
+            DataHeader header{};
+            std::memcpy(&header, buffer, sizeof(DataHeader));
             const std::size_t raw_point_size = point_size(header.data_type);
             if (raw_point_size == 0 || header.dot_num == 0) [[unlikely]] {
                 log_packet_drop("lidar: invalid data_type or dot_num", robustness_config.min_drop_log_interval);
@@ -251,7 +253,8 @@ namespace mid360_driver {
                 continue;
             }
             {
-                auto [iter, inserted] = last_udp_cnt_map.try_emplace(sender_endpoint.address(), header.udp_cnt);
+                const uint16_t udp_cnt = header.udp_cnt;
+                auto [iter, inserted] = last_udp_cnt_map.try_emplace(sender_endpoint.address(), udp_cnt);
                 if (!inserted) {
                     int32_t diff = static_cast<int32_t>(header.udp_cnt) - static_cast<int32_t>(iter->second);
                     if (diff < 0) {
@@ -302,9 +305,12 @@ namespace mid360_driver {
             points.clear();
             points.reserve(header.dot_num);
             if (header.data_type == LIVOX_LIDAR_CARTESIAN_COORDINATE_HIGH_DATA) {
-                const auto *raw_points = reinterpret_cast<const CartesianHighPoint *>(buffer + sizeof(DataHeader));
+                const std::uint8_t * raw_points = buffer + sizeof(DataHeader);
                 for (std::size_t i = 0; i < header.dot_num; ++i) {
-                    const auto &raw_point = raw_points[i];
+                    CartesianHighPoint raw_point{};
+                    std::memcpy(
+                        &raw_point, raw_points + i * sizeof(CartesianHighPoint),
+                        sizeof(CartesianHighPoint));
                     if (!is_point_valid(raw_point.tag)) {
                         continue;
                     }
@@ -319,9 +325,12 @@ namespace mid360_driver {
                     }
                 }
             } else if (header.data_type == LIVOX_LIDAR_CARTESIAN_COORDINATE_LOW_DATA) {
-                const auto *raw_points = reinterpret_cast<const CartesianLowPoint *>(buffer + sizeof(DataHeader));
+                const std::uint8_t * raw_points = buffer + sizeof(DataHeader);
                 for (std::size_t i = 0; i < header.dot_num; ++i) {
-                    const auto &raw_point = raw_points[i];
+                    CartesianLowPoint raw_point{};
+                    std::memcpy(
+                        &raw_point, raw_points + i * sizeof(CartesianLowPoint),
+                        sizeof(CartesianLowPoint));
                     if (!is_point_valid(raw_point.tag)) {
                         continue;
                     }
@@ -362,7 +371,8 @@ namespace mid360_driver {
                 log_packet_drop("imu: packet smaller than IMU payload", robustness_config.min_drop_log_interval);
                 continue;
             }
-            const auto &header = *reinterpret_cast<const DataHeader *>(buffer);
+            DataHeader header{};
+            std::memcpy(&header, buffer, sizeof(DataHeader));
             if (header.data_type != LIVOX_LIDAR_IMU_DATA) [[unlikely]] {
                 log_packet_drop("imu: invalid data_type", robustness_config.min_drop_log_interval);
                 continue;
@@ -393,7 +403,8 @@ namespace mid360_driver {
                 log_packet_drop("imu: implausible timestamp", robustness_config.min_drop_log_interval);
                 continue;
             }
-            const auto &raw_imu = *reinterpret_cast<const Imu *>(buffer + sizeof(DataHeader));
+            Imu raw_imu{};
+            std::memcpy(&raw_imu, buffer + sizeof(DataHeader), sizeof(Imu));
             ImuMsg imu_msg;
             imu_msg.timestamp = header_timestamp;
             imu_msg.angular_velocity_x = raw_imu.angular_velocity_x;

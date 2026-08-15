@@ -32,6 +32,7 @@
 #include <cfloat>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <utility>
 #include <vector>
 template<int D, int Freedom>
@@ -84,7 +85,21 @@ public:
         double vx = v(0);
         double vy = v(1);
         if (std::hypot(vx, vy) < 1e-6) {
-            return getYaw(0.0);
+            // 零速点不能按速度方向取 yaw，也不能递归回 getYaw(0.0)：MINCO 边界
+            // 速度通常被设为零，t=0 处速度仍为零会无限递归直到栈溢出。这里改用
+            // 相邻位置差分估计朝向；完全静止的退化轨迹返回 0。
+            const double eps = std::min(1e-3, getDuration() * 0.5);
+            Eigen::VectorXd p0 = getPos(t);
+            Eigen::VectorXd p1 = getPos(std::min(t + eps, getDuration()));
+            if (p0.size() < 2 || p1.size() < 2) {
+                return 0.0;
+            }
+            const double dx = p1(0) - p0(0);
+            const double dy = p1(1) - p0(1);
+            if (std::hypot(dx, dy) < 1e-9) {
+                return 0.0;
+            }
+            return std::atan2(dy, dx);
         }
         return std::atan2(vy, vx);
     }

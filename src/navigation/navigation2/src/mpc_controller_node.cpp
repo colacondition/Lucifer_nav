@@ -338,6 +338,16 @@ public:
     mp.Q = declare_parameter<std::vector<double>>("Q", std::vector<double>{15.0, 15.0});
     mp.R = declare_parameter<std::vector<double>>("R", std::vector<double>{0.1, 0.1});
     mp.Rd = declare_parameter<std::vector<double>>("Rd", std::vector<double>{1.0, 0.05});
+    // 参数非法时回退到安全默认值而不是把节点带崩：负 steps 会在 configure()
+    // 里转成巨大 resize，过短的 Q/R/Rd 会越界。configure() 本身也保留同样的
+    // 库级校验作为第二道防线。
+    if (!mpc::paramsAreValid(mp)) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "Invalid MPC parameters (predict_steps/predict_dt/Q/R/Rd); "
+        "falling back to defaults");
+      mp = mpc::MpcParams{};
+    }
     steps_ = mp.steps;
     predict_dt_ = mp.dt;
     solver_.configure(mp);
@@ -964,11 +974,20 @@ private:
     const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap, const Eigen::Vector2d & pos,
     double yaw)
   {
+    // 没有代价图时无法评估倒车路径是否安全。旧逻辑里 hazardous 取 true（按最坏
+    // 情况处理），但 reversePathClear 被 `costmap &&` 短路跳过，最危险的“无图”
+    // 场景反而会继续下发倒车速度。这里统一为：无图绝不盲倒车，立即停止并判失败，
+    // 由重规划在代价图恢复后重新决策。
+    if (!costmap) {
+      publishStop();
+      failRecovery("no costmap during reverse");
+      return;
+    }
+
     reverse_travelled_ += (pos - reverse_last_pos_).norm();
     reverse_last_pos_ = pos;
 
-    const bool hazardous =
-      costmap ? mpc::isHazardous(*costmap, pos, hazard_policy_) : true;
+    const bool hazardous = mpc::isHazardous(*costmap, pos, hazard_policy_);
 
     if (reverse_travelled_ >= recovery_reverse_distance_) {
       if (!hazardous) {
@@ -980,7 +999,7 @@ private:
       return;
     }
 
-    if (costmap && !reversePathClear(*costmap, pos)) {
+    if (!reversePathClear(*costmap, pos)) {
       publishStop();
       enterRecovery(NavState::HazardRecovery, pos, "reverse path blocked by lethal obstacle");
       return;

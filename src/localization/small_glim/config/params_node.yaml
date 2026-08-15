@@ -4,6 +4,23 @@
       debug: false # if true, the node will print debug information
       enable_mapping: true # if true, mapping runs from startup and the final map is saved on exit (Ctrl-C)
       enable_tf_publish: false # if true, the node will publish tf (odometry_frame_id <- base_frame_id)
+      # 高频里程计补帧：在 10Hz 雷达帧之间用最新 bias + IMU 前向传播发布 odom/TF。
+      # 0 = 关闭（TF/odom/点云全部回到 10Hz 雷达校正节拍）。当前用 100.0；
+      # 若控制端对高频噪声敏感，可退回 50.0。
+      high_rate_odom_hz: 100.0
+      # 10Hz 校正帧跳变的平滑时间常数（秒）。新校正帧会先把旧基准用 IMU 外推到
+      # 同一时间戳，再与校正值做指数平滑，只吸收校正残差、不抹掉帧间运动。
+      # 0 = 不平滑，校正残差完全吸收。
+      high_rate_smoothing_tau: 0.1
+      # z 轴单独的校正平滑时间常数（秒）。地面机器人高度只该缓慢变化，而运动/旋转时
+      # LIO 高度校正常有 cm 级抖动；用更慢的 tau 避免高频 TF 反复“下沉又弹回地面”。
+      # 0 = 不平滑。
+      high_rate_smoothing_tau_z: 1.0
+      # 纯 IMU 外推的最大时间窗口（秒）。估计处理延迟很大时限制外推长度，抑制漂移。
+      high_rate_max_window: 0.2
+      # 传播 IMU 队列安全上限（样本数）。定位长时间不出新校正帧时，超过上限会
+      # 把基准重锚到最近一次传播输出，防止队列无界增长。
+      high_rate_max_imu_queue: 2000
       imu_time_offset: 0.0 # time offset to be added to the imu timestamps (in seconds)
       lidar_time_offset: 0.0 # time offset to be added to the lidar timestamps (in seconds)
       acc_scale: 1.0 # scale factor for the accelerometer measurements

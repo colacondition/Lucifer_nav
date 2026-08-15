@@ -191,6 +191,9 @@ public:
   // 上。底盘换结构、base_link 原点抬到轮轴上时才需要填。
   double base_to_ground_z_{0.0};
   bool sensor_height_resolved_{false};
+  // TF 查询连续失败计数：失败几次后锁定参数兜底值，避免每个点云回调都空等
+  // 0.2s 超时，把分割节拍拖垮。
+  int sensor_height_tf_failures_{0};
   std::thread watchdog_thread_;
 
 private:
@@ -318,8 +321,19 @@ void SegmentationNode::resolveSensorHeight(const std::string &cloud_frame) {
                          "configured fallback %.3f: %s",
                          sensor_height_frame_.c_str(), cloud_frame.c_str(),
                          params_.sensor_height, ex.what());
+    // TF 长期缺失时不能在每个点云回调里都空等 0.2s：5 次失败后锁定兜底值，
+    // 等外部重新发布外参后需重启节点才会再次尝试解析。
+    if (++sensor_height_tf_failures_ >= 5) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "sensor_height TF lookup failed %d times in a row; "
+                   "locking to configured fallback %.3f to keep the segmentation "
+                   "cadence. Restart the node after fixing the TF tree.",
+                   sensor_height_tf_failures_, params_.sensor_height);
+      sensor_height_resolved_ = true;
+    }
     return;
   }
+  sensor_height_tf_failures_ = 0;
 
   const double mount_z = tf_stamped.transform.translation.z;
   const double resolved = mount_z + base_to_ground_z_;

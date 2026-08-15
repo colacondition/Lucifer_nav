@@ -321,7 +321,11 @@ EstimationFrame::ConstPtr OdometryEstimationCPU::insert_frame(
 
     // Overwrite the predicted state with the last states if no IMU data is available
     if (num_imu_integrated < 2 && last > 1) {
-        const Eigen::Isometry3d T_delta = frames[last - 1]->T_lidar_imu.inverse() * frames[last]->T_lidar_imu;
+        // 帧间运动增量必须来自相邻帧的“世界系位姿差”，而不是 T_lidar_imu 外参：
+        // 外参是常量，旧写法 T_delta 恒为单位阵，预测直接退化为上一帧位姿，
+        // 等于没有任何运动补偿。这里用 lidar 世界位姿的增量近似 IMU 增量外推。
+        const Eigen::Isometry3d T_delta =
+            frames[last - 1]->T_world_lidar.inverse() * frames[last]->T_world_lidar;
         predicted_T_world_imu = gtsam::Pose3((frames[last]->T_world_imu * T_delta).matrix());
         predicted_v_world_imu = frames[last]->v_world_imu;
     }

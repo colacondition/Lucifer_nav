@@ -222,8 +222,26 @@ struct MincoOptimizer::Impl
       return {};
     }
 
-    waypoints_ = waypoints;
     piece_num_ = waypoints.size() - 1;
+    if (segment_times.size() != piece_num_) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("minco_optimizer"),
+        "segment_times size mismatch: expected %zu, got %zu",
+        piece_num_, segment_times.size());
+      return {};
+    }
+    for (const double t : segment_times) {
+      // 零/负/非有限段长时间会让 MINCO 的幂次矩阵与无主元带状 LU 产生
+      // 除零或 NaN 轨迹，必须在这里拦掉而不是让 NaN 一路流到 MPC。
+      if (!std::isfinite(t) || t <= 0.0) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("minco_optimizer"),
+          "segment time must be finite and positive, got %.6f", t);
+        return {};
+      }
+    }
+
+    waypoints_ = waypoints;
 
     const auto w_smooth = params_.smooth_weight;
 
@@ -268,6 +286,15 @@ struct MincoOptimizer::Impl
         nullptr,
         this,
         lbfgs_params_);
+
+      // 优化失败时返回空轨迹，让节点的“发布原始路径”回退真正生效。
+      // 旧实现失败仍把可能已经发散的 x_opt 写回轨迹，NaN 路径会一路流到 MPC。
+      if (!(ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH)) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("minco_optimizer"),
+          "MINCO optimization failed: %s", lbfgs::lbfgs_strerror(ret));
+        return {};
+      }
     }
 
     Eigen::Matrix2Xd in_ps(2, ctrl_num);
@@ -291,12 +318,6 @@ struct MincoOptimizer::Impl
 
     std::vector<Piece<5, 2>> final_traj;
     minco_.getPieces(final_traj);
-
-    if (!(ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH)) {
-      RCLCPP_ERROR(
-        rclcpp::get_logger("minco_optimizer"),
-        "MINCO optimization failed: %s", lbfgs::lbfgs_strerror(ret));
-    }
 
     return final_traj;
   }

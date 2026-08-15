@@ -30,9 +30,15 @@
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>
 
+  <!-- launch 与 tools 的运行期 Python 依赖。旧实现只把 numpy 列为 test_depend，
+       rosdep install 会漏装 yaml/msgpack/PIL，换机后 ros2 launch 直接 import 失败。 -->
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-msgpack</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pil</exec_depend>
+
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>
-  <test_depend>python3-numpy</test_depend>
 
   <!-- 故意不声明 decision：decision 已经 exec_depend 了 bringup（它的路点 CSV
        存在 bringup/config/waypoints 下），反向再声明会形成 colcon 无法拓扑排序

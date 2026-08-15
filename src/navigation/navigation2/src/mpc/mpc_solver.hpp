@@ -7,6 +7,8 @@
 // 这里仅做轨迹跟踪 QP；避障由全局规划器和局部安全检查负责。
 #pragma once
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -27,6 +29,16 @@ struct MpcParams
   std::vector<double> Rd{1.0, 0.05};   // 控制平滑权重（dvx, dvy）
 };
 
+// 参数合法性检查。MPC 的稀疏结构与工作区尺寸都由这些值决定，非法值会在
+// configure() 里变成负尺寸 resize / 数组越界（一条 ros2 param set 即可击穿
+// 控制节点），所以这里作为库级入口统一拒绝。
+inline bool paramsAreValid(const MpcParams & p)
+{
+  return p.steps > 0 && p.dt > 0.0 && std::isfinite(p.dt) &&
+         p.max_speed >= 0.0 && p.max_accel >= 0.0 && p.turtle_max_speed >= 0.0 &&
+         p.Q.size() >= 2 && p.R.size() >= 2 && p.Rd.size() >= 2;
+}
+
 class MpcSolver
 {
 public:
@@ -37,6 +49,12 @@ public:
   // 在这里一次性建好；solve() 热路径只更新线性项与边界。
   void configure(const MpcParams & p)
   {
+    if (!paramsAreValid(p)) {
+      throw std::invalid_argument(
+        "MpcSolver::configure: invalid parameters "
+        "(require steps>0, dt>0, max_speed/max_accel/turtle_max_speed>=0, "
+        "|Q|,|R|,|Rd| >= 2)");
+    }
     params_ = p;
     cleanup();
     setup_done_ = false;

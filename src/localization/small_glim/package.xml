@@ -7,7 +7,7 @@
   <maintainer email="mitsuha.2213@gmail.com">@Polyacetone</maintainer>
   <license>MIT</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
 
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
@@ -18,6 +18,12 @@
   <depend>visualization_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
+
+  <!-- CMake 实际 find_package 的构建依赖。GTSAM / gtsam_points 在 ROS 2 Humble
+       没有标准 rosdep key，由用户按 README 从源码安装，故不在这里声明（否则
+       rosdep install 会直接报 unknown key）。 -->
+  <depend>eigen</depend>
+  <depend>libpcl-all-dev</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

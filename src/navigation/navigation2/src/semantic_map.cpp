@@ -480,6 +480,38 @@ SemanticMap SemanticMap::fromChannels(
     require("tunnel_ids", tunnel_ids.size());
   }
 
+  // 消息入口的自洽性校验。注意：这里收到的是 rm_map_server 发布的“膨胀后”
+  // 地图，方向场会合法地传播到隧道四周的 flat 格（给 MINCO 用），因此不能像
+  // 文件入口 loadSemanticMap 那样要求“非方向标签必须不带方向”——那条只对标注
+  // 原始数据成立。旧实现曾在这里加过该检查，结果真实地图整帧被拒，隧道影响区
+  // 空表、顶板点云把洞口重新封死。
+  std::size_t tunnel_cells = 0;
+  for (std::size_t index = 0; index < cell_count; ++index) {
+    const std::uint8_t label = terrain[index];
+    if (label >= kTerrainLabelCount) {
+      throw std::runtime_error(
+        "semantic map message has an out-of-range terrain label " + std::to_string(label));
+    }
+    if (!isDirectionalLabel(label)) {
+      continue;
+    }
+    ++tunnel_cells;
+    if (!tunnel_ids.empty()) {
+      const std::uint8_t id = tunnel_ids[index];
+      if (id == 0 || static_cast<std::size_t>(id) > tunnels.size()) {
+        throw std::runtime_error(
+          "semantic map tunnel cell " + std::to_string(index) + " references tunnel id " +
+          std::to_string(id) + " but only " + std::to_string(tunnels.size()) +
+          " tunnels are declared");
+      }
+    }
+  }
+  if (tunnel_cells > 0 && tunnels.empty()) {
+    throw std::runtime_error(
+      "semantic map message has tunnel cells but declares no tunnel specs; "
+      "clear_height is required to decide whether the chassis fits");
+  }
+
   SemanticMap map;
   map.geometry_ = geometry;
   map.terrain_ = std::move(terrain);

@@ -29,6 +29,9 @@ struct GlobalSearchConfig
 {
   float xy_step{2.0f};
   float yaw_step{0.5235988f};
+  // 候选数量硬上限：地图有飞点/边界异常时，xy 网格 × yaw 网格会让候选爆炸，
+  // 一次全局重定位就可能 OOM 或阻塞数分钟。超限时自动倍增 xy_step 降采样。
+  std::size_t max_candidates{2000000};
   float score_distance{0.45f};
   std::size_t score_stride{4};
   std::size_t top_k{6};

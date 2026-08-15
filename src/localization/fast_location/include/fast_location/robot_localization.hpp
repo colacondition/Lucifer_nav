@@ -50,7 +50,10 @@ private:
     Eigen::Matrix4f initial_pcd_to_odom_{Eigen::Matrix4f::Identity()};
     // 默认使用代码内置零位姿作为初始位姿
     std::atomic<bool> initial_pose_received_{true};
-    bool initialized_{false};  // 系统是否已初始化
+    // 这三个标志在订阅回调（SubScan/subInitPose）与定位定时器回调
+    // （locationThread/globalLocalization）之间跨线程共享，必须用 atomic 消除
+    // 数据竞争（旧实现是普通 bool，MultiThreadedExecutor(2) 下属 UB）。
+    std::atomic<bool> initialized_{false};  // 系统是否已初始化
 
     Eigen::Matrix4f poseToMat(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
     Eigen::Matrix4f inverseSE3(const Eigen::Matrix4f &T);
@@ -182,7 +185,7 @@ private:
     fast_location::TrackingRecovery tracking_recovery_{5};
 
     // 一致性校验暂存的待接受结果。仅在 enable_temporal_verification_ 为真时使用。
-    bool pending_global_result_valid_ = false;
+    std::atomic<bool> pending_global_result_valid_{false};
     Eigen::Matrix4f pending_global_result_ = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f pending_global_guess_ = Eigen::Matrix4f::Identity();
     float pending_global_fitness_ = 0.0f;
@@ -195,7 +198,7 @@ private:
     std::string pc_in_map_frame_;  // pc_in_map 对外统一使用 map_frame
     double map_z_offset_{0.0};  // Z 轴偏移补偿（仿真地面厚度，实车为 0）
     Eigen::Matrix4f map_from_pcd_{Eigen::Matrix4f::Identity()};
-    bool first_localization_ = true;  // 是否为首次定位（首次用多尺度）
+    std::atomic<bool> first_localization_{true};  // 是否为首次定位（首次用多尺度）
     bool tf_ready_ = false;
     std::atomic<bool> has_new_scan_{false};
     std::atomic<bool> odom_received_{false};

@@ -110,6 +110,21 @@ public:
     void erase_imu_data(size_t last);
 
     /**
+    * @brief Number of IMU samples currently retained in the queue
+    */
+    size_t imu_queue_size() const;
+
+    /**
+    * @brief Suppress per-tick gap warnings.
+    * @param suppress  true to silence "invalid dt" warnings
+    *
+    * 高频补帧传播器每个 tick 都从“过去的估计帧时间”重新积分，首段 gap 超过
+    * max_integration_dt 是正常现象（锚点会推进，后续帧照常积分），不值得每
+    * 10~30ms 刷一条 WARN。主里程计线程保持默认告警。
+    */
+    void set_suppress_gap_warnings(bool suppress) { suppress_gap_warnings_ = suppress; }
+
+    /**
     * @brief Preintegrated measurements
     */
     const gtsam::PreintegratedImuMeasurements& integrated_measurements() const;
@@ -118,6 +133,7 @@ private:
     std::shared_ptr<gtsam::PreintegratedImuMeasurements> imu_measurements;
     std::deque<Eigen::Matrix<double, 7, 1>> imu_queue;
     std::unique_ptr<IMUIntegrationParams> params;
+    bool suppress_gap_warnings_{false};
 };
 
 }

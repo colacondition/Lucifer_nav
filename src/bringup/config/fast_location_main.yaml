@@ -41,7 +41,7 @@
     #
     # EMA 平滑系数 α：每次接受新结果时 T_smooth = α*T_new + (1-α)*T_prev。
     # 值越低正常拍越稳（更少吸收 ICP 单拍噪声），但真实漂移的收敛也越慢。
-    ema_alpha: 0.3
+    ema_alpha: 0.25
     # 出洞/粗→细校正拍的临时 EMA 系数：接近 1 时一拍吸收绝大部分修正（避免数秒
     # 爬行），又保留少量平滑防止单拍噪声完全外露成抖动。
     recovery_alpha: 0.95
@@ -68,7 +68,7 @@
     # ========== 频率与队列 ==========
     io_queue_size: 10            # 发布/订阅队列长度
     map_publish_rate_hz: 5.0     # 全局地图发布频率（Hz）
-    localization_rate_hz: 5.0   # 定位更新频率（Hz）
+    localization_rate_hz: 10.0   # 定位更新频率（Hz）
     tf_publish_rate_hz: 50.0    # map->odom TF 发布频率（tf2 自行插值，50Hz 足够）
     publish_tf: true             # 主定位模式：发布 map->odom TF
     publish_map_to_odometry: false  # 是否发布 map_to_odometry 里程计话题
@@ -93,6 +93,7 @@
     # 可能收不回来。要恢复「被抱走后全场重定位」，再把这个开关打开。
     enable_global_search: false
     global_search_xy_step: 2.0
+    global_search_max_candidates: 2000000  # 候选硬上限：飞点/大图时自动加大步长防止 OOM
     global_search_yaw_step_deg: 30.0
     global_search_score_distance: 0.45
     global_search_score_stride: 4

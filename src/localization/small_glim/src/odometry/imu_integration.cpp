@@ -254,10 +254,18 @@ size_t IMUIntegration::integrate_imu(
 
         const double dt = imu_stamp - last_stamp;
         if (dt <= 0.0) {
+            // 乱序/重复帧：丢弃，但锚点不动。
             continue;
         }
         if (!std::isfinite(dt) || dt > params->max_integration_dt) {
-            logger::warn("imu_integration", "skip IMU integration with invalid dt={:.6f}", dt);
+            // 时间跳变超过单步上限：不积分这段 gap，但必须把锚点推进到当前帧。
+            // 旧实现跳过时不动 last_stamp，后续每一帧的 dt 都在 gap 上累加，
+            // 全部被判 invalid —— 表现为 0.109/0.114/... 递增刷屏且这段数据
+            // 完全没参与积分。
+            if (!suppress_gap_warnings_) {
+                logger::warn("imu_integration", "skip IMU integration with invalid dt={:.6f}", dt);
+            }
+            last_stamp = imu_stamp;
             continue;
         }
 
@@ -339,10 +347,16 @@ size_t IMUIntegration::integrate_imu(
 
         const double dt = imu_stamp - last_stamp;
         if (dt <= 0.0) {
+            // 乱序/重复帧：丢弃，但锚点不动。
             continue;
         }
         if (!std::isfinite(dt) || dt > params->max_integration_dt) {
-            logger::warn("imu_integration", "skip IMU pose prediction with invalid dt={:.6f}", dt);
+            // 时间跳变超过单步上限：不积分这段 gap，但锚点必须推进到当前帧，
+            // 否则后续帧的 dt 会在 gap 上累加、全部被判 invalid。
+            if (!suppress_gap_warnings_) {
+                logger::warn("imu_integration", "skip IMU pose prediction with invalid dt={:.6f}", dt);
+            }
+            last_stamp = imu_stamp;
             continue;
         }
 
@@ -395,6 +409,10 @@ size_t IMUIntegration::integrate_imu(
 
 void IMUIntegration::erase_imu_data(size_t last) {
     imu_queue.erase(imu_queue.begin(), imu_queue.begin() + static_cast<int64_t>(last));
+}
+
+size_t IMUIntegration::imu_queue_size() const {
+    return imu_queue.size();
 }
 
 const gtsam::PreintegratedImuMeasurements& IMUIntegration::integrated_measurements() const {
