@@ -17,8 +17,8 @@ TEST(DecisionConfig, LoadsDefaults)
   EXPECT_EQ(config.topics.game_status, "game_status");
   EXPECT_EQ(config.topics.goal, "/goal_pose");
   EXPECT_EQ(config.topics.decision_state, "/decision/state");
-  EXPECT_EQ(config.waypoint_executor.follow_service, "start_waypoint_following");
-  EXPECT_EQ(config.waypoint_executor.through_service, "start_waypoint_through");
+  EXPECT_EQ(config.waypoint_executor.follow_action, "/waypoint_editor/follow_waypoints");
+  EXPECT_EQ(config.waypoint_executor.through_action, "/waypoint_editor/through_waypoints");
   EXPECT_DOUBLE_EQ(config.loop_hz, 10.0);
   EXPECT_EQ(config.hp_recovery.low_threshold, 120);
   EXPECT_EQ(config.hp_recovery.high_threshold, 400);

@@ -20,10 +20,9 @@ struct WaypointExecutorConfig
 {
   std::string saved_waypoint_file_topic{"/waypoint_editor/saved_waypoint_file"};
   std::string executor_waypoints_topic{"/waypoint_editor/executor_waypoints"};
-  std::string follow_status_topic{"/waypoint_editor/follow_status"};
-  std::string through_status_topic{"/waypoint_editor/through_status"};
-  std::string follow_service{"start_waypoint_following"};
-  std::string through_service{"start_waypoint_through"};
+  // action 接口（decision → 执行器的数据通路；旧 Trigger 服务/状态话题已废弃）
+  std::string follow_action{"/waypoint_editor/follow_waypoints"};
+  std::string through_action{"/waypoint_editor/through_waypoints"};
   double start_delay_sec{0.2};
 };
 
@@ -42,16 +41,12 @@ struct HpRecoveryConfig
 
 struct TargetConfig
 {
-  bool enable_patrol{false};
-  std::string waypoint_map_name;
-  std::string waypoint_search_root;
   std::string patrol_waypoint_file;
   std::string center_waypoint_file;
   std::string wait_center_waypoint_file;
   std::string home_waypoint_file;
   std::string wait_home_waypoint_file;
   std::string wait_hp_waypoint_file;
-  double patrol_interval_sec{10.0};
 };
 
 struct WaypointConfig
@@ -66,7 +61,6 @@ struct MaintainGoalConfig
   std::string robot_base_frame{"base_link_fake"};
   double xy_tolerance{0.35};
   double drift_hold_sec{0.8};
-  double target_change_hold_sec{0.25};
 };
 
 // 战斗感知参数：把中心区行为从"定时巡逻"改为"按交战态势反应"。

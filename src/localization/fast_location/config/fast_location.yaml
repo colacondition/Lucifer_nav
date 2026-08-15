@@ -59,14 +59,12 @@
     # ========== 频率与队列 ==========
     io_queue_size: 10            # 发布/订阅队列长度
     map_publish_rate_hz: 5.0     # 全局地图发布频率（Hz）
-    localization_rate_hz: 0.5   # 定位更新频率（Hz）
-    tf_publish_rate_hz: 200.0    # map->odom TF 发布频率（Hz）
+    localization_rate_hz: 5.0    # 定位更新频率（Hz，与 fast_location_main.yaml 一致）
+    tf_publish_rate_hz: 50.0     # map->odom TF 发布频率（tf2 自行插值，50Hz 足够）
     publish_tf: true             # 主定位模式下为 true，发布 map->odom TF
     publish_map_to_odometry: false  # 是否发布 map_to_odometry 里程计话题
 
     # ========== ICP 参数 ==========
-    use_fast_gicp: true              # 启用 fast_gicp（性能提升10-100倍）
-    use_cuda: false                  # 启用 GPU 加速（需要NVIDIA驱动正常，修复后改为true）
     gicp_num_threads: 4              # CPU模式线程数（0=自动，建议4-8）
     gicp_max_iterations_first: 100   # 首次定位 GICP 最大迭代次数
     gicp_max_iterations_track: 70   # 跟踪阶段 GICP 最大迭代次数

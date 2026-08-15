@@ -221,6 +221,9 @@ namespace mid360_driver {
         uint8_t buffer[MAX_PACKET_SIZE];
         asio::ip::udp::endpoint sender_endpoint;
         std::vector<Point> points;
+        // 每源最近 udp_cnt：去重 + 乱序保护（旧实现解析了 udp_cnt 但从不使用）。
+        // udp_cnt 是 16 位递增计数：差 0 = 重复包，差 > 半程 = 乱序旧包，都丢。
+        std::unordered_map<asio::ip::address, uint16_t, IpAddressHasher> last_udp_cnt_map;
         while (is_running.load(std::memory_order_relaxed)) {
             asio::error_code error_code;
             const std::size_t received_size = co_await receive_pointcloud_socket.async_receive_from(
@@ -246,6 +249,20 @@ namespace mid360_driver {
             if (expected_size > received_size) [[unlikely]] {
                 log_packet_drop("lidar: packet smaller than declared payload", robustness_config.min_drop_log_interval);
                 continue;
+            }
+            {
+                auto [iter, inserted] = last_udp_cnt_map.try_emplace(sender_endpoint.address(), header.udp_cnt);
+                if (!inserted) {
+                    int32_t diff = static_cast<int32_t>(header.udp_cnt) - static_cast<int32_t>(iter->second);
+                    if (diff < 0) {
+                        diff += 65536;  // 16 位回绕
+                    }
+                    if (diff == 0 || diff > 32768) [[unlikely]] {
+                        log_packet_drop("lidar: duplicate or out-of-order packet", robustness_config.min_drop_log_interval);
+                        continue;
+                    }
+                    iter->second = header.udp_cnt;
+                }
             }
             if (header.time_type != TIMESTAMP_TYPE_NO_SYNC && header.time_type != TIMESTAMP_TYPE_GPTP_OR_PTP && header.time_type != TIMESTAMP_TYPE_GPS) [[unlikely]] {
                 log_packet_drop("lidar: invalid timestamp type", robustness_config.min_drop_log_interval);
@@ -319,25 +336,11 @@ namespace mid360_driver {
                     }
                 }
             } else if (header.data_type == LIVOX_LIDAR_SPHERICAL_COORDINATE_DATA) {
-                const auto *raw_points = reinterpret_cast<const SphericalPoint *>(buffer + sizeof(DataHeader));
-                for (std::size_t i = 0; i < header.dot_num; ++i) {
-                    const auto &raw_point = raw_points[i];
-                    if (!is_point_valid(raw_point.tag)) {
-                        continue;
-                    }
-                    Point point;
-                    point.timestamp = interpolate_timestamp(i);
-                    double radius = raw_point.depth / 1000.0;
-                    double theta = raw_point.theta / 100.0 / 180.0 * std::numbers::pi;
-                    double phi = raw_point.phi / 100.0 / 180.0 * std::numbers::pi;
-                    point.x = static_cast<float>(radius * sin(theta) * cos(phi));
-                    point.y = static_cast<float>(radius * sin(theta) * sin(phi));
-                    point.z = static_cast<float>(radius * cos(theta));
-                    point.intensity = raw_point.reflectivity;
-                    if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z) && point.x * point.x + point.y * point.y + point.z * point.z <= robustness_config.max_point_range * robustness_config.max_point_range) {
-                        points.push_back(point);
-                    }
-                }
+                // Mid360 默认只推 0x01 高精度笛卡尔包。球坐标包的 θ/φ 约定与 Livox
+                // 官方 azimuth/elevation 定义不一致，误触发会产出旋转/镜像点云，
+                // 与其解析出错误数据不如整包丢弃并留日志。
+                log_packet_drop("lidar: spherical packet unsupported", robustness_config.min_drop_log_interval);
+                continue;
             }
             on_receive_pointcloud(sender_endpoint.address(), points);
         }

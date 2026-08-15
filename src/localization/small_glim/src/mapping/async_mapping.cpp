@@ -259,6 +259,12 @@ void AsyncMapping::insert_frame(const EstimationFrame::ConstPtr& frame) {
     if (!frame) return;
     {
         std::lock_guard<std::mutex> lk(mutex_);
+        // 队列设上限、超限丢最旧：mapping worker 慢时（imu_refine 的 GTSAM LM、
+        // 密集关键帧）旧实现无界增长。丢帧只影响建图密度，不影响里程计。
+        constexpr size_t kMaxQueueSize = 100;
+        while (queue_.size() >= kMaxQueueSize) {
+            queue_.pop_front();
+        }
         queue_.push_back(frame);
     }
     cv_.notify_one();

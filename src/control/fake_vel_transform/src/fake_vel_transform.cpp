@@ -50,10 +50,10 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
 }
 
 // Get the local pose from planner
-void FakeVelTransform::localPoseCallback(const nav_msgs::msg::Path::SharedPtr msg)
+void FakeVelTransform::localPoseCallback(const nav_msgs::msg::Path::ConstSharedPtr msg)
 {
   if (!msg || msg->poses.empty()) {
-    RCLCPP_WARN(get_logger(), "Received empty or invalid PoseArray message");
+    RCLCPP_WARN(get_logger(), "Received empty or invalid Path message");
     return;
   }
 
@@ -127,6 +127,15 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
     aft_tf_vel.linear.y = -msg->linear.x * sin(angle_diff) + msg->linear.y * cos(angle_diff);
 
     cmd_vel_chassis_pub_->publish(aft_tf_vel);
+    // 诊断锚点：线上出现过「MPC 判定 commanding velocity 但车不动」的故障，
+    // 需要知道指令到底在哪一环断掉。这条日志能证明本节点确实收到了 /cmd_vel
+    // 并把非零指令发到了 /cmd_vel_chassis；若 gzserver 仍然没动，剩下的断点
+    // 就在插件/物理侧（配合 ros2 topic echo /cmd_vel_chassis 一起看）。
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "forwarded cmd_vel -> cmd_vel_chassis: in=(%.2f, %.2f, %.2f) out=(%.2f, %.2f, %.2f)",
+      msg->linear.x, msg->linear.y, msg->angular.z,
+      aft_tf_vel.linear.x, aft_tf_vel.linear.y, aft_tf_vel.angular.z);
   } catch (tf2::TransformException & ex) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,

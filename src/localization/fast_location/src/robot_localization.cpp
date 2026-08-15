@@ -6,23 +6,10 @@
 #include <stdexcept>
 
 
-std::mutex data_mutex;
-std::mutex tf_mutex;
-
-PointCloudXYZI::Ptr global_map(new PointCloudXYZI);
-PointCloudXYZI::Ptr cur_scan(new PointCloudXYZI);
-nav_msgs::msg::Odometry::SharedPtr cur_odom(new nav_msgs::msg::Odometry);
-Eigen::Matrix4f T_pcd_to_odom = Eigen::Matrix4f::Identity();
-Eigen::Matrix4f initial_pcd_to_odom = Eigen::Matrix4f::Identity();
-
-
-std::atomic<bool> initial_pose_received{true};    // 默认使用代码内置零位姿作为初始位姿
-bool initialized = false;              // 系统是否已初始化
 
 RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options): rclcpp::Node("robot_localization_node", options)
 {
     // 初始化性能优化相关成员
-    accumulated_scan_.reset(new PointCloudXYZI);
 
     this->declare_parameter<std::string>("map_pcd_path", "package://bringup/PCD/RMUL.pcd");
     this->declare_parameter<float>("map_voxel_size", 0.1);
@@ -30,10 +17,8 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<float>("submap_voxel_size_first", 0.1);
     this->declare_parameter<float>("submap_voxel_size_track", 0.2);
     this->declare_parameter<float>("fov_far", 20.0);
-    this->declare_parameter<float>("refine_fov_far", 15.0);
     this->declare_parameter<float>("localization_th", 0.85);
     this->declare_parameter<float>("first_localization_th", 0.95);
-    this->declare_parameter<bool>("use_fast_gicp", true);
     this->declare_parameter<bool>("use_cuda", false);
     this->declare_parameter<int>("gicp_num_threads", 2);
     this->declare_parameter<int>("gicp_max_iterations_first", 50);
@@ -74,9 +59,12 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<std::string>("pub_map_downsampled_topic", "map_downsampled");
 
     this->declare_parameter<int>("io_queue_size", 10);
+    // 默认值与 bringup/config/fast_location_main.yaml（权威配置）保持一致。
     this->declare_parameter<double>("map_publish_rate_hz", 5.0);
-    this->declare_parameter<double>("localization_rate_hz", 10.0);
-    this->declare_parameter<double>("tf_publish_rate_hz", 100.0);
+    this->declare_parameter<double>("localization_rate_hz", 5.0);
+    // map→odom TF 每拍发的是同一份最新位姿（tf2 会自行插值），50Hz 足够；
+    // 200Hz 只是重复广播，纯浪费。
+    this->declare_parameter<double>("tf_publish_rate_hz", 50.0);
     this->declare_parameter<bool>("publish_tf", true);
     this->declare_parameter<bool>("publish_map_to_odometry", false);
 
@@ -94,7 +82,6 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     submap_voxel_size_first_ = this->get_parameter("submap_voxel_size_first").as_double();
     submap_voxel_size_track_ = this->get_parameter("submap_voxel_size_track").as_double();
     fov_far_ = this->get_parameter("fov_far").as_double();
-    refine_fov_far_ = this->get_parameter("refine_fov_far").as_double();
     localization_th_ = this->get_parameter("localization_th").as_double();
     first_localization_th_ = this->get_parameter("first_localization_th").as_double();
     this->declare_parameter<double>("degenerate_condition_threshold", 100.0);
@@ -120,7 +107,6 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<int>("coarse_every", 3);
     coarse_every_ = static_cast<int>(
         std::max<int64_t>(1, this->get_parameter("coarse_every").as_int()));
-    use_fast_gicp_ = this->get_parameter("use_fast_gicp").as_bool();
     use_cuda_ = this->get_parameter("use_cuda").as_bool();
     gicp_num_threads_ = this->get_parameter("gicp_num_threads").as_int();
     gicp_max_iterations_first_ = this->get_parameter("gicp_max_iterations_first").as_int();
@@ -287,7 +273,7 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
 
     RCLCPP_DEBUG(this->get_logger(), "Building KdTree for global map...");
     kdtree_global_map.reset(new pcl::KdTreeFLANN<Point>);
-    kdtree_global_map->setInputCloud(global_map);
+    kdtree_global_map->setInputCloud(global_map_);
     RCLCPP_DEBUG(this->get_logger(), "KdTree built successfully!");
 
     // 地图加载完成后再启动全局地图发布。
@@ -316,8 +302,8 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
             " >>> [ localization ] Using fixed PCD-to-map alignment: [%.3f, %.3f, %.3f rad].",
             explicit_pose[0], explicit_pose[1], explicit_pose[2]);
     }
-    initial_pcd_to_odom = Eigen::Matrix4f::Identity();
-    T_pcd_to_odom = initial_pcd_to_odom;
+    initial_pcd_to_odom_ = Eigen::Matrix4f::Identity();
+    T_pcd_to_odom_ = initial_pcd_to_odom_;
 
     // 先发一次全局地图，保证固定对齐已经生效。
     RCLCPP_DEBUG(this->get_logger(), "Publishing global map immediately...");
@@ -341,26 +327,26 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
 
 void RobotLocalizationNode::locationThread()
 {
-    if(!initial_pose_received.load(std::memory_order_acquire) || !odom_received_.load(std::memory_order_acquire) || global_map->empty())
+    if(!initial_pose_received_.load(std::memory_order_acquire) || !odom_received_.load(std::memory_order_acquire) || global_map_->empty())
     {
         return;
     }
 
     // 还没进入跟踪前，先做一次初始定位。
-    if (!initialized) {
+    if (!initialized_) {
         // 如果之前有一次全局搜索在等第二帧校验,先处理这个。
         if (pending_global_result_valid_) {
-            initialized = verifyPendingGlobalResult();
-            if (initialized) {
+            initialized_ = verifyPendingGlobalResult();
+            if (initialized_) {
                 RCLCPP_DEBUG(this->get_logger(), "Initial localization completed.");
             }
             return;
         }
-        if(!cur_scan->empty())
+        if(!cur_scan_->empty())
         {
-            initialized = enable_global_search_ ?
-                performGlobalSearch() : globalLocalization(initial_pcd_to_odom);
-            if (initialized) {
+            initialized_ = enable_global_search_ ?
+                performGlobalSearch() : globalLocalization(initial_pcd_to_odom_);
+            if (initialized_) {
                 RCLCPP_DEBUG(this->get_logger(), "Initial localization completed.");
             }
         }
@@ -381,8 +367,8 @@ void RobotLocalizationNode::locationThread()
 
     Eigen::Matrix4f pose_guess;
     {
-        std::lock_guard<std::mutex> lock(tf_mutex);
-        pose_guess = T_pcd_to_odom;
+        std::lock_guard<std::mutex> lock(tf_mutex_);
+        pose_guess = T_pcd_to_odom_;
     }
     globalLocalization(pose_guess);
 }
@@ -394,8 +380,8 @@ bool RobotLocalizationNode::snapshotLocalizationInput(
 {
     PointCloudXYZI::Ptr scan_snapshot(new PointCloudXYZI);
     {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        if(cur_scan->empty())
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        if(cur_scan_->empty())
         {
             RCLCPP_ERROR(this->get_logger(), "Current scan is empty, cannot perform localization!");
             return false;
@@ -407,8 +393,11 @@ bool RobotLocalizationNode::snapshotLocalizationInput(
                 "Odometry not received yet, skip localization.");
             return false;
         }
-        *scan_snapshot = *cur_scan;
-        odom_snapshot = *cur_odom;
+        // 指针交换拿走整块内存（cur_scan_ 换成空云，等下一帧 SubScan 填充），
+        // 免去每 tick 一次整帧深拷贝。此后该对象只归 scan_snapshot 独占，
+        // SubScan/重置路径都只操作新的 cur_scan_，并发安全由引用计数保证。
+        scan_snapshot.swap(cur_scan_);
+        odom_snapshot = *cur_odom_;
     }
 
     const auto &p = odom_snapshot.pose.pose.position;
@@ -436,21 +425,21 @@ bool RobotLocalizationNode::snapshotLocalizationInput(
 PointCloudXYZI::Ptr RobotLocalizationNode::snapshotAccumulatedScan(int frames)
 {
     // 从 scan_buffer_ 里取最近 frames 帧合并,提供给精化阶段。
-    // <=1 或 buffer 只有一帧时不需要额外堆叠,让调用方沿用 cur_scan。
+    // <=1 或 buffer 只有一帧时不需要额外堆叠,调用方沿用快照已取的 scan。
     if (frames <= 1) {
         return nullptr;
     }
     std::deque<PointCloudXYZI::Ptr> buffer_copy;
     nav_msgs::msg::Odometry odom_snapshot;
     {
-        std::lock_guard<std::mutex> lock(data_mutex);
+        std::lock_guard<std::mutex> lock(data_mutex_);
         if (static_cast<int>(scan_buffer_.size()) < 2) {
             return nullptr;
         }
         const int keep = std::min<int>(frames, scan_buffer_.size());
         buffer_copy.insert(
             buffer_copy.end(), scan_buffer_.end() - keep, scan_buffer_.end());
-        odom_snapshot = *cur_odom;
+        odom_snapshot = *cur_odom_;
     }
 
     std::size_t total_pts = 0;
@@ -467,7 +456,7 @@ PointCloudXYZI::Ptr RobotLocalizationNode::snapshotAccumulatedScan(int frames)
     }
 
     // 与 snapshotLocalizationInput 保持一致:base 帧下需要用当前 odom 姿态搬到 odom 系。
-    // 注意 buffer 里旧帧的 base 位姿其实和当前不同,这里的近似和现有单帧堆叠(cur_scan)完全一致。
+    // 注意 buffer 里旧帧的 base 位姿其实和当前不同,这里的近似和现有单帧堆叠(cur_scan_)完全一致。
     if (scan_input_frame_mode_ == "base") {
         const auto & p = odom_snapshot.pose.pose.position;
         const auto & q = odom_snapshot.pose.pose.orientation;
@@ -502,7 +491,7 @@ bool RobotLocalizationNode::performGlobalSearch()
     std::vector<Eigen::Matrix4f> candidates;
     try {
         candidates = fast_location::generatePlanarCandidates(
-            fast_location::computePlanarBounds(*global_map),
+            fast_location::computePlanarBounds(*global_map_),
             odom_from_base,
             global_search_config_);
     } catch (const std::exception &error) {
@@ -514,7 +503,7 @@ bool RobotLocalizationNode::performGlobalSearch()
     const float coarse_voxel = std::max(0.25f, scan_voxel_size_ * 2.0f);
     const auto coarse_scan = voxelDownSample(scan_for_icp, coarse_voxel);
     const auto ranked = fast_location::scoreGlobalCandidates(
-        global_map, coarse_scan, candidates, global_search_config_);
+        *kdtree_global_map, coarse_scan, candidates, global_search_config_);
     auto selected = fast_location::selectSeparatedCandidates(ranked, global_search_config_);
     if (selected.empty() || selected.front().score < global_search_config_.minimum_score) {
         const float best_score = selected.empty() ? 0.0f : selected.front().score;
@@ -529,7 +518,7 @@ bool RobotLocalizationNode::performGlobalSearch()
     // 精细打分用未再降采样的 scan_for_icp,残差更能反映真实对齐情况。
     const float coarse_top_score = selected.front().score;
     selected = fast_location::refineCandidateScores(
-        global_map, scan_for_icp, selected, global_search_config_);
+        *kdtree_global_map, scan_for_icp, selected, global_search_config_);
 
     if (selected.empty() || selected.front().score < global_search_config_.minimum_score) {
         RCLCPP_WARN_THROTTLE(
@@ -654,7 +643,7 @@ bool RobotLocalizationNode::verifyPendingGlobalResult()
     std::vector<fast_location::GlobalSearchCandidate> single{
         {pending_global_result_, 0.0f}};
     const auto rechecked = fast_location::refineCandidateScores(
-        global_map, coarse_scan, single, global_search_config_);
+        *kdtree_global_map, coarse_scan, single, global_search_config_);
     const float verify_score = rechecked.empty() ? 0.0f : rechecked.front().score;
 
     if (verify_score < temporal_verification_min_score_) {
@@ -807,7 +796,7 @@ bool RobotLocalizationNode::acceptLocalizationResult(
     degeneracy_recovery_ = false;
     coarse_escape_ = false;
     {
-        std::lock_guard<std::mutex> lock(tf_mutex);
+        std::lock_guard<std::mutex> lock(tf_mutex_);
         // EMA 平滑：防止定位更新在低频（0.5Hz）下产生 map→odom 的突变跳帧。
         // 借鉴 B（HWSentryNav26）的 odom_localizer 平滑策略；α=0.7 时每拍吸收
         // 70% 新结果，约 3 个更新周期（6s）完全收敛。
@@ -838,7 +827,7 @@ bool RobotLocalizationNode::acceptLocalizationResult(
             ema_transform_(0, 0) = cy; ema_transform_(0, 1) = -sy;
             ema_transform_(1, 0) = sy; ema_transform_(1, 1) =  cy;
         }
-        T_pcd_to_odom = ema_transform_;
+        T_pcd_to_odom_ = ema_transform_;
         tf_ready_ = true;
     }
     tracking_recovery_.recordSuccess();
@@ -925,10 +914,10 @@ void RobotLocalizationNode::handleTrackingFailure()
     }
 
     // 连续失败到阈值后，回退到全局搜索。
-    initialized = false;
+    initialized_ = false;
     first_localization_ = true;
     {
-        std::lock_guard<std::mutex> lock(tf_mutex);
+        std::lock_guard<std::mutex> lock(tf_mutex_);
         tf_ready_ = false;
     }
     has_new_scan_.store(true, std::memory_order_release);
@@ -1103,7 +1092,7 @@ PointCloudXYZI::Ptr RobotLocalizationNode::gropGlobalMapInFOV(
     float search_radius,
     bool publish_debug_cloud)
 {
-    if(!global_map || global_map->empty())
+    if(!global_map_ || global_map_->empty())
     {
         RCLCPP_ERROR(this->get_logger(), "Global map is empty!");
         return nullptr;
@@ -1153,7 +1142,7 @@ PointCloudXYZI::Ptr RobotLocalizationNode::gropGlobalMapInFOV(
         PointCloudXYZI::Ptr submap(new PointCloudXYZI);
         submap->reserve(indices.size());
         for (int idx : indices) {
-            submap->push_back(global_map->points[idx]);
+            submap->push_back(global_map_->points[idx]);
         }
 
         RCLCPP_DEBUG(this->get_logger(), ">>> [Submap] Extracted %zu points from global map", submap->size());
@@ -1234,7 +1223,7 @@ std::string resolvePackageUrl(const std::string &path)
 
 bool RobotLocalizationNode::loadGlobalMap(const std::string &pcd_file_path)
 {
-    std::lock_guard<std::mutex> lock(data_mutex);
+    std::lock_guard<std::mutex> lock(data_mutex_);
 
     std::string resolved_pcd_file_path;
     try {
@@ -1255,13 +1244,13 @@ bool RobotLocalizationNode::loadGlobalMap(const std::string &pcd_file_path)
     // 对全局地图进行下采样,减少点云数量
     RCLCPP_DEBUG(this->get_logger(), ">>> [Downsampling] Applying voxel filter with size: %.2fm", map_voxel_size_);
     auto downsample_start = std::chrono::high_resolution_clock::now();
-    global_map = voxelDownSample(raw_map, map_voxel_size_);
+    global_map_ = voxelDownSample(raw_map, map_voxel_size_);
     auto downsample_end = std::chrono::high_resolution_clock::now();
     auto downsample_time = std::chrono::duration_cast<std::chrono::milliseconds>(downsample_end - downsample_start).count();
 
-    float reduction_ratio = 100.0 * (1.0 - (float)global_map->size() / (float)raw_map->size());
+    float reduction_ratio = 100.0 * (1.0 - (float)global_map_->size() / (float)raw_map->size());
     RCLCPP_DEBUG(this->get_logger(), ">>> [Downsampling] Result: %zu -> %zu points (reduced %.1f%%) in %ld ms",
-                raw_map->size(), global_map->size(), reduction_ratio, downsample_time);
+                raw_map->size(), global_map_->size(), reduction_ratio, downsample_time);
 
     return true;
 }
@@ -1276,119 +1265,6 @@ PointCloudXYZI::Ptr RobotLocalizationNode::voxelDownSample(PointCloudXYZI::Ptr c
     voxel_filter.filter(*cloud_filtered);
     return cloud_filtered;
 }
-
-
-void RobotLocalizationNode::extractFeatures(PointCloudXYZI::Ptr cloud,
-                                            PointCloudXYZI::Ptr edge_features,
-                                            PointCloudXYZI::Ptr planar_features,
-                                            int num_neighbors,
-                                            float edge_threshold,
-                                            float planar_threshold)
-{
-    if (!cloud || cloud->empty())
-    {
-        RCLCPP_WARN(this->get_logger(), "Input cloud is empty for feature extraction!");
-        return;
-    }
-
-    // 构建KD树用于近邻搜索
-    pcl::KdTreeFLANN<Point> kdtree;
-    kdtree.setInputCloud(cloud);
-
-    std::vector<float> curvatures(cloud->size(), 0.0f);
-    std::vector<bool> valid_point(cloud->size(), true);
-
-    // 计算每个点的曲率
-    for (size_t i = 0; i < cloud->size(); ++i)
-    {
-        const Point& point = cloud->points[i];
-
-        // 跳过无效点
-        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
-        {
-            valid_point[i] = false;
-            continue;
-        }
-
-        std::vector<int> indices(num_neighbors);
-        std::vector<float> distances(num_neighbors);
-
-        // 查邻域点。
-        if (kdtree.nearestKSearch(point, num_neighbors, indices, distances) < num_neighbors)
-        {
-            valid_point[i] = false;
-            continue;
-        }
-
-        // 计算邻域中心点
-        Eigen::Vector3f center(0.0f, 0.0f, 0.0f);
-        for (int idx : indices)
-        {
-            center.x() += cloud->points[idx].x;
-            center.y() += cloud->points[idx].y;
-            center.z() += cloud->points[idx].z;
-        }
-        center /= static_cast<float>(num_neighbors);
-
-        // 计算协方差矩阵
-        Eigen::Matrix3f covariance = Eigen::Matrix3f::Zero();
-        for (int idx : indices)
-        {
-            Eigen::Vector3f diff(
-                cloud->points[idx].x - center.x(),
-                cloud->points[idx].y - center.y(),
-                cloud->points[idx].z - center.z()
-            );
-            covariance += diff * diff.transpose();
-        }
-        covariance /= static_cast<float>(num_neighbors);
-
-        // 特征值分解
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(covariance);
-        Eigen::Vector3f eigenvalues = solver.eigenvalues();
-
-        // 特征值按升序排列: λ0 <= λ1 <= λ2
-        float lambda0 = eigenvalues(0);
-        float lambda1 = eigenvalues(1);
-        float lambda2 = eigenvalues(2);
-
-        float sum = lambda0 + lambda1 + lambda2;
-        if (sum < 1e-6f)
-        {
-            valid_point[i] = false;
-            continue;
-        }
-
-        // 计算曲率 (最小特征值 / 特征值之和)
-        // 平面点: 曲率小 (λ0 << λ1 ≈ λ2)
-        // 边缘点: 曲率大 (λ0 ≈ λ1 << λ2)
-        curvatures[i] = lambda0 / sum;
-    }
-
-    // 根据曲率分类点
-    for (size_t i = 0; i < cloud->size(); ++i)
-    {
-        if (!valid_point[i])
-            continue;
-
-        const Point& point = cloud->points[i];
-
-        if (curvatures[i] > edge_threshold)
-        {
-            // 高曲率 -> 边缘点
-            edge_features->push_back(point);
-        }
-        else if (curvatures[i] < planar_threshold)
-        {
-            // 低曲率 -> 平面点
-            planar_features->push_back(point);
-        }
-    }
-
-    RCLCPP_DEBUG(this->get_logger(), "Feature extraction: %zu edge points, %zu planar points from %zu input points",
-                edge_features->size(), planar_features->size(), cloud->size());
-}
-
 
 
 
@@ -1432,7 +1308,7 @@ void RobotLocalizationNode::SubScan(const sensor_msgs::msg::PointCloud2::SharedP
     PointCloudXYZI::Ptr stacked_scan(new PointCloudXYZI);
     std::deque<PointCloudXYZI::Ptr> buffer_copy;
     {
-        std::lock_guard<std::mutex> lock(data_mutex);
+        std::lock_guard<std::mutex> lock(data_mutex_);
         scan_buffer_.push_back(scan_filtered);
         while (static_cast<int>(scan_buffer_.size()) > buffer_capacity) {
             scan_buffer_.pop_front();
@@ -1453,10 +1329,11 @@ void RobotLocalizationNode::SubScan(const sensor_msgs::msg::PointCloud2::SharedP
         *stacked_scan += *cloud;
     }
 
-    // 更新当前定位使用的扫描。
+    // 更新当前定位使用的扫描。指针交换：新合并云进 cur_scan_，旧缓冲随局部变量
+    // 析构，免去每 tick 一次整帧深拷贝。所有权交接都在 data_mutex_ 内完成。
     {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        *cur_scan = *stacked_scan;
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        cur_scan_.swap(stacked_scan);
         has_new_scan_.store(true, std::memory_order_release);
         // 新扫描到了，清空旧缓存。
         scan_downsample_cache_.clear();
@@ -1467,8 +1344,8 @@ void RobotLocalizationNode::SubScan(const sensor_msgs::msg::PointCloud2::SharedP
 
 void RobotLocalizationNode::SubOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
-    std::lock_guard<std::mutex> lock(data_mutex);
-    cur_odom = msg;
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    cur_odom_ = msg;
     odom_received_.store(true, std::memory_order_release);
 }
 
@@ -1485,8 +1362,8 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
 
     nav_msgs::msg::Odometry odom_snapshot;
     {
-        std::lock_guard<std::mutex> lock(data_mutex);
-        odom_snapshot = *cur_odom;
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        odom_snapshot = *cur_odom_;
     }
 
     const Eigen::Matrix4f map_from_base = this->poseToMat(msg);
@@ -1507,20 +1384,19 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
     }
 
     {
-        std::lock_guard<std::mutex> lock(data_mutex);
+        std::lock_guard<std::mutex> lock(data_mutex_);
         scan_buffer_.clear();
-        cur_scan->clear();
+        cur_scan_->clear();
         has_new_scan_.store(false, std::memory_order_release);
     }
     {
-        std::lock_guard<std::mutex> lock(tf_mutex);
-        initial_pcd_to_odom = pcd_from_odom;
-        T_pcd_to_odom = pcd_from_odom;
+        std::lock_guard<std::mutex> lock(tf_mutex_);
+        initial_pcd_to_odom_ = pcd_from_odom;
+        T_pcd_to_odom_ = pcd_from_odom;
         tf_ready_ = false;
     }
-    initial_pose_received.store(true, std::memory_order_release);
+    initial_pose_received_.store(true, std::memory_order_release);
     // 唤醒定位线程。
-    initial_pose_cv_.notify_one();
     first_localization_ = true;
     // 用户重新指定初始位姿,丢弃之前挂起的全局搜索结果。
     pending_global_result_valid_ = false;
@@ -1548,12 +1424,12 @@ void RobotLocalizationNode::publishMapToOdomTf()
     Eigen::Matrix4f T;
     bool tf_ready = false;
     {
-        std::lock_guard<std::mutex> lock(tf_mutex);
+        std::lock_guard<std::mutex> lock(tf_mutex_);
         tf_ready = tf_ready_;
         if (!tf_ready) {
             return;
         }
-        T = fast_location::composeMapToOdom(map_from_pcd_, T_pcd_to_odom);
+        T = fast_location::composeMapToOdom(map_from_pcd_, T_pcd_to_odom_);
     }
 
     // map->odom TF 用当前时钟（now()）作为时间戳——标准做法（与 Nav2 amcl 一致）。
@@ -1626,7 +1502,7 @@ void RobotLocalizationNode::publishPcdCloudInMap(
 void RobotLocalizationNode::publishGlobalMap()
 {
     // 把加载的全局地图发布出去，供外部可视化或调试。
-    if (!global_map || global_map->empty())
+    if (!global_map_ || global_map_->empty())
     {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
                             "Global map is empty, skipping publish");
@@ -1638,7 +1514,7 @@ void RobotLocalizationNode::publishGlobalMap()
     }
 
     if (!global_map_msg_ready_) {
-        const auto map_cloud = transformCloud(*global_map, map_from_pcd_);
+        const auto map_cloud = transformCloud(*global_map_, map_from_pcd_);
         pcl::toROSMsg(*map_cloud, global_map_msg_);
         global_map_msg_.header.frame_id = map_frame_;
         global_map_msg_ready_ = true;
@@ -1648,7 +1524,7 @@ void RobotLocalizationNode::publishGlobalMap()
     pub_global_map->publish(global_map_msg_);
     
     RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                          "Publishing global map with %zu points", global_map->size());
+                          "Publishing global map with %zu points", global_map_->size());
 }
 
 

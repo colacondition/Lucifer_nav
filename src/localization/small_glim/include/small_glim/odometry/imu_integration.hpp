@@ -104,41 +104,15 @@ public:
     );
 
     /**
-    * @brief Find IMU data in a time range
-    * @param start_time  Start time
-    * @param end_time    End time
-    * @param delta_times Delta times (interval between IMU frames)
-    * @param imu_data    IMU data
-    * @return Index of the last integrated IMU frame
-    */
-    size_t find_imu_data(
-        double start_time,
-        double end_time,
-        std::vector<double>& delta_times,
-        std::vector<Eigen::Matrix<double, 7, 1>>& imu_data
-    );
-
-    /**
     * @brief Erase IMU data before the given index
     * @param last Last integrated IMU measurement index
     */
     void erase_imu_data(size_t last);
 
     /**
-    * @brief Erase IMU data with a timestamp before or equal to the given stamp
-    * @param stamp Erase IMU frames with stamp <= the given stamp
-    */
-    void erase_imu_data_up_to(double stamp);
-
-    /**
     * @brief Preintegrated measurements
     */
     const gtsam::PreintegratedImuMeasurements& integrated_measurements() const;
-
-    /**
-    * @brief IMU data in queue
-    */
-    const std::deque<Eigen::Matrix<double, 7, 1>>& imu_data_in_queue() const;
 
 private:
     std::shared_ptr<gtsam::PreintegratedImuMeasurements> imu_measurements;

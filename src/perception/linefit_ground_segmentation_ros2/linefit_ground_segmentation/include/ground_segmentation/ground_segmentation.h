@@ -1,6 +1,7 @@
 #ifndef GROUND_SEGMENTATION_H_
 #define GROUND_SEGMENTATION_H_
 
+#include <functional>
 #include <mutex>
 
 #include "ground_segmentation/segment.h"
@@ -76,6 +77,15 @@ class GroundSegmentation {
 
   // Visualizer.
   std::unique_ptr<Viewer> viewer_;
+
+  // 并行分片执行 [0, count) 上的任务，调用线程也参与，全部完成后返回。
+  //
+  // 实现采用「每轮直接起 std::thread + join」的上游方案。此前这里用过一个自定义
+  // 持久线程池（代次号 + arrived_ barrier），上线后先后死锁两次（一次 arrived_
+  // 下溢，一次主线程永久等在 cv_done_ 上、全部 worker 睡在 cv_work_ 上 ——
+  // 2026-08 看门狗 backtrace 实锤）。线程池省下的只是每帧 ~100 次线程创建/销毁
+  // 的几十微秒；而每轮新建线程没有任何跨轮共享状态，结构上不可能死锁。
+  void runParallel(std::size_t count, const std::function<void(std::size_t, std::size_t)> & task);
 
   void assignCluster(std::vector<int>* segmentation);
 

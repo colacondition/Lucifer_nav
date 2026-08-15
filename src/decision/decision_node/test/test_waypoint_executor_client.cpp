@@ -1,15 +1,97 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <vector>
 
+#include <decision_interfaces/action/follow_waypoints.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <std_msgs/msg/string.hpp>
-#include <std_srvs/srv/trigger.hpp>
 
 #include "decision/waypoint_executor_client.hpp"
+
+namespace
+{
+
+using FollowWaypoints = decision_interfaces::action::FollowWaypoints;
+
+void initRclcppIfNeeded()
+{
+  if (!rclcpp::ok()) {
+    int argc = 0;
+    char ** argv = nullptr;
+    rclcpp::init(argc, argv);
+  }
+}
+
+decision::Pose makePose(double x, double y)
+{
+  decision::Pose pose;
+  pose.x = x;
+  pose.y = y;
+  pose.qw = 1.0;
+  return pose;
+}
+
+// 假执行器：记录收到的目标；按行为立即成功/失败，或挂起不返回结果。
+struct MockExecutor
+{
+  enum class Behavior
+  {
+    Succeed,
+    Abort,
+    Hang,
+  };
+
+  std::vector<FollowWaypoints::Goal> goals;
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<FollowWaypoints>> last_handle;
+  std::shared_ptr<rclcpp_action::Server<FollowWaypoints>> server;
+  Behavior behavior{Behavior::Succeed};
+
+  explicit MockExecutor(
+    rclcpp::Node::SharedPtr node, const std::string & action_name)
+  {
+    server = rclcpp_action::create_server<FollowWaypoints>(
+      node,
+      action_name,
+      [](const rclcpp_action::GoalUUID &, std::shared_ptr<const FollowWaypoints::Goal>) {
+        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+      },
+      [](const std::shared_ptr<rclcpp_action::ServerGoalHandle<FollowWaypoints>>) {
+        return rclcpp_action::CancelResponse::ACCEPT;
+      },
+      [this](const std::shared_ptr<rclcpp_action::ServerGoalHandle<FollowWaypoints>> handle) {
+        goals.push_back(handle->get_goal() ? *handle->get_goal() : FollowWaypoints::Goal());
+        last_handle = handle;
+        if (behavior == Behavior::Hang) {
+          return;
+        }
+        auto result = std::make_shared<FollowWaypoints::Result>();
+        result->success = (behavior == Behavior::Succeed);
+        result->message = result->success ? "completed" : "aborted";
+        if (result->success) {
+          handle->succeed(result);
+        } else {
+          handle->abort(result);
+        }
+      });
+  }
+};
+
+void spinUntil(
+  const rclcpp::Node::SharedPtr & node,
+  const std::function<bool()> & predicate,
+  int max_iterations = 200)
+{
+  for (int i = 0; i < max_iterations && !predicate(); ++i) {
+    rclcpp::spin_some(node);
+  }
+}
+
+}  // namespace
 
 TEST(WaypointExecutorClient, HomeAndWaitHomePreemptImmediately)
 {
@@ -22,53 +104,36 @@ TEST(WaypointExecutorClient, HomeAndWaitHomePreemptImmediately)
   EXPECT_FALSE(client.shouldPreemptImmediately(decision::TargetName::Patrol));
 }
 
-TEST(WaypointExecutorClient, CompletedStatusMarksSuccess)
+TEST(WaypointExecutorClient, ApplyResultMarksSuccessOrAborted)
 {
   decision::DecisionConfig config;
   decision::WaypointExecutorClient client(config);
   client.setRunningTarget(decision::TargetName::Center, decision::TargetMode::ExecutorFollow, 10.0);
 
-  auto state = client.onExecutorStatus(
-    decision::TargetName::Center,
-    decision::TargetMode::ExecutorFollow,
-    "COMPLETED",
-    11.0);
+  auto succeeded = client.applyExecutorResult(
+    decision::TargetName::Center, decision::TargetMode::ExecutorFollow, true, 11.0);
+  EXPECT_EQ(succeeded.result_status, decision::ExecutorResultStatus::Succeeded);
+  EXPECT_FALSE(succeeded.running_target.has_value());
+  EXPECT_NEAR(succeeded.last_goal_success_time_sec, 11.0, 1e-9);
 
-  EXPECT_EQ(state.result_status, decision::ExecutorResultStatus::Succeeded);
-  EXPECT_FALSE(state.running_target.has_value());
+  client.setRunningTarget(decision::TargetName::Center, decision::TargetMode::ExecutorFollow, 12.0);
+  auto aborted = client.applyExecutorResult(
+    decision::TargetName::Center, decision::TargetMode::ExecutorFollow, false, 13.0);
+  EXPECT_EQ(aborted.result_status, decision::ExecutorResultStatus::Aborted);
+  EXPECT_FALSE(aborted.running_target.has_value());
 }
 
-TEST(WaypointExecutorClient, AbortedStatusMarksFailure)
+TEST(WaypointExecutorClient, ApplyResultIgnoresMismatchedTarget)
 {
   decision::DecisionConfig config;
   decision::WaypointExecutorClient client(config);
   client.setRunningTarget(decision::TargetName::Center, decision::TargetMode::ExecutorFollow, 10.0);
 
-  auto state = client.onExecutorStatus(
-    decision::TargetName::Center,
-    decision::TargetMode::ExecutorFollow,
-    "ABORTED",
-    11.0);
-
-  EXPECT_EQ(state.result_status, decision::ExecutorResultStatus::Aborted);
-  EXPECT_FALSE(state.running_target.has_value());
-}
-
-TEST(WaypointExecutorClient, CompletedTargetDoesNotNeedResend)
-{
-  decision::DecisionConfig config;
-  decision::WaypointExecutorClient client(config);
-  client.setRunningTarget(decision::TargetName::Home, decision::TargetMode::ExecutorFollow, 10.0);
-
-  auto state = client.onExecutorStatus(
-    decision::TargetName::Home,
-    decision::TargetMode::ExecutorFollow,
-    "COMPLETED",
-    11.0);
-
-  EXPECT_EQ(state.active_target, decision::TargetName::Home);
-  EXPECT_EQ(state.result_status, decision::ExecutorResultStatus::Succeeded);
-  EXPECT_FALSE(state.running_target.has_value());
+  // 别的目标晚到的结果不能覆盖当前状态。
+  auto state = client.applyExecutorResult(
+    decision::TargetName::Home, decision::TargetMode::ExecutorFollow, true, 11.0);
+  EXPECT_EQ(state.result_status, decision::ExecutorResultStatus::None);
+  EXPECT_EQ(state.running_target, decision::TargetName::Center);
 }
 
 TEST(WaypointExecutorClient, MaintainReissueUsesDistanceAndHoldTime)
@@ -79,12 +144,8 @@ TEST(WaypointExecutorClient, MaintainReissueUsesDistanceAndHoldTime)
   config.maintain_goal.drift_hold_sec = 0.8;
   decision::WaypointExecutorClient client(config);
 
-  decision::Pose robot;
-  robot.x = 2.0;
-  robot.y = 0.0;
-  decision::Pose target;
-  target.x = 0.0;
-  target.y = 0.0;
+  const auto robot = makePose(2.0, 0.0);
+  const auto target = makePose(0.0, 0.0);
 
   EXPECT_FALSE(client.needMaintainReissue(decision::TargetName::WaitCenter, robot, target, 1.0));
   EXPECT_TRUE(client.needMaintainReissue(decision::TargetName::WaitCenter, robot, target, 2.0));
@@ -99,9 +160,8 @@ TEST(WaypointExecutorClient, MaintainsOnlyWaitTargets)
   config.maintain_goal.xy_tolerance = 0.35;
   config.maintain_goal.drift_hold_sec = 0.8;
 
-  decision::Pose robot;
-  robot.x = 2.0;
-  decision::Pose anchor;
+  const auto robot = makePose(2.0, 0.0);
+  const auto anchor = makePose(0.0, 0.0);
 
   for (const auto target : {
       decision::TargetName::WaitHome,
@@ -134,28 +194,16 @@ TEST(WaypointExecutorClient, CompletedWaitTargetRequestsAgainAfterDrift)
 
   client.setRunningTarget(
     decision::TargetName::WaitHp, decision::TargetMode::ExecutorFollow, 10.0);
-  client.onExecutorStatus(
-    decision::TargetName::WaitHp,
-    decision::TargetMode::ExecutorFollow,
-    "COMPLETED",
-    11.0);
+  client.applyExecutorResult(
+    decision::TargetName::WaitHp, decision::TargetMode::ExecutorFollow, true, 11.0);
 
-  decision::Pose robot;
-  robot.x = 2.0;
-  decision::Pose anchor;
+  const auto robot = makePose(2.0, 0.0);
+  const auto anchor = makePose(0.0, 0.0);
 
   EXPECT_FALSE(client.shouldRequestTarget(
-    decision::TargetName::WaitHp,
-    decision::TargetMode::ExecutorFollow,
-    robot,
-    anchor,
-    11.1));
+    decision::TargetName::WaitHp, decision::TargetMode::ExecutorFollow, robot, anchor, 11.1));
   EXPECT_TRUE(client.shouldRequestTarget(
-    decision::TargetName::WaitHp,
-    decision::TargetMode::ExecutorFollow,
-    robot,
-    anchor,
-    12.0));
+    decision::TargetName::WaitHp, decision::TargetMode::ExecutorFollow, robot, anchor, 12.0));
 }
 
 TEST(WaypointExecutorClient, CompletedMoveTargetDoesNotMaintain)
@@ -166,464 +214,205 @@ TEST(WaypointExecutorClient, CompletedMoveTargetDoesNotMaintain)
 
   client.setRunningTarget(
     decision::TargetName::Center, decision::TargetMode::ExecutorFollow, 10.0);
-  client.onExecutorStatus(
-    decision::TargetName::Center,
-    decision::TargetMode::ExecutorFollow,
-    "COMPLETED",
-    11.0);
+  client.applyExecutorResult(
+    decision::TargetName::Center, decision::TargetMode::ExecutorFollow, true, 11.0);
 
-  decision::Pose robot;
-  robot.x = 2.0;
-  decision::Pose anchor;
+  const auto robot = makePose(2.0, 0.0);
+  const auto anchor = makePose(0.0, 0.0);
 
   EXPECT_FALSE(client.shouldRequestTarget(
-    decision::TargetName::Center,
-    decision::TargetMode::ExecutorFollow,
-    robot,
-    anchor,
-    20.0));
+    decision::TargetName::Center, decision::TargetMode::ExecutorFollow, robot, anchor, 20.0));
 }
 
-TEST(WaypointExecutorClient, CompletedWaitTargetDoesNotRestartWhenPoseIsUnavailable)
+TEST(WaypointExecutorClient, DispatchSendsActionGoalAndPublishesForPanel)
 {
-  decision::DecisionConfig config;
-  config.maintain_goal.enable = true;
-  decision::WaypointExecutorClient client(config);
-
-  client.setRunningTarget(
-    decision::TargetName::WaitHome, decision::TargetMode::ExecutorFollow, 10.0);
-  client.onExecutorStatus(
-    decision::TargetName::WaitHome,
-    decision::TargetMode::ExecutorFollow,
-    "COMPLETED",
-    11.0);
-
-  EXPECT_FALSE(client.shouldRequestTarget(
-    decision::TargetName::WaitHome,
-    decision::TargetMode::ExecutorFollow,
-    std::nullopt,
-    std::nullopt,
-    14.0));
-  EXPECT_FALSE(client.shouldRequestTarget(
-    decision::TargetName::WaitHome,
-    decision::TargetMode::ExecutorFollow,
-    std::nullopt,
-    std::nullopt,
-    1000.0));
-}
-
-TEST(WaypointExecutorClient, DispatchPublishesWaypointsThenStartsServiceAfterDelay)
-{
-  if (!rclcpp::ok()) {
-    int argc = 0;
-    char ** argv = nullptr;
-    rclcpp::init(argc, argv);
-  }
-
-  auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_dispatch_test");
+  initRclcppIfNeeded();
   const auto suffix = std::to_string(
     std::chrono::steady_clock::now().time_since_epoch().count());
-  const auto waypoints_topic = "executor_waypoints_" + suffix;
-  const auto saved_file_topic = "saved_waypoint_file_" + suffix;
-  const auto follow_service_name = "start_waypoint_following_" + suffix;
-  const auto through_service_name = "start_waypoint_through_" + suffix;
+  auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_dispatch_" + suffix);
+  const auto follow_action = "follow_waypoints_dispatch_" + suffix;
+  const auto through_action = "through_waypoints_dispatch_" + suffix;
+  const auto waypoints_topic = "executor_waypoints_dispatch_" + suffix;
+  const auto saved_file_topic = "saved_waypoint_file_dispatch_" + suffix;
 
   rclcpp::QoS latched_qos(1);
   latched_qos.reliable().transient_local();
+  MockExecutor mock(node, follow_action);
+  mock.behavior = MockExecutor::Behavior::Succeed;
 
   std::vector<nav_msgs::msg::Path> received_paths;
   std::vector<std_msgs::msg::String> received_files;
-  int service_calls = 0;
-
   auto path_sub = node->create_subscription<nav_msgs::msg::Path>(
     waypoints_topic, latched_qos,
-    [&received_paths](const nav_msgs::msg::Path & msg) {
-      received_paths.push_back(msg);
-    });
+    [&received_paths](const nav_msgs::msg::Path & msg) { received_paths.push_back(msg); });
   auto file_sub = node->create_subscription<std_msgs::msg::String>(
     saved_file_topic, latched_qos,
-    [&received_files](const std_msgs::msg::String & msg) {
-      received_files.push_back(msg);
-    });
-  auto direct_goal_pub = node->create_publisher<geometry_msgs::msg::PoseStamped>(
-    "direct_goal_" + suffix, 10);
-  auto follow_service = node->create_service<std_srvs::srv::Trigger>(
-    follow_service_name,
-    [&service_calls](
-      const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-      ++service_calls;
-      response->success = true;
-      response->message = "started";
-    });
+    [&received_files](const std_msgs::msg::String & msg) { received_files.push_back(msg); });
 
   decision::DecisionConfig config;
   config.goal_frame_id = "map";
-  config.waypoint_executor.start_delay_sec = 0.2;
   decision::WaypointExecutorClient client(config);
   client.setRosInterfaces(
     node->create_publisher<nav_msgs::msg::Path>(waypoints_topic, latched_qos),
     node->create_publisher<std_msgs::msg::String>(saved_file_topic, latched_qos),
-    direct_goal_pub,
-    node->create_client<std_srvs::srv::Trigger>(follow_service_name),
-    node->create_client<std_srvs::srv::Trigger>(through_service_name));
+    nullptr,
+    rclcpp_action::create_client<FollowWaypoints>(node, follow_action),
+    rclcpp_action::create_client<FollowWaypoints>(node, through_action));
 
-  decision::Pose first;
-  first.x = 1.0;
-  first.y = 2.0;
-  first.qw = 1.0;
-  decision::Pose second;
-  second.x = 3.0;
-  second.y = 4.0;
-  second.qw = 1.0;
-
-  EXPECT_FALSE(client.stepExecutorTarget(
-    decision::TargetName::Center,
-    decision::TargetMode::ExecutorFollow,
-    "/tmp/center.csv",
-    {first, second},
-    false,
-    10.0));
-
-  rclcpp::spin_some(node);
-  ASSERT_EQ(received_paths.size(), 1U);
-  EXPECT_EQ(received_paths.front().header.frame_id, "map");
-  ASSERT_EQ(received_paths.front().poses.size(), 2U);
-  EXPECT_DOUBLE_EQ(received_paths.front().poses[1].pose.position.x, 3.0);
-  ASSERT_EQ(received_files.size(), 1U);
-  EXPECT_EQ(received_files.front().data, "/tmp/center.csv");
-  EXPECT_EQ(service_calls, 0);
+  // 先 spin 让 action server 就绪。
+  spinUntil(node, [&mock]() { return mock.server != nullptr; }, 10);
+  spinUntil(
+    node,
+    [&]() {
+      return rclcpp_action::create_client<FollowWaypoints>(node, follow_action)->action_server_is_ready();
+    },
+    10);
 
   EXPECT_TRUE(client.stepExecutorTarget(
     decision::TargetName::Center,
     decision::TargetMode::ExecutorFollow,
     "/tmp/center.csv",
-    {first, second},
+    {makePose(1.0, 2.0), makePose(3.0, 4.0)},
     false,
-    10.3));
+    10.0));
 
-  for (int i = 0; i < 20 && !client.state().running_target.has_value(); ++i) {
-    rclcpp::spin_some(node);
-  }
+  spinUntil(node, [&mock]() { return !mock.goals.empty(); });
+  ASSERT_EQ(mock.goals.size(), 1U);
+  EXPECT_EQ(mock.goals.front().waypoints.header.frame_id, "map");
+  ASSERT_EQ(mock.goals.front().waypoints.poses.size(), 2U);
+  EXPECT_DOUBLE_EQ(mock.goals.front().waypoints.poses[1].pose.position.x, 3.0);
 
-  EXPECT_EQ(service_calls, 1);
-  EXPECT_EQ(client.state().running_target, decision::TargetName::Center);
-  EXPECT_EQ(client.state().running_mode, decision::TargetMode::ExecutorFollow);
+  // 结果送达后状态应转为成功。
+  spinUntil(
+    node,
+    [&]() { return client.state().result_status == decision::ExecutorResultStatus::Succeeded; });
+  EXPECT_FALSE(client.state().running_target.has_value());
+
+  // 面板兼容发布。
+  rclcpp::spin_some(node);
+  ASSERT_EQ(received_paths.size(), 1U);
+  ASSERT_EQ(received_files.size(), 1U);
+  EXPECT_EQ(received_files.front().data, "/tmp/center.csv");
 }
 
-TEST(WaypointExecutorClient, ImmediatePreemptPublishesGoalPose)
+TEST(WaypointExecutorClient, ImmediatePreemptPublishesDirectGoal)
 {
-  if (!rclcpp::ok()) {
-    int argc = 0;
-    char ** argv = nullptr;
-    rclcpp::init(argc, argv);
-  }
-
-  auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_preempt_test");
+  initRclcppIfNeeded();
   const auto suffix = std::to_string(
     std::chrono::steady_clock::now().time_since_epoch().count());
-  const auto waypoints_topic = "executor_waypoints_preempt_" + suffix;
-  const auto saved_file_topic = "saved_waypoint_file_preempt_" + suffix;
+  auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_preempt_" + suffix);
+  const auto follow_action = "follow_waypoints_preempt_" + suffix;
+  const auto through_action = "through_waypoints_preempt_" + suffix;
   const auto direct_goal_topic = "direct_goal_preempt_" + suffix;
-  const auto follow_service_name = "start_waypoint_following_preempt_" + suffix;
-  const auto through_service_name = "start_waypoint_through_preempt_" + suffix;
 
-  rclcpp::QoS latched_qos(1);
-  latched_qos.reliable().transient_local();
+  MockExecutor mock(node, follow_action);
+  mock.behavior = MockExecutor::Behavior::Succeed;
 
   std::vector<geometry_msgs::msg::PoseStamped> received_direct_goals;
-  int service_calls = 0;
-
   auto direct_goal_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
     direct_goal_topic, 10,
     [&received_direct_goals](const geometry_msgs::msg::PoseStamped & msg) {
       received_direct_goals.push_back(msg);
     });
-  auto follow_service = node->create_service<std_srvs::srv::Trigger>(
-    follow_service_name,
-    [&service_calls](
-      const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-      ++service_calls;
-      response->success = true;
-      response->message = "started";
-    });
 
   decision::DecisionConfig config;
   config.goal_frame_id = "map";
   decision::WaypointExecutorClient client(config);
-  client.setRunningTarget(decision::TargetName::Center, decision::TargetMode::ExecutorFollow, 9.0);
   client.setRosInterfaces(
-    node->create_publisher<nav_msgs::msg::Path>(waypoints_topic, latched_qos),
-    node->create_publisher<std_msgs::msg::String>(saved_file_topic, latched_qos),
+    nullptr,
+    nullptr,
     node->create_publisher<geometry_msgs::msg::PoseStamped>(direct_goal_topic, 10),
-    node->create_client<std_srvs::srv::Trigger>(follow_service_name),
-    node->create_client<std_srvs::srv::Trigger>(through_service_name));
+    rclcpp_action::create_client<FollowWaypoints>(node, follow_action),
+    rclcpp_action::create_client<FollowWaypoints>(node, through_action));
 
-  decision::Pose first;
-  first.x = 7.0;
-  first.y = 8.0;
-  first.qw = 1.0;
+  spinUntil(node, [&mock]() { return mock.server != nullptr; }, 10);
 
   EXPECT_TRUE(client.stepExecutorTarget(
     decision::TargetName::Home,
     decision::TargetMode::ExecutorFollow,
     "/tmp/home.csv",
-    {first},
+    {makePose(7.0, 8.0)},
     true,
     10.0));
 
-  for (int i = 0; i < 20 && (received_direct_goals.empty() || service_calls == 0); ++i) {
-    rclcpp::spin_some(node);
-  }
-
+  spinUntil(node, [&received_direct_goals]() { return !received_direct_goals.empty(); });
   ASSERT_EQ(received_direct_goals.size(), 1U);
   EXPECT_DOUBLE_EQ(received_direct_goals.front().pose.position.x, 7.0);
   EXPECT_DOUBLE_EQ(received_direct_goals.front().pose.position.y, 8.0);
-  EXPECT_EQ(service_calls, 1);
 }
 
-TEST(WaypointExecutorClient, ImmediateRequestsCoalesceWhileServiceRequestIsInFlight)
+TEST(WaypointExecutorClient, PreemptedGoalResultDoesNotOverrideNewTarget)
 {
-  if (!rclcpp::ok()) {
-    int argc = 0;
-    char ** argv = nullptr;
-    rclcpp::init(argc, argv);
-  }
-
-  auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_coalesce_test");
+  initRclcppIfNeeded();
   const auto suffix = std::to_string(
     std::chrono::steady_clock::now().time_since_epoch().count());
-  const auto waypoints_topic = "executor_waypoints_coalesce_" + suffix;
-  const auto saved_file_topic = "saved_waypoint_file_coalesce_" + suffix;
-  const auto direct_goal_topic = "direct_goal_coalesce_" + suffix;
-  const auto follow_service_name = "start_waypoint_following_coalesce_" + suffix;
-  const auto through_service_name = "start_waypoint_through_coalesce_" + suffix;
+  auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_override_" + suffix);
+  const auto follow_action = "follow_waypoints_override_" + suffix;
+  const auto through_action = "through_waypoints_override_" + suffix;
 
-  rclcpp::QoS latched_qos(1);
-  latched_qos.reliable().transient_local();
-
-  std::vector<geometry_msgs::msg::PoseStamped> received_direct_goals;
-  int service_calls = 0;
-
-  auto direct_goal_sub = node->create_subscription<geometry_msgs::msg::PoseStamped>(
-    direct_goal_topic, 10,
-    [&received_direct_goals](const geometry_msgs::msg::PoseStamped & msg) {
-      received_direct_goals.push_back(msg);
-    });
-  auto follow_service = node->create_service<std_srvs::srv::Trigger>(
-    follow_service_name,
-    [&service_calls](
-      const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-      ++service_calls;
-      response->success = true;
-      response->message = "started";
-    });
-
-  decision::DecisionConfig config;
-  config.goal_frame_id = "map";
-  decision::WaypointExecutorClient client(config);
-  client.setRosInterfaces(
-    node->create_publisher<nav_msgs::msg::Path>(waypoints_topic, latched_qos),
-    node->create_publisher<std_msgs::msg::String>(saved_file_topic, latched_qos),
-    node->create_publisher<geometry_msgs::msg::PoseStamped>(direct_goal_topic, 10),
-    node->create_client<std_srvs::srv::Trigger>(follow_service_name),
-    node->create_client<std_srvs::srv::Trigger>(through_service_name));
-
-  decision::Pose home;
-  home.x = 1.0;
-  home.qw = 1.0;
-  decision::Pose wait_home;
-  wait_home.x = 2.0;
-  wait_home.qw = 1.0;
-
-  EXPECT_TRUE(client.stepExecutorTarget(
-    decision::TargetName::Home,
-    decision::TargetMode::ExecutorFollow,
-    "/tmp/home.csv", {home}, true, 10.0));
-  EXPECT_FALSE(client.stepExecutorTarget(
-    decision::TargetName::Home,
-    decision::TargetMode::ExecutorFollow,
-    "/tmp/home.csv", {home}, true, 10.1));
-  EXPECT_FALSE(client.stepExecutorTarget(
-    decision::TargetName::Home,
-    decision::TargetMode::ExecutorFollow,
-    "/tmp/home.csv", {home}, true, 10.2));
-  EXPECT_FALSE(client.stepExecutorTarget(
-    decision::TargetName::WaitHome,
-    decision::TargetMode::ExecutorFollow,
-    "/tmp/wait_home.csv", {wait_home}, true, 10.3));
-
-  for (int i = 0; i < 20; ++i) {
-    rclcpp::spin_some(node);
-  }
-
-  ASSERT_EQ(received_direct_goals.size(), 2U);
-  EXPECT_DOUBLE_EQ(received_direct_goals[0].pose.position.x, 1.0);
-  EXPECT_DOUBLE_EQ(received_direct_goals[1].pose.position.x, 2.0);
-  EXPECT_EQ(service_calls, 1);
-  EXPECT_FALSE(client.state().running_target.has_value());
-
-  EXPECT_TRUE(client.stepExecutorTarget(
-    decision::TargetName::WaitHome,
-    decision::TargetMode::ExecutorFollow,
-    "/tmp/wait_home.csv", {wait_home}, true, 10.4));
-  for (int i = 0; i < 20 && !client.state().running_target.has_value(); ++i) {
-    rclcpp::spin_some(node);
-  }
-
-  EXPECT_EQ(received_direct_goals.size(), 2U);
-  EXPECT_EQ(service_calls, 2);
-  EXPECT_EQ(client.state().running_target, decision::TargetName::WaitHome);
-}
-
-TEST(WaypointExecutorClient, TerminalStatusBeforeStartResponseSettlesInFlightGeneration)
-{
-  if (!rclcpp::ok()) {
-    int argc = 0;
-    char ** argv = nullptr;
-    rclcpp::init(argc, argv);
-  }
-
-  const auto verify_terminal = [](
-      const std::string & status,
-      decision::ExecutorResultStatus expected_result,
-      decision::TargetName target) {
-      SCOPED_TRACE(status);
-
-      const auto suffix = std::to_string(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-      auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_terminal_" + suffix);
-      const auto waypoints_topic = "executor_waypoints_terminal_" + suffix;
-      const auto saved_file_topic = "saved_waypoint_file_terminal_" + suffix;
-      const auto follow_service_name = "start_waypoint_following_terminal_" + suffix;
-      const auto through_service_name = "start_waypoint_through_terminal_" + suffix;
-
-      rclcpp::QoS latched_qos(1);
-      latched_qos.reliable().transient_local();
-
-      int service_calls = 0;
-      auto follow_service = node->create_service<std_srvs::srv::Trigger>(
-        follow_service_name,
-        [&service_calls](
-          const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-          std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-          ++service_calls;
-          response->success = true;
-          response->message = "started";
-        });
-
-      decision::DecisionConfig config;
-      decision::WaypointExecutorClient client(config);
-      client.setRosInterfaces(
-        node->create_publisher<nav_msgs::msg::Path>(waypoints_topic, latched_qos),
-        node->create_publisher<std_msgs::msg::String>(saved_file_topic, latched_qos),
-        node->create_publisher<geometry_msgs::msg::PoseStamped>("direct_goal_" + suffix, 10),
-        node->create_client<std_srvs::srv::Trigger>(follow_service_name),
-        node->create_client<std_srvs::srv::Trigger>(through_service_name));
-
-      decision::Pose waypoint;
-      waypoint.x = 1.0;
-      waypoint.qw = 1.0;
-      ASSERT_TRUE(client.stepExecutorTarget(
-        target, decision::TargetMode::ExecutorFollow,
-        "/tmp/terminal.csv", {waypoint}, true, 10.0));
-
-      const auto status_target = client.targetForStatus(
-        decision::TargetMode::ExecutorFollow, status);
-      ASSERT_EQ(status_target, target);
-      const auto terminal_state = client.onExecutorStatus(
-        *status_target, decision::TargetMode::ExecutorFollow, status, 11.0);
-      EXPECT_EQ(terminal_state.result_status, expected_result);
-      EXPECT_FALSE(terminal_state.running_target.has_value());
-
-      for (int i = 0; i < 20; ++i) {
-        rclcpp::spin_some(node);
-      }
-
-      EXPECT_EQ(service_calls, 1);
-      EXPECT_EQ(client.state().result_status, expected_result);
-      EXPECT_FALSE(client.state().running_target.has_value());
-    };
-
-  verify_terminal(
-    "COMPLETED", decision::ExecutorResultStatus::Succeeded, decision::TargetName::Home);
-  verify_terminal(
-    "ABORTED", decision::ExecutorResultStatus::Aborted, decision::TargetName::WaitHome);
-}
-
-TEST(WaypointExecutorClient, RunningHandoffAssociatesTerminalWithInFlightTarget)
-{
-  if (!rclcpp::ok()) {
-    int argc = 0;
-    char ** argv = nullptr;
-    rclcpp::init(argc, argv);
-  }
-
-  const auto suffix = std::to_string(
-    std::chrono::steady_clock::now().time_since_epoch().count());
-  auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_handoff_" + suffix);
-  const auto waypoints_topic = "executor_waypoints_handoff_" + suffix;
-  const auto saved_file_topic = "saved_waypoint_file_handoff_" + suffix;
-  const auto follow_service_name = "start_waypoint_following_handoff_" + suffix;
-  const auto through_service_name = "start_waypoint_through_handoff_" + suffix;
-
-  rclcpp::QoS latched_qos(1);
-  latched_qos.reliable().transient_local();
-
-  int service_calls = 0;
-  auto follow_service = node->create_service<std_srvs::srv::Trigger>(
-    follow_service_name,
-    [&service_calls](
-      const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-      ++service_calls;
-      response->success = true;
-      response->message = "started";
-    });
+  MockExecutor mock(node, follow_action);
+  mock.behavior = MockExecutor::Behavior::Hang;  // 第一个目标挂起
 
   decision::DecisionConfig config;
   decision::WaypointExecutorClient client(config);
-  client.setRunningTarget(
-    decision::TargetName::Center, decision::TargetMode::ExecutorFollow, 9.0);
   client.setRosInterfaces(
-    node->create_publisher<nav_msgs::msg::Path>(waypoints_topic, latched_qos),
-    node->create_publisher<std_msgs::msg::String>(saved_file_topic, latched_qos),
-    node->create_publisher<geometry_msgs::msg::PoseStamped>("direct_goal_" + suffix, 10),
-    node->create_client<std_srvs::srv::Trigger>(follow_service_name),
-    node->create_client<std_srvs::srv::Trigger>(through_service_name));
+    nullptr, nullptr, nullptr,
+    rclcpp_action::create_client<FollowWaypoints>(node, follow_action),
+    rclcpp_action::create_client<FollowWaypoints>(node, through_action));
 
-  decision::Pose home;
-  home.x = 1.0;
-  home.qw = 1.0;
-  ASSERT_TRUE(client.stepExecutorTarget(
+  spinUntil(node, [&mock]() { return mock.server != nullptr; }, 10);
+
+  EXPECT_TRUE(client.stepExecutorTarget(
     decision::TargetName::Home, decision::TargetMode::ExecutorFollow,
-    "/tmp/home.csv", {home}, true, 10.0));
+    "/tmp/a.csv", {makePose(1.0, 0.0)}, true, 10.0));
+  spinUntil(node, [&]() { return client.state().running_target.has_value(); });
+  ASSERT_TRUE(client.state().running_target.has_value());
 
-  EXPECT_EQ(
-    client.targetForStatus(decision::TargetMode::ExecutorFollow, "COMPLETED"),
-    decision::TargetName::Center);
+  // 第二个目标抢占；假执行器改为立即成功。
+  mock.behavior = MockExecutor::Behavior::Succeed;
+  EXPECT_TRUE(client.stepExecutorTarget(
+    decision::TargetName::Center, decision::TargetMode::ExecutorFollow,
+    "/tmp/b.csv", {makePose(2.0, 0.0)}, true, 11.0));
 
-  const auto running_target = client.targetForStatus(
-    decision::TargetMode::ExecutorFollow, "RUNNING");
-  ASSERT_EQ(running_target, decision::TargetName::Home);
-  client.onExecutorStatus(
-    *running_target, decision::TargetMode::ExecutorFollow, "RUNNING", 10.1);
-
-  const auto completed_target = client.targetForStatus(
-    decision::TargetMode::ExecutorFollow, "COMPLETED");
-  ASSERT_EQ(completed_target, decision::TargetName::Home);
-  const auto completed = client.onExecutorStatus(
-    *completed_target, decision::TargetMode::ExecutorFollow, "COMPLETED", 10.2);
-  EXPECT_EQ(completed.result_status, decision::ExecutorResultStatus::Succeeded);
-  EXPECT_FALSE(completed.running_target.has_value());
-
-  for (int i = 0; i < 20; ++i) {
-    rclcpp::spin_some(node);
-  }
-
-  EXPECT_EQ(service_calls, 1);
-  EXPECT_EQ(client.state().result_status, decision::ExecutorResultStatus::Succeeded);
+  spinUntil(
+    node,
+    [&]() { return client.state().result_status == decision::ExecutorResultStatus::Succeeded; });
   EXPECT_FALSE(client.state().running_target.has_value());
+}
+
+TEST(WaypointExecutorClient, ResultCallbackHookNotifiesTerminalOutcome)
+{
+  initRclcppIfNeeded();
+  const auto suffix = std::to_string(
+    std::chrono::steady_clock::now().time_since_epoch().count());
+  auto node = std::make_shared<rclcpp::Node>("waypoint_executor_client_hook_" + suffix);
+  const auto follow_action = "follow_waypoints_hook_" + suffix;
+  const auto through_action = "through_waypoints_hook_" + suffix;
+
+  MockExecutor mock(node, follow_action);
+  mock.behavior = MockExecutor::Behavior::Abort;
+
+  decision::DecisionConfig config;
+  decision::WaypointExecutorClient client(config);
+  client.setRosInterfaces(
+    nullptr, nullptr, nullptr,
+    rclcpp_action::create_client<FollowWaypoints>(node, follow_action),
+    rclcpp_action::create_client<FollowWaypoints>(node, through_action));
+
+  std::optional<std::pair<decision::TargetName, bool>> notified;
+  client.setResultCallback(
+    [&notified](decision::TargetName target, bool success) {
+      notified = std::make_pair(target, success);
+    });
+
+  spinUntil(node, [&mock]() { return mock.server != nullptr; }, 10);
+
+  EXPECT_TRUE(client.stepExecutorTarget(
+    decision::TargetName::Patrol, decision::TargetMode::ExecutorFollow,
+    "/tmp/p.csv", {makePose(1.0, 0.0)}, true, 10.0));
+
+  spinUntil(node, [&notified]() { return notified.has_value(); });
+  ASSERT_TRUE(notified.has_value());
+  EXPECT_EQ(notified->first, decision::TargetName::Patrol);
+  EXPECT_FALSE(notified->second);
 }

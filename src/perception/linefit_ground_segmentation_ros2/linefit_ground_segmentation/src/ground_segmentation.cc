@@ -1,10 +1,12 @@
 #include "ground_segmentation/ground_segmentation.h"
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <list>
 #include <memory>
 #include <thread>
+#include <vector>
 
 
 GroundSegmentation::GroundSegmentation(const GroundSegmentationParams& params) :
@@ -60,19 +62,42 @@ void GroundSegmentation::segment(const PointCloud& cloud, std::vector<int>* segm
   }
 }
 
+void GroundSegmentation::runParallel(
+    std::size_t count, const std::function<void(std::size_t, std::size_t)> & task) {
+  if (count == 0) {
+    return;
+  }
+  const std::size_t participants =
+      std::max<std::size_t>(1, static_cast<std::size_t>(params_.n_threads));
+  if (participants == 1) {
+    task(0, count);
+    return;
+  }
+  // 分片与旧实现完全一致：第 i 份是 [count*i/P, count*(i+1)/P)。
+  std::vector<std::thread> threads;
+  threads.reserve(participants - 1);
+  for (std::size_t i = 0; i + 1 < participants; ++i) {
+    const std::size_t start = count * i / participants;
+    const std::size_t end = count * (i + 1) / participants;
+    threads.emplace_back([&task, start, end] { task(start, end); });
+  }
+  task(count * (participants - 1) / participants, count);
+  for (auto & thread : threads) {
+    thread.join();
+  }
+}
+
 void GroundSegmentation::getLines(std::list<PointLine> *lines) {
+  // 每轮线程执行；分片互不重叠，但主线程与工作线程并发写同一个 lines 列表，
+  // 保留互斥锁。
   std::mutex line_mutex;
-  std::vector<std::thread> thread_vec(params_.n_threads);
-  unsigned int i;
-  for (i = 0; i < params_.n_threads; ++i) {
-    const unsigned int start_index = params_.n_segments / params_.n_threads * i;
-    const unsigned int end_index = params_.n_segments / params_.n_threads * (i+1);
-    thread_vec[i] = std::thread(&GroundSegmentation::lineFitThread, this,
-                                start_index, end_index, lines, &line_mutex);
-  }
-  for (auto it = thread_vec.begin(); it != thread_vec.end(); ++it) {
-    it->join();
-  }
+  runParallel(
+    static_cast<std::size_t>(params_.n_segments),
+    [this, lines, &line_mutex](std::size_t start_index, std::size_t end_index) {
+      lineFitThread(
+        static_cast<unsigned int>(start_index), static_cast<unsigned int>(end_index),
+        lines, &line_mutex);
+    });
 }
 
 void GroundSegmentation::lineFitThread(const unsigned int start_index,
@@ -130,17 +155,13 @@ pcl::PointXYZ GroundSegmentation::minZPointTo3d(const Bin::MinZPoint &min_z_poin
 }
 
 void GroundSegmentation::assignCluster(std::vector<int>* segmentation) {
-  std::vector<std::thread> thread_vec(params_.n_threads);
-  const size_t cloud_size = segmentation->size();
-  for (unsigned int i = 0; i < params_.n_threads; ++i) {
-    const unsigned int start_index = cloud_size / params_.n_threads * i;
-    const unsigned int end_index = cloud_size / params_.n_threads * (i+1);
-    thread_vec[i] = std::thread(&GroundSegmentation::assignClusterThread, this,
-                                start_index, end_index, segmentation);
-  }
-  for (auto it = thread_vec.begin(); it != thread_vec.end(); ++it) {
-    it->join();
-  }
+  runParallel(
+    segmentation->size(),
+    [this, segmentation](std::size_t start_index, std::size_t end_index) {
+      assignClusterThread(
+        static_cast<unsigned int>(start_index), static_cast<unsigned int>(end_index),
+        segmentation);
+    });
 }
 
 void GroundSegmentation::assignClusterThread(const unsigned int &start_index,
@@ -207,24 +228,11 @@ void GroundSegmentation::getMinZPoints(PointCloud* out_cloud) {
 }
 
 void GroundSegmentation::insertPoints(const PointCloud& cloud) {
-  std::vector<std::thread> threads(params_.n_threads);
-  const size_t points_per_thread = cloud.size() / params_.n_threads;
-  // Launch threads.
-  for (unsigned int i = 0; i < params_.n_threads - 1; ++i) {
-    const size_t start_index = i * points_per_thread;
-    const size_t end_index = (i+1) * points_per_thread;
-    threads[i] = std::thread(&GroundSegmentation::insertionThread, this,
-                             std::cref(cloud), start_index, end_index);
-  }
-  // Launch last thread which might have more points than others.
-  const size_t start_index = (params_.n_threads - 1) * points_per_thread;
-  const size_t end_index = cloud.size();
-  threads[params_.n_threads - 1] =
-      std::thread(&GroundSegmentation::insertionThread, this, std::cref(cloud), start_index, end_index);
-  // Wait for threads to finish.
-  for (auto it = threads.begin(); it != threads.end(); ++it) {
-    it->join();
-  }
+  runParallel(
+    cloud.size(),
+    [this, &cloud](std::size_t start_index, std::size_t end_index) {
+      insertionThread(cloud, start_index, end_index);
+    });
 }
 
 void GroundSegmentation::insertionThread(const PointCloud& cloud,

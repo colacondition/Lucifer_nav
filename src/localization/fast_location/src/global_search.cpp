@@ -156,21 +156,18 @@ void sortByScoreWithTieBreak(
 }  // namespace
 
 std::vector<GlobalSearchCandidate> scoreGlobalCandidates(
-  const PointCloudXYZI::ConstPtr & global_map,
+  const pcl::KdTreeFLANN<Point> & kdtree,
   const PointCloudXYZI::ConstPtr & scan,
   const std::vector<Eigen::Matrix4f> & candidates,
   const GlobalSearchConfig & config)
 {
   // 用最近邻命中率给候选位姿打分。
-  if (!global_map || global_map->empty() || !scan || scan->empty()) {
+  if (!scan || scan->empty()) {
     return {};
   }
   if (!(config.score_distance > 0.0f)) {
     throw std::invalid_argument("global search score distance must be positive");
   }
-
-  pcl::KdTreeFLANN<Point> kdtree;
-  kdtree.setInputCloud(global_map);
   // 采样稀疏一点，减小搜索代价。
   const std::size_t stride = std::max<std::size_t>(1, config.score_stride);
   const float maximum_distance_sq = config.score_distance * config.score_distance;
@@ -224,13 +221,13 @@ std::vector<GlobalSearchCandidate> selectSeparatedCandidates(
 }
 
 std::vector<GlobalSearchCandidate> refineCandidateScores(
-  const PointCloudXYZI::ConstPtr & global_map,
+  const pcl::KdTreeFLANN<Point> & kdtree,
   const PointCloudXYZI::ConstPtr & scan,
   const std::vector<GlobalSearchCandidate> & selected,
   const GlobalSearchConfig & config)
 {
   // 对少量入选候选用更严的 score_distance 和 stride 再打一次分,打破粗搜的量化粒度。
-  if (selected.empty() || !global_map || global_map->empty() || !scan || scan->empty()) {
+  if (selected.empty() || !scan || scan->empty()) {
     return selected;
   }
 
@@ -238,9 +235,6 @@ std::vector<GlobalSearchCandidate> refineCandidateScores(
     config.refine_score_distance : config.score_distance;
   const std::size_t refine_stride = std::max<std::size_t>(1, config.refine_score_stride);
   const float maximum_distance_sq = refine_distance * refine_distance;
-
-  pcl::KdTreeFLANN<Point> kdtree;
-  kdtree.setInputCloud(global_map);
 
   std::vector<GlobalSearchCandidate> refined;
   refined.reserve(selected.size());

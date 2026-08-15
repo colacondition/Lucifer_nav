@@ -13,8 +13,9 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <std_msgs/msg/string.hpp>
-#include <std_srvs/srv/trigger.hpp>
+#include <decision_interfaces/action/follow_waypoints.hpp>
 #include <tf2/exceptions.h>
 #include <tf2/time.h>
 #include <tf2_ros/buffer.h>
@@ -76,12 +77,28 @@ public:
       config_.waypoint_executor.saved_waypoint_file_topic, latchedQos());
     executor_waypoints_pub_ = create_publisher<nav_msgs::msg::Path>(
       config_.waypoint_executor.executor_waypoints_topic, latchedQos());
-    follow_client_ = create_client<std_srvs::srv::Trigger>(
-      config_.waypoint_executor.follow_service);
-    through_client_ = create_client<std_srvs::srv::Trigger>(
-      config_.waypoint_executor.through_service);
+    follow_client_ = rclcpp_action::create_client<decision_interfaces::action::FollowWaypoints>(
+      this, config_.waypoint_executor.follow_action);
+    through_client_ = rclcpp_action::create_client<decision_interfaces::action::FollowWaypoints>(
+      this, config_.waypoint_executor.through_action);
     waypoint_executor_->setRosInterfaces(
       executor_waypoints_pub_, saved_waypoint_file_pub_, goal_pub_, follow_client_, through_client_);
+    // action 结果 → 状态机事件（替代旧的「状态话题 + 代次关联」）。
+    waypoint_executor_->setResultCallback(
+      [this](decision::TargetName target, bool success) {
+        pending_executor_event_ = decision::ExecutorEvent{
+          target,
+          success ? decision::ExecutorEventType::Succeeded : decision::ExecutorEventType::Aborted};
+        if (success) {
+          RCLCPP_INFO(
+            get_logger(), "Executor target [%s] completed",
+            decision::toString(target).c_str());
+        } else {
+          RCLCPP_WARN(
+            get_logger(), "Executor target [%s] aborted",
+            decision::toString(target).c_str());
+        }
+      });
 
     robot_status_sub_ = create_subscription<decision_interfaces::msg::RobotStatus>(
       config_.topics.robot_status, 10,
@@ -92,16 +109,6 @@ public:
       config_.topics.game_status, 10,
       [this](const decision_interfaces::msg::GameStatus & msg) {
         context_.setGameStatus(msg, nowSec());
-      });
-    follow_status_sub_ = create_subscription<std_msgs::msg::String>(
-      config_.waypoint_executor.follow_status_topic, executorStatusQos(),
-      [this](const std_msgs::msg::String & msg) {
-        onExecutorStatus(decision::TargetMode::ExecutorFollow, msg.data);
-      });
-    through_status_sub_ = create_subscription<std_msgs::msg::String>(
-      config_.waypoint_executor.through_status_topic, latchedQos(),
-      [this](const std_msgs::msg::String & msg) {
-        onExecutorStatus(decision::TargetMode::ExecutorThrough, msg.data);
       });
 
     timer_ = create_wall_timer(
@@ -126,30 +133,6 @@ private:
       static_cast<int>(status->game_progress) == config_.game.progress &&
       static_cast<int>(status->stage_remain_time) >= config_.game.lower_remain_time &&
       static_cast<int>(status->stage_remain_time) <= config_.game.higher_remain_time;
-  }
-
-  void onExecutorStatus(decision::TargetMode mode, const std::string & status)
-  {
-    const auto target = waypoint_executor_->targetForStatus(mode, status);
-    if (!target.has_value()) {
-      return;
-    }
-
-    const auto updated = waypoint_executor_->onExecutorStatus(
-      *target, mode, status, nowSec());
-    if (updated.result_status == decision::ExecutorResultStatus::Succeeded) {
-      pending_executor_event_ = decision::ExecutorEvent{
-        *target, decision::ExecutorEventType::Succeeded};
-      RCLCPP_INFO(
-        get_logger(), "Executor target [%s] completed",
-        decision::toString(*target).c_str());
-    } else if (updated.result_status == decision::ExecutorResultStatus::Aborted) {
-      pending_executor_event_ = decision::ExecutorEvent{
-        *target, decision::ExecutorEventType::Aborted};
-      RCLCPP_WARN(
-        get_logger(), "Executor target [%s] aborted",
-        decision::toString(*target).c_str());
-    }
   }
 
   void onTimer()
@@ -439,12 +422,10 @@ private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr decision_state_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr executor_waypoints_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr saved_waypoint_file_pub_;
-  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr follow_client_;
-  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr through_client_;
+  rclcpp_action::Client<decision_interfaces::action::FollowWaypoints>::SharedPtr follow_client_;
+  rclcpp_action::Client<decision_interfaces::action::FollowWaypoints>::SharedPtr through_client_;
   rclcpp::Subscription<decision_interfaces::msg::RobotStatus>::SharedPtr robot_status_sub_;
   rclcpp::Subscription<decision_interfaces::msg::GameStatus>::SharedPtr game_status_sub_;
-  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr follow_status_sub_;
-  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr through_status_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   std::optional<decision::ExecutorEvent> pending_executor_event_;

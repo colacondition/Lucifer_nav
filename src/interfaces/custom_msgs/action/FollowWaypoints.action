@@ -1,0 +1,10 @@
+# 沿给定航点依次行驶。goal 自带航点，不再依赖 override/current_waypoints
+# 话题与 CSV——客户端到执行器的数据流收敛为一个 action。
+
+nav_msgs/Path waypoints
+---
+bool success
+string message
+---
+int32 current_index   # 1-based，正在接近的第几个航点
+string status         # RUNNING / COMPLETED / ABORTED

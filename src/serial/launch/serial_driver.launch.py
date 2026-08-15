@@ -14,6 +14,7 @@ def generate_launch_description():
     node_output = LaunchConfiguration('node_output')
 
     serial_driver_node = Node(
+        respawn=True, respawn_delay=2.0,  # 串口崩溃自愈（重连后继续收发）
         package='serial_driver',
         executable='serial_driver_node',
         namespace='',

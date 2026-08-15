@@ -10,9 +10,7 @@ decision::DecisionStateMachine machine()
   hp.low_threshold = 120;
   hp.high_threshold = 400;
   decision::TargetConfig targets;
-  targets.enable_patrol = true;
   targets.patrol_waypoint_file = "patrol.csv";
-  targets.patrol_interval_sec = 10.0;
   return decision::DecisionStateMachine(hp, targets);
 }
 

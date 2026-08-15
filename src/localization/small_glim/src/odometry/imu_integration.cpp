@@ -393,69 +393,12 @@ size_t IMUIntegration::integrate_imu(
     return cursor;
 }
 
-size_t IMUIntegration::find_imu_data(
-    double start_time,
-    double end_time,
-    std::vector<double>& delta_times,
-    std::vector<Eigen::Matrix<double, 7, 1>>& imu_data
-) {
-    size_t cursor = 0;
-    auto imu_itr = imu_queue.begin();
-    double last_stamp = start_time;
-
-    if (imu_itr == imu_queue.end()) {
-        return cursor;
-    }
-
-    for (; imu_itr != imu_queue.end(); imu_itr++, cursor++) {
-        const auto& imu_frame = *imu_itr;
-        const double imu_stamp = imu_frame[0];
-        if (imu_stamp > end_time) {
-            break;
-        }
-
-        const double dt = imu_stamp - last_stamp;
-        if (dt <= 0.0) {
-            continue;
-        }
-        if (!std::isfinite(dt) || dt > params->max_integration_dt) {
-            logger::warn("imu_integration", "skip IMU lookup with invalid dt={:.6f}", dt);
-            continue;
-        }
-
-        delta_times.emplace_back(dt);
-        imu_data.emplace_back(imu_frame);
-        last_stamp = imu_stamp;
-    }
-
-    const double dt = end_time - last_stamp;
-    if (dt > 0.0 && dt <= params->max_integration_dt) {
-        Eigen::Matrix<double, 7, 1> last_imu_frame = imu_itr == imu_queue.end() ? *(imu_itr - 1) : *imu_itr;
-        delta_times.emplace_back(dt);
-        imu_data.emplace_back(last_imu_frame);
-    }
-
-    return cursor;
-}
-
 void IMUIntegration::erase_imu_data(size_t last) {
     imu_queue.erase(imu_queue.begin(), imu_queue.begin() + static_cast<int64_t>(last));
 }
 
-void IMUIntegration::erase_imu_data_up_to(double stamp) {
-    auto it = imu_queue.begin();
-    while (it != imu_queue.end() && (*it)[0] <= stamp) {
-        ++it;
-    }
-    imu_queue.erase(imu_queue.begin(), it);
-}
-
 const gtsam::PreintegratedImuMeasurements& IMUIntegration::integrated_measurements() const {
     return *imu_measurements;
-}
-
-const std::deque<Eigen::Matrix<double, 7, 1>>& IMUIntegration::imu_data_in_queue() const {
-    return imu_queue;
 }
 
 } // namespace small_glim

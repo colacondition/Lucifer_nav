@@ -43,18 +43,24 @@ public:
     // 状态型话题，与 serial_driver / 电控一致用 transient_local + reliable：
     // 晚起的可视化（或 MPC）也立刻拿到当前值，而不是干等到下一帧。
     const auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+    // 两个订阅回调各自写成员、又通过 publishMarkers 读对方的成员，串行化。
+    cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions sub_options;
+    sub_options.callback_group = cb_group_;
     state_sub_ = create_subscription<decision_interfaces::msg::GimbalPostureState>(
       posture_state_topic_, qos,
-      [this](decision_interfaces::msg::GimbalPostureState::SharedPtr msg) {
+      [this](decision_interfaces::msg::GimbalPostureState::ConstSharedPtr msg) {
         lowered_ = msg->lowered;
         publishMarkers();
-      });
+      },
+      sub_options);
     cmd_sub_ = create_subscription<decision_interfaces::msg::GimbalPosture>(
       posture_topic_, qos,
-      [this](decision_interfaces::msg::GimbalPosture::SharedPtr msg) {
+      [this](decision_interfaces::msg::GimbalPosture::ConstSharedPtr msg) {
         lower_cmd_ = msg->lower;
         publishMarkers();
-      });
+      },
+      sub_options);
 
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       marker_topic_, qos);
@@ -138,6 +144,7 @@ private:
 
   rclcpp::Subscription<decision_interfaces::msg::GimbalPostureState>::SharedPtr state_sub_;
   rclcpp::Subscription<decision_interfaces::msg::GimbalPosture>::SharedPtr cmd_sub_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
 };
 

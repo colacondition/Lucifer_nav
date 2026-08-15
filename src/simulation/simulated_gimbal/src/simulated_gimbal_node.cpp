@@ -83,6 +83,9 @@ private:
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
       [this]() {
         current_lowered_ = target_;
+        // 一次性动作：到点即自停（旧实现留着重复定时器，动作完成后仍每
+        // action_delay_ 秒空触发刷日志）。
+        action_timer_->cancel();
         RCLCPP_INFO(get_logger(), "gimbal action done: lowered=%s",
                     current_lowered_ ? "true" : "false");
       });

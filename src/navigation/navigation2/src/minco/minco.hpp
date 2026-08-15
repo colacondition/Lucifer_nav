@@ -186,7 +186,7 @@ public:
     }
 
     inline void operator=(const BandedSystemNoTime& bs) {
-        ptrData = nullptr;
+        destroy();  // 先释放旧缓冲：原实现直接置 nullptr，复用对象时会泄漏
         create(bs.N, bs.lowerBw, bs.upperBw);
         memcpy(ptrData, bs.ptrData, N * (lowerBw + upperBw + 1) * sizeof(double));
     }

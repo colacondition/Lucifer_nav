@@ -35,6 +35,10 @@ void AsyncOdometryEstimation::insert_frame(const PreprocessedFrame::Ptr frame) {
     input_frame_queue.push_back(frame);
 }
 
+void AsyncOdometryEstimation::set_output_ivox(bool enabled) {
+    output_ivox_enabled.store(enabled, std::memory_order_relaxed);
+}
+
 void AsyncOdometryEstimation::join() {
     end_of_sequence = true;
     if (thread.joinable()) {
@@ -158,7 +162,12 @@ void AsyncOdometryEstimation::run() {
             const auto& frame = raw_frames.front();
             std::vector<EstimationFrame::ConstPtr> marginalized;
             auto estimation_frame = odometry_estimation->insert_frame(frame, marginalized);
-            auto target_ivox_frame = odometry_estimation->get_target_ivox_frame();
+            // 无订阅者时不构建 ivox 帧：get_target_ivox_frame 会把整张体素图的点
+            // 全量拷成点云，10Hz 下纯浪费（输出队列照样是空的）。
+            EstimationFrame::ConstPtr target_ivox_frame;
+            if (output_ivox_enabled.load(std::memory_order_relaxed)) {
+                target_ivox_frame = odometry_estimation->get_target_ivox_frame();
+            }
 
             if (estimation_frame) output_estimation_results.push_back(estimation_frame);
             if (target_ivox_frame) output_target_ivox_frames.push_back(target_ivox_frame);

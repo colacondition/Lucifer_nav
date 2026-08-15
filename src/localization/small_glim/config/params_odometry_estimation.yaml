@@ -16,7 +16,7 @@
       fix_imu_bias: false # If true, disable IMU bias estimation and use the initial IMU bias
 
       # Registration
-      registration_type: "GICP" # Registration type (GICP or VGICP)
+      registration_type: "GICP" # Registration type (only GICP is supported)
       lru_thresh: 100 # LRU cache threshold
       target_downsampling_rate: 0.1 # Downsampling rate for points to be inserted into the target
 
@@ -30,11 +30,6 @@
       max_imu_wait_time_gap: 0.3 # Drop a LiDAR frame if its scan_end_time is this far ahead of latest IMU
       max_imu_wait_wall_time: 1.0 # Drop a LiDAR frame if wall-clock wait for IMU exceeds this duration
       max_internal_frame_queue: 20 # Drop oldest queued frames when odometry input backlog exceeds this limit
-
-      # VGICP
-      vgicp_resolution: 0.25 # Voxelmap resolution (for VGICP)
-      vgicp_voxelmap_levels: 2 # Multi-resolution voxelmap levels (for VGICP)
-      vgicp_voxelmap_scaling_factor: 2.0 # Multi-resolution voxelmap scaling factor (for VGICP)
 
       # MISC
       num_threads: 6 # Number of threads for odometry estimation

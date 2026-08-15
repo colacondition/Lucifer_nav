@@ -47,9 +47,14 @@ public:
     hysteresis_ = declare_parameter<double>("hysteresis", 0.3);
     decider_ = GimbalLowerDecider(hysteresis_);
 
+    // mt 容器下订阅与定时器共享 receiver_/path_points_，串行化（同 planner 纪律）。
+    cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions sub_options;
+    sub_options.callback_group = cb_group_;
+
     semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
       semantic_map_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
-      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+      [this](decision_interfaces::msg::SemanticMap::ConstSharedPtr msg) {
         try {
           if (!receiver_.update(*msg)) {
             return;
@@ -62,7 +67,8 @@ public:
         RCLCPP_INFO(
           get_logger(), "Tunnel posture got semantic map: %zu tunnels",
           receiver_.map().tunnels().size());
-      });
+      },
+      sub_options);
 
     // reliable + transient_local：这是个状态型请求而不是数据流，漏一帧的代价是云台
     // 该收的时候没收。晚起的电控节点也应当立刻拿到当前请求。
@@ -74,21 +80,23 @@ public:
     // 兜底）才会收，贴着洞口路过不会再误收。
     path_sub_ = create_subscription<nav_msgs::msg::Path>(
       path_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
-      [this](nav_msgs::msg::Path::SharedPtr msg) {
+      [this](nav_msgs::msg::Path::ConstSharedPtr msg) {
         std::vector<Eigen::Vector2d> points;
         points.reserve(msg->poses.size());
         for (const auto & pose : msg->poses) {
           points.emplace_back(pose.pose.position.x, pose.pose.position.y);
         }
         path_points_ = std::move(points);
-      });
+      },
+      sub_options);
 
     const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, update_frequency_));
     timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
       [this]() {
         tick();
-      });
+      },
+      cb_group_);
 
     // 开机先发一次 false，让电控有个确定的初值而不是等第一次进洞。
     publish(false);
@@ -157,6 +165,7 @@ private:
 
   rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::Publisher<decision_interfaces::msg::GimbalPosture>::SharedPtr posture_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 

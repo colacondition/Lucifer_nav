@@ -36,19 +36,26 @@ public:
   {
     loadParameters();
 
+    // mt 容器下订阅回调与定时器回调读写同一批 latest_*/receiver_/膨胀缓存成员，
+    // 全部放进一个互斥回调组串行化（与 rm_global_planner 同款纪律）。
+    cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions sub_options;
+    sub_options.callback_group = cb_group_;
+
     auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
     map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       map_topic_, map_qos,
-      [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+      [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
         latest_map_ = std::move(msg);
         publishCostmap();
-      });
+      },
+      sub_options);
 
     // 语义地图和 /map 同源同 QoS（都由 rm_map_server 用 transient_local 发一次），
     // 所以不需要时间同步 —— 两者要么都收到，要么这张地图根本没加载。
     semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
       semantic_map_topic_, map_qos,
-      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+      [this](decision_interfaces::msg::SemanticMap::ConstSharedPtr msg) {
         try {
           // rm_map_server 每秒重发同一张图兜底，内容没变时 update 直接返回 false，
           // 不重建方向场也不动逐格半径缓存。
@@ -68,22 +75,25 @@ public:
           get_logger(), "Global costmap got semantic map: %zu tunnels",
           receiver_.map().tunnels().size());
         inflation_radius_limit_.clear();
-      });
+      },
+      sub_options);
 
     // 点云和激光都可作为全局障碍输入。
     if (subscribe_pointcloud_) {
       pointcloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         pointcloud_topic_, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
           latest_pointcloud_ = std::move(msg);
-        });
+        },
+        sub_options);
     }
     if (subscribe_scan_) {
       scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
         scan_topic_, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::LaserScan::SharedPtr msg) {
+        [this](sensor_msgs::msg::LaserScan::ConstSharedPtr msg) {
           latest_scan_ = std::move(msg);
-        });
+        },
+        sub_options);
     }
 
     auto costmap_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
@@ -105,7 +115,8 @@ public:
         std::chrono::duration_cast<std::chrono::nanoseconds>(period),
         [this]() {
           publishCostmap();
-        });
+        },
+        cb_group_);
     }
 
     RCLCPP_INFO(
@@ -533,9 +544,9 @@ private:
   bool reuse_previous_grid_{true};
   int previous_obstacle_decay_{0};
 
-  nav_msgs::msg::OccupancyGrid::SharedPtr latest_map_;
-  sensor_msgs::msg::LaserScan::SharedPtr latest_scan_;
-  sensor_msgs::msg::PointCloud2::SharedPtr latest_pointcloud_;
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr latest_map_;
+  sensor_msgs::msg::LaserScan::ConstSharedPtr latest_scan_;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_pointcloud_;
   std::optional<nav_msgs::msg::OccupancyGrid> previous_raw_grid_;
   // 没收到语义地图时 receiver_.map() 是空图（valid() == false），所有隧道查询退化成
   // 「没有隧道」，行为与改动前完全一致。
@@ -549,6 +560,7 @@ private:
   rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr raw_costmap_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PolygonStamped>::SharedPtr footprint_pub_;

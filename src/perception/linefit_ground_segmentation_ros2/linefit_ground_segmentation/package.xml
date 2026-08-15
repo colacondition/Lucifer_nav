@@ -11,8 +11,8 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>eigen</depend>
-  <depend>pcl_ros</depend>
-  <depend>pcl_conversions</depend>
+  <!-- 核心只用裸 PCL（common/visualization），不依赖 ROS 侧 pcl_ros/pcl_conversions -->
+  <depend>libpcl-all-dev</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 

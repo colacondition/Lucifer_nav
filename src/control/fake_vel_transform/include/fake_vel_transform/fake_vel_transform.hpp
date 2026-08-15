@@ -1,14 +1,11 @@
 #ifndef FAKE_VEL_TRANSFORM__FAKE_VEL_TRANSFORM_HPP_
 #define FAKE_VEL_TRANSFORM__FAKE_VEL_TRANSFORM_HPP_
 
-#include <message_filters/subscriber.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/create_timer_ros.h>
-#include <tf2_ros/message_filter.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 
-#include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -29,7 +26,7 @@ public:
 private:
   void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
 
-  void localPoseCallback(const nav_msgs::msg::Path::SharedPtr msg);
+  void localPoseCallback(const nav_msgs::msg::Path::ConstSharedPtr msg);
 
   void publishTransform();
 
@@ -48,7 +45,6 @@ private:
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   MonotonicStampGate tf_stamp_gate_;
 
-  geometry_msgs::msg::PoseStamped planner_local_pose_;
   double current_angle_{0.0};
   double base_link_angle_{0.0};
   float angular_deadband_{0.05F};

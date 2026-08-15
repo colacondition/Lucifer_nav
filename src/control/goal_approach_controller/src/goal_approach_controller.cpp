@@ -61,19 +61,22 @@ public:
       std::bind(&GoalApproachControllerNode::cmdCallback, this, std::placeholders::_1));
     path_sub_ = create_subscription<nav_msgs::msg::Path>(
       path_topic_, rclcpp::QoS(1).reliable(),
-      [this](const nav_msgs::msg::Path::SharedPtr msg) {
+      [this](nav_msgs::msg::Path::ConstSharedPtr msg) {
         if (!msg || msg->poses.empty()) {
           goal_.reset();
+          goal_transform_dirty_ = true;
           return;
         }
         goal_ = msg->poses.back();
         if (goal_->header.frame_id.empty()) {
           goal_->header.frame_id = msg->header.frame_id.empty() ? global_frame_ : msg->header.frame_id;
         }
+        // 目标变了，下次 cmd 回调时重算一次全局系目标。
+        goal_transform_dirty_ = true;
       });
     approach_enabled_sub_ = create_subscription<std_msgs::msg::Bool>(
       approach_enabled_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
-      [this](const std_msgs::msg::Bool::SharedPtr msg) {
+      [this](std_msgs::msg::Bool::ConstSharedPtr msg) {
         approach_enabled_ = msg->data;
         RCLCPP_INFO(
           get_logger(), "Goal approach controller %s",
@@ -131,7 +134,7 @@ private:
     }
   }
 
-  void cmdCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+  void cmdCallback(const geometry_msgs::msg::Twist::ConstSharedPtr msg)
   {
     geometry_msgs::msg::Twist cmd = *msg;
     if (!approach_enabled_) {
@@ -143,15 +146,25 @@ private:
       return;
     }
 
+    // 目标变换只在换路径/换目标时重算一次（此前每条 cmd_vel 都做两次 TF 查询，
+    // 30Hz 下是纯浪费；目标在 map 系时 transformGoal 本就是恒等，但省掉缓存
+    // 失效后的重复查询在 100Hz 底盘指令下仍有意义）。
+    if (goal_transform_dirty_) {
+      goal_transform_dirty_ = false;
+      if (!transformGoal(*goal_, cached_goal_in_global_)) {
+        cmd_pub_->publish(cmd);
+        return;
+      }
+    }
+
     geometry_msgs::msg::PoseStamped robot_pose;
-    geometry_msgs::msg::PoseStamped goal_pose;
-    if (!getRobotPose(robot_pose) || !transformGoal(*goal_, goal_pose)) {
+    if (!getRobotPose(robot_pose)) {
       cmd_pub_->publish(cmd);
       return;
     }
 
-    const double dx = goal_pose.pose.position.x - robot_pose.pose.position.x;
-    const double dy = goal_pose.pose.position.y - robot_pose.pose.position.y;
+    const double dx = cached_goal_in_global_.pose.position.x - robot_pose.pose.position.x;
+    const double dy = cached_goal_in_global_.pose.position.y - robot_pose.pose.position.y;
     const double dist = std::hypot(dx, dy);
 
     if (dist <= goal_tolerance_) {
@@ -194,6 +207,9 @@ private:
   bool approach_enabled_{true};
 
   std::optional<geometry_msgs::msg::PoseStamped> goal_;
+  // 全局系目标缓存：只在换目标时重算（cmd 回调只查一次机器人位姿）。
+  geometry_msgs::msg::PoseStamped cached_goal_in_global_;
+  bool goal_transform_dirty_{true};
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr approach_enabled_sub_;

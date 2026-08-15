@@ -14,29 +14,17 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define termios asmtermios
-#include <asm/termios.h>
-#undef termios
 #include <termios.h>
 
 namespace serial_driver
 {
-  extern "C" int ioctl(int d, int request, ...);
-
   Port::Port(std::shared_ptr<SerialConfig> ptr) { config = ptr; }
 
   bool Port::init()
   {
     struct termios newtio;
-    struct termios oldtio;
     bzero(&newtio, sizeof(newtio));
-    bzero(&oldtio, sizeof(oldtio));
 
-    if (tcgetattr(fd, &oldtio) != 0)
-    {
-      perror("tcgetattr");
-      return false;
-    }
     newtio.c_cflag |= CLOCAL | CREAD;
     newtio.c_cflag &= ~CSIZE;
 
@@ -111,8 +99,33 @@ namespace serial_driver
     else
       newtio.c_cflag &= ~CRTSCTS;
 
-    newtio.c_cc[VTIME] = 10; /* Time-out value (tenths of a second) [!ICANON]. */
-    newtio.c_cc[VMIN] = 0;   /* Minimum number of bytes read at once [!ICANON]. */
+    // 只用标准 POSIX 波特率：不再走 asm/termios + ioctl(TCGETS2/TCSETS2) 的
+    // 非标波特率 hack（旧实现只为支持 961200，而实际配置是 115200，hack 从未
+    // 生效过，还让代码依赖内核头文件）。端口是非阻塞读（O_NONBLOCK），
+    // VMIN/VTIME 不生效，无需设置。
+    speed_t speed;
+    switch (config->baudrate)
+    {
+    case 9600: speed = B9600; break;
+    case 19200: speed = B19200; break;
+    case 38400: speed = B38400; break;
+    case 57600: speed = B57600; break;
+    case 115200: speed = B115200; break;
+    case 230400: speed = B230400; break;
+    case 460800: speed = B460800; break;
+    case 500000: speed = B500000; break;
+    case 921600: speed = B921600; break;
+    default:
+      fprintf(
+        stderr,
+        "unsupported baud rate %d: use a standard POSIX rate "
+        "(9600/19200/38400/57600/115200/230400/460800/500000/921600)\n",
+        config->baudrate);
+      return false;
+    }
+    cfsetispeed(&newtio, speed);
+    cfsetospeed(&newtio, speed);
+
     tcflush(fd, TCIOFLUSH);
 
     if (tcsetattr(fd, TCSANOW, &newtio) != 0)
@@ -121,62 +134,24 @@ namespace serial_driver
       return false;
     }
 
-    struct termios2 tio;
-
-    if (ioctl(fd, TCGETS2, &tio))
-    {
-      perror("TCGETS2");
-      return false;
-    }
-
-    tio.c_cflag &= ~CBAUD;
-    tio.c_cflag |= BOTHER;
-    tio.c_ispeed = config->baudrate;
-    tio.c_ospeed = config->baudrate;
-
-    if (ioctl(fd, TCSETS2, &tio))
-    {
-      perror("TCSETS2");
-      return false;
-    }
-
-    if (ioctl(fd, TCGETS2, &tio))
-    {
-      perror("TCGETS2");
-      return false;
-    }
     isinit = true;
-    return true;
-  }
-
-  bool Port::setPermission(const std::string & name)
-  {
-    std::string cmd = "sudo chmod 777 " + name;
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (!pipe)
-    {
-      std::cerr << "Failed to run permission command for " << name << std::endl;
-      return false;
-    }
-    const int rc = pclose(pipe);
-    if (rc != 0)
-    {
-      std::cerr << "Permission command failed for " << name
-                << " with code " << rc << std::endl;
-      return false;
-    }
     return true;
   }
 
   int Port::openPort()
   {
     auto try_open = [this](const std::string & device_name) {
-        setPermission(device_name);
         fd = open(device_name.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
         if (fd < 0)
         {
           std::cerr << "open device failed: " << device_name
                     << " error=" << strerror(errno) << std::endl;
+          if (errno == EACCES || errno == EPERM) {
+            // 不再 sudo chmod：权限归 udev/dialout 组管。
+            std::cerr << "Permission denied on " << device_name
+                      << " — add the user to the 'dialout' group or install a udev rule "
+                      << "(e.g. KERNEL==\"ttyACM*\", MODE=\"0666\")." << std::endl;
+          }
           isopen = false;
           return false;
         }
@@ -295,7 +270,13 @@ namespace serial_driver
 
   bool Port::isPortOpen() { return isopen; }
 
-  Port::~Port() {}
+  Port::~Port() {
+    // 节点/容器卸载时关掉还开着的 fd：旧实现析构为空，端口只靠 closePort()
+    // 显式关闭，每次重启组件都会泄漏一个 fd。
+    if (fd >= 0) {
+      closePort();
+    }
+  }
   SerialConfig::~SerialConfig() {}
 
 } // namespace serial_driver

@@ -12,7 +12,7 @@
 #include <gazebo/plugins/RayPlugin.hh>
 #include <gazebo_ros/node.hpp>
 #include "sensor_msgs/msg/point_cloud2.hpp"
-#include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <ros2_livox_simulation/msg/custom_msg.hpp>
 
 #include "livox_ode_multiray_shape.h"
 
@@ -104,7 +104,7 @@ namespace gazebo
 
       gazebo_ros::Node::SharedPtr node_;
       rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud2_pub;
-      rclcpp::Publisher<livox_ros_driver2::msg::CustomMsg>::SharedPtr custom_pub;
+      rclcpp::Publisher<ros2_livox_simulation::msg::CustomMsg>::SharedPtr custom_pub;
       
       std::string parent_name;
       std::string child_name;

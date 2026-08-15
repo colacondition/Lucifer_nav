@@ -110,7 +110,7 @@ source install/setup.bash
 ros2 launch navigation2 bringup.launch.py \
   use_sim_time:=True \
   map:=/home/cola/Lucifer_nav/src/bringup/map/RMUL.msgpack \
-  params_file:=/home/cola/Lucifer_nav/src/bringup/config/navigation2.yaml
+  params_file:=/home/cola/Lucifer_nav/src/navigation/navigation2/params/navigation2.yaml
 ```
 
 
@@ -118,10 +118,10 @@ ros2 launch navigation2 bringup.launch.py \
 ros2 launch navigation2 bringup.launch.py start_map_server:=False
 ```
 
-队内主调参文件：
+队内主调参文件（唯一真源；bringup 的 launch 也显式加载这一份）：
 
 ```text
-src/bringup/config/navigation2.yaml
+src/navigation/navigation2/params/navigation2.yaml
 ```
 
 ## 测试

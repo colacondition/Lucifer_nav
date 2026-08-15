@@ -32,12 +32,18 @@ public:
       "deadband_velocity", std::vector<double>{0.0, 0.0, 0.0}), {0.0, 0.0, 0.0});
 
     // 订阅输入速度，输出平滑速度。
+    // mt 容器下订阅与定时器共享 last_cmd_time_/latest cmd，串行化。
+    cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions sub_options;
+    sub_options.callback_group = cb_group_;
+
     cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       input_topic_, rclcpp::QoS(1),
-      [this](geometry_msgs::msg::Twist::SharedPtr msg) {
+      [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
         target_cmd_ = *msg;
         last_cmd_time_ = now();
-      });
+      },
+      sub_options);
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(output_topic_, rclcpp::QoS(1));
 
     const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, smoothing_frequency_));
@@ -45,7 +51,8 @@ public:
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
       [this]() {
         update();
-      });
+      },
+      cb_group_);
 
     RCLCPP_INFO(
       get_logger(), "rm_velocity_smoother ready: %s -> %s", input_topic_.c_str(),
@@ -127,6 +134,7 @@ private:
   rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

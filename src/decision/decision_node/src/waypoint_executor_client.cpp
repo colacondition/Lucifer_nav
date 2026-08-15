@@ -21,9 +21,11 @@ void WaypointExecutorClient::setRosInterfaces(
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr executor_waypoints_pub,
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr saved_waypoint_file_pub,
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr direct_goal_pub,
-  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr follow_client,
-  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr through_client)
+  rclcpp_action::Client<FollowWaypoints>::SharedPtr follow_client,
+  rclcpp_action::Client<FollowWaypoints>::SharedPtr through_client)
 {
+  // 前两个发布器保留给 RViz 面板（override 高亮 / 当前文件显示），
+  // 执行器的数据通路已经走 action。
   executor_waypoints_pub_ = std::move(executor_waypoints_pub);
   saved_waypoint_file_pub_ = std::move(saved_waypoint_file_pub);
   direct_goal_pub_ = std::move(direct_goal_pub);
@@ -34,6 +36,11 @@ void WaypointExecutorClient::setRosInterfaces(
 void WaypointExecutorClient::setActiveTarget(TargetName target)
 {
   state_.active_target = target;
+}
+
+void WaypointExecutorClient::setResultCallback(std::function<void(TargetName, bool)> callback)
+{
+  result_callback_ = std::move(callback);
 }
 
 void WaypointExecutorClient::setRunningTarget(
@@ -48,81 +55,36 @@ void WaypointExecutorClient::setRunningTarget(
   state_.last_send_time_sec = now_sec;
 }
 
-std::optional<TargetName> WaypointExecutorClient::targetForStatus(
+WaypointExecutorState WaypointExecutorClient::applyExecutorResult(
+  TargetName target,
   TargetMode mode,
-  const std::string & status)
+  bool success,
+  double now_sec)
 {
-  const bool matches_in_flight =
-    start_request_in_flight_ && start_request_mode_ == mode;
-  if (status == "RUNNING" && matches_in_flight) {
-    handoff_request_generation_ = start_request_generation_;
-    return start_request_target_;
+  // 结果只对「当前仍在跑的目标」生效：被抢占的旧目标晚到的结果直接忽略。
+  const bool matches_running =
+    state_.running_target == target && state_.running_mode == mode;
+  if (!matches_running) {
+    return state_;
   }
-  const bool is_terminal = status == "COMPLETED" || status == "ABORTED";
-  if (is_terminal && matches_in_flight &&
-    handoff_request_generation_ == start_request_generation_)
-  {
-    return start_request_target_;
+
+  auto updated = state_;
+  if (success) {
+    updated.result_status = ExecutorResultStatus::Succeeded;
+    updated.last_goal_success_time_sec = now_sec;
+  } else {
+    updated.result_status = ExecutorResultStatus::Aborted;
   }
-  if (state_.running_target.has_value() && state_.running_mode == mode) {
-    return state_.running_target;
-  }
-  if (matches_in_flight) {
-    return start_request_target_;
-  }
-  return std::nullopt;
+  updated.running_target.reset();
+  updated.running_mode.reset();
+  state_ = updated;
+  return state_;
 }
 
 bool WaypointExecutorClient::shouldPreemptImmediately(TargetName target) const
 {
   (void)state_;
   return target == TargetName::Home || target == TargetName::WaitHome;
-}
-
-WaypointExecutorState WaypointExecutorClient::onExecutorStatus(
-  TargetName target,
-  TargetMode mode,
-  const std::string & status,
-  double now_sec)
-{
-  const bool matches_running =
-    state_.running_target == target && state_.running_mode == mode;
-  const bool matches_in_flight =
-    start_request_in_flight_ && start_request_target_ == target && start_request_mode_ == mode;
-  if (!matches_running && !matches_in_flight) {
-    return state_;
-  }
-
-  auto updated = state_;
-  if (status == "COMPLETED") {
-    updated.result_status = ExecutorResultStatus::Succeeded;
-    updated.running_target.reset();
-    updated.running_mode.reset();
-    updated.last_goal_success_time_sec = now_sec;
-  } else if (status == "ABORTED") {
-    updated.result_status = ExecutorResultStatus::Aborted;
-    updated.running_target.reset();
-    updated.running_mode.reset();
-  } else {
-    updated.result_status = ExecutorResultStatus::Unknown;
-  }
-
-  if (matches_in_flight && (status == "COMPLETED" || status == "ABORTED")) {
-    terminal_request_generation_ = start_request_generation_;
-    if (handoff_request_generation_ == start_request_generation_) {
-      handoff_request_generation_.reset();
-    }
-  }
-  if (state_.active_target == target) {
-    state_ = updated;
-    return state_;
-  }
-  if (matches_running) {
-    state_.running_target.reset();
-    state_.running_mode.reset();
-  }
-
-  return updated;
 }
 
 bool WaypointExecutorClient::needMaintainReissue(
@@ -197,71 +159,107 @@ bool WaypointExecutorClient::stepExecutorTarget(
   if (mode != TargetMode::ExecutorFollow && mode != TargetMode::ExecutorThrough) {
     return false;
   }
-  if (!executor_waypoints_pub_ || !saved_waypoint_file_pub_ || waypoints.empty()) {
-    return false;
-  }
-  if (start_request_in_flight_ && !immediate_preempt) {
+  if (waypoints.empty()) {
     return false;
   }
 
-  const bool pending_matches = pending_target_ == target && pending_mode_ == mode;
-  if (!pending_matches) {
-    executor_waypoints_pub_->publish(buildPathMessage(waypoints));
-    if (immediate_preempt && direct_goal_pub_) {
-      direct_goal_pub_->publish(buildPoseStamped(waypoints.front()));
-    }
-
-    std_msgs::msg::String file_msg;
-    file_msg.data = waypoint_file;
-    saved_waypoint_file_pub_->publish(file_msg);
-
-    pending_target_ = target;
-    pending_mode_ = mode;
-    pending_since_sec_ = now_sec;
-    state_.active_target = target;
-    state_.result_status = ExecutorResultStatus::None;
-    if (!immediate_preempt) {
-      return false;
-    }
-  }
-
-  if (start_request_in_flight_) {
+  auto client = actionClient(mode);
+  if (!client || !client->action_server_is_ready()) {
     return false;
   }
 
-  if (!immediate_preempt &&
-    now_sec - pending_since_sec_ < config_.waypoint_executor.start_delay_sec)
+  // 旧 Trigger 实现靠 generation 关联 in-flight 请求，必须挡住重复下发；
+  // action 模型里「发新目标」本身就是抢占手段（服务器停旧任务跑新任务），
+  // 挡在这里会让非 Home 目标永远无法打断正在执行的任务（决策卡死）。
+  //
+  // 防抖只作用于「同目标的重复重试」：切目标（抢占）必须立刻发出。
+  const bool target_changed =
+    state_.running_target != target || state_.running_mode != mode;
+  if (!immediate_preempt && !target_changed &&
+    now_sec - state_.last_send_time_sec < config_.retry_interval_sec)
   {
     return false;
   }
-  if (!immediate_preempt && now_sec - state_.last_send_time_sec < config_.retry_interval_sec) {
-    return false;
+
+  // 面板兼容：发布 override 航点与文件（旧 Trigger 通路仍依赖这两个话题，
+  // RViz 面板也显示它们）；执行器本体走 action。
+  const auto path_msg = buildPathMessage(waypoints);
+  if (executor_waypoints_pub_) {
+    executor_waypoints_pub_->publish(path_msg);
+  }
+  if (saved_waypoint_file_pub_ && !waypoint_file.empty()) {
+    std_msgs::msg::String file_msg;
+    file_msg.data = waypoint_file;
+    saved_waypoint_file_pub_->publish(file_msg);
+  }
+  if (immediate_preempt && direct_goal_pub_) {
+    // Home 型目标：先把第一个航点直接发给导航，不等执行器起跑。
+    direct_goal_pub_->publish(buildPoseStamped(waypoints.front()));
   }
 
-  // 每次真正下发前重发航点路径：pending 延迟、跨话题乱序、以及同目标再次下发
-  // 时 pending 已匹配而不再重发，都会让下游 follow executor 的 override 过期。
-  // 重发保证它始终采用本次这组点，而不是回退到编辑器当前航点（如 patrol 全部点）。
-  executor_waypoints_pub_->publish(buildPathMessage(waypoints));
-
-  auto client = serviceClient(mode);
-  if (!client || !client->wait_for_service(std::chrono::seconds(0))) {
-    return false;
-  }
-
-  start_request_in_flight_ = true;
   state_.last_send_time_sec = now_sec;
-  start_request_target_ = target;
-  start_request_mode_ = mode;
-  start_request_generation_ = ++next_start_request_generation_;
-  handoff_request_generation_.reset();
-  const auto request_id = start_request_generation_;
-  const auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
-  client->async_send_request(
-    request,
-    [this, target, mode, now_sec, request_id](
-      rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
-      onStartResponse(target, mode, now_sec, request_id, std::move(future));
-    });
+  state_.active_target = target;
+  state_.result_status = ExecutorResultStatus::None;
+
+  auto goal = FollowWaypoints::Goal();
+  goal.waypoints = path_msg;
+
+  auto options = rclcpp_action::Client<FollowWaypoints>::SendGoalOptions();
+  options.goal_response_callback =
+    [this, target, mode, now_sec](
+      std::shared_ptr<GoalHandleFollowWaypoints> goal_handle) {
+      try {
+      if (!goal_handle) {
+        // 被拒绝：目标/航点无效，视为一次失败但不重置 running（可能仍在跑旧目标）。
+        if (state_.active_target == target && state_.result_status == ExecutorResultStatus::None) {
+          state_.result_status = ExecutorResultStatus::Aborted;
+        }
+        return;
+      }
+      active_goal_handle_ = goal_handle;
+      setRunningTarget(target, mode, now_sec);
+      } catch (const std::exception & ex) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("decision"), "goal_response_callback threw: %s", ex.what());
+      } catch (...) {
+        RCLCPP_ERROR(rclcpp::get_logger("decision"), "goal_response_callback threw");
+      }
+    };
+  options.result_callback =
+    [this, target, mode](const rclcpp_action::ClientGoalHandle<FollowWaypoints>::WrappedResult & wrapped) {
+      try {
+      // 只认最新的 goal：被抢占的旧目标晚到的结果不能覆盖新目标的状态。
+      if (!active_goal_handle_ ||
+        wrapped.goal_id != active_goal_handle_->get_goal_id())
+      {
+        return;
+      }
+      goal_in_flight_ = false;
+      active_goal_handle_.reset();
+      const bool success = wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+        wrapped.result && wrapped.result->success;
+      // 只把「确实应用到当前目标」的结果喂给状态机：被抢占的旧目标晚到的
+      // canceled 结果不能误报成一个 Aborted 事件。
+      const bool matches_running =
+        state_.running_target == target && state_.running_mode == mode;
+      if (matches_running) {
+        applyExecutorResult(
+          target, mode, success,
+          rclcpp::Clock(RCL_SYSTEM_TIME).now().seconds());
+        if (result_callback_) {
+          result_callback_(target, success);
+        }
+      }
+      } catch (const std::exception & ex) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("decision"), "result_callback threw: %s", ex.what());
+      } catch (...) {
+        RCLCPP_ERROR(rclcpp::get_logger("decision"), "result_callback threw");
+      }
+    };
+
+  goal_in_flight_ = true;
+  client->async_send_goal(goal, options);
   return true;
 }
 
@@ -295,8 +293,8 @@ geometry_msgs::msg::PoseStamped WaypointExecutorClient::buildPoseStamped(const P
   return msg;
 }
 
-rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr WaypointExecutorClient::serviceClient(
-  TargetMode mode) const
+rclcpp_action::Client<WaypointExecutorClient::FollowWaypoints>::SharedPtr
+WaypointExecutorClient::actionClient(TargetMode mode) const
 {
   if (mode == TargetMode::ExecutorFollow) {
     return follow_client_;
@@ -305,54 +303,6 @@ rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr WaypointExecutorClient::servic
     return through_client_;
   }
   return nullptr;
-}
-
-void WaypointExecutorClient::onStartResponse(
-  TargetName target,
-  TargetMode mode,
-  double request_time_sec,
-  std::uint64_t request_id,
-  rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future)
-{
-  if (!start_request_in_flight_ || request_id != start_request_generation_) {
-    return;
-  }
-
-  const bool pending_matches_request = pending_target_ == target && pending_mode_ == mode;
-  const bool terminal_received = terminal_request_generation_ == request_id;
-  start_request_in_flight_ = false;
-  start_request_target_.reset();
-  start_request_mode_.reset();
-  start_request_generation_ = 0;
-  handoff_request_generation_.reset();
-  if (terminal_received) {
-    terminal_request_generation_.reset();
-  }
-  if (pending_matches_request) {
-    pending_target_.reset();
-    pending_mode_.reset();
-    pending_since_sec_ = -1.0e9;
-  }
-
-  try {
-    const auto response = future.get();
-    if (!response->success) {
-      if (pending_matches_request && !terminal_received) {
-        state_.result_status = ExecutorResultStatus::Aborted;
-      }
-      return;
-    }
-  } catch (const std::exception &) {
-    if (pending_matches_request && !terminal_received) {
-      state_.result_status = ExecutorResultStatus::Unknown;
-    }
-    return;
-  }
-
-  if (terminal_received || !pending_matches_request) {
-    return;
-  }
-  setRunningTarget(target, mode, request_time_sec);
 }
 
 double WaypointExecutorClient::distance(const Pose & a, const Pose & b) const

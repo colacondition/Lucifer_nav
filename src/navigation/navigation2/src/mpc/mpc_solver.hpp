@@ -33,12 +33,15 @@ public:
   // 释放 OSQP 资源。
   ~MpcSolver() { cleanup(); }
 
-  // 重新装配一组参数。
+  // 重新装配一组参数。P/A 的稀疏结构与数值只依赖参数（与 xref/x_init 无关），
+  // 在这里一次性建好；solve() 热路径只更新线性项与边界。
   void configure(const MpcParams & p)
   {
     params_ = p;
     cleanup();
     setup_done_ = false;
+    buildHessian();                                   // P
+    buildConstraintMatrix();                          // A、ncon_
   }
 
   // 输入参考轨迹，输出每步的速度序列。
@@ -54,9 +57,7 @@ public:
     const int dimu = 2 * steps;
     const int nx = dimx + dimu;
 
-    buildHessian();                                   // P（固定稀疏结构）
     buildGradient(xref, uref);                        // q
-    buildConstraintMatrix();                          // A（固定稀疏结构）
     buildBounds(x_init, turtle);                      // l, u
 
     if (!setup_done_) {
@@ -265,6 +266,13 @@ private:
     settings_->eps_rel = 1e-4;
 
     if (osqp_setup(&work_, data_, settings_) != 0) {
+      // osqp_setup 失败：OSQP 自行清理半成品 workspace，但 data_/settings_ 和
+      // 两个 csc 结构体是我们分配的，必须在这里释放——否则每次重试（configure
+      // 后再次 solve）都会泄漏两份内存。
+      if (P_csc_) { c_free(P_csc_); P_csc_ = nullptr; }
+      if (A_csc_) { c_free(A_csc_); A_csc_ = nullptr; }
+      if (data_) { c_free(data_); data_ = nullptr; }
+      if (settings_) { c_free(settings_); settings_ = nullptr; }
       work_ = nullptr;
       return false;
     }

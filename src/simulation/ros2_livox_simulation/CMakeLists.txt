@@ -12,14 +12,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 ## Find dependencies ##
 #######################
 find_package(ament_cmake_auto REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(gazebo_dev REQUIRED)
 find_package(gazebo_ros REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
-find_package(livox_ros_driver2 REQUIRED)
 find_package(Boost REQUIRED COMPONENTS chrono)
+find_package(Protobuf REQUIRED)
 ament_auto_find_build_dependencies()
+
+# CustomMsg/CustomPoint：原定义来自 livox_ros_driver2（官方驱动包已整体移除，
+# 实车由 mid360_driver 直发 PointCloud2），收编进本包给仿真插件保留话题兼容层。
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/CustomMsg.msg"
+  "msg/CustomPoint.msg"
+  DEPENDENCIES std_msgs
+)
 
 ###########
 ## Build ##
@@ -40,8 +50,9 @@ ament_auto_add_library(ros2_livox SHARED
 target_link_libraries(ros2_livox
     RayPlugin
     GpuRayPlugin
-    libprotobuf.so.9
-    libboost_chrono.so.1.71.0
+    ${Boost_LIBRARIES}
+    ${Protobuf_LIBRARIES}
+    ${PROJECT_NAME}__rosidl_typesupport_cpp
 )
 
 #############

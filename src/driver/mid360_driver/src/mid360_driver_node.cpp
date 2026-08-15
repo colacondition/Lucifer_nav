@@ -16,8 +16,10 @@ namespace mid360_driver {
 
     void LidarPublisher::ensure_initialized(rclcpp::Node &node, const std::string &lidar_topic, const std::string &imu_topic) {
         if (!is_initialized) {
-            pointcloud_publisher = node.create_publisher<sensor_msgs::msg::PointCloud2>(lidar_topic, 1000);
-            imu_publisher = node.create_publisher<sensor_msgs::msg::Imu>(imu_topic, 1000);
+            // 传感器流用 SensorDataQoS（best-effort）：丢一帧点云比 TCP 式重传堆队列
+            // 更健康。下游 small_glim / cpp_lidar_filter 的订阅同为 SensorDataQoS。
+            pointcloud_publisher = node.create_publisher<sensor_msgs::msg::PointCloud2>(lidar_topic, rclcpp::SensorDataQoS());
+            imu_publisher = node.create_publisher<sensor_msgs::msg::Imu>(imu_topic, rclcpp::SensorDataQoS());
             is_initialized = true;
         }
     }
@@ -34,8 +36,8 @@ namespace mid360_driver {
             lidar_ip_str.append(std::to_string(static_cast<int>(lidar_ip_bytes[2])));
             lidar_ip_str.push_back('_');
             lidar_ip_str.append(std::to_string(static_cast<int>(lidar_ip_bytes[3])));
-            pointcloud_publisher = node.create_publisher<sensor_msgs::msg::PointCloud2>(lidar_topic + lidar_ip_str, 1000);
-            imu_publisher = node.create_publisher<sensor_msgs::msg::Imu>(imu_topic + lidar_ip_str, 1000);
+            pointcloud_publisher = node.create_publisher<sensor_msgs::msg::PointCloud2>(lidar_topic + lidar_ip_str, rclcpp::SensorDataQoS());
+            imu_publisher = node.create_publisher<sensor_msgs::msg::Imu>(imu_topic + lidar_ip_str, rclcpp::SensorDataQoS());
             is_initialized = true;
         }
     }
@@ -69,55 +71,14 @@ namespace mid360_driver {
         if (points_to_publish.empty()) {
             return;
         }
-        double min_timestamp = std::numeric_limits<double>::max();
-        double max_timestamp = std::numeric_limits<double>::lowest();
-        for (const auto &point: points_to_publish) {
-            if (std::isfinite(point.timestamp)) {
-                min_timestamp = std::min(min_timestamp, point.timestamp);
-                max_timestamp = std::max(max_timestamp, point.timestamp);
-            }
-        }
-        if (!std::isfinite(min_timestamp) || !std::isfinite(max_timestamp)) {
-            return;
-        }
-        const double frame_time_span = max_timestamp - min_timestamp;
-        if (frame_time_span < 0.0 || frame_time_span > robustness_config.max_packet_time_span * 2.0) {
-            RCLCPP_WARN(
-                rclcpp::get_logger("mid360_driver"),
-                "drop point cloud with invalid timestamp span: min=%.6f max=%.6f span=%.6f points=%zu",
-                min_timestamp,
-                max_timestamp,
-                frame_time_span,
-                points_to_publish.size()
-            );
-            return;
-        }
 
-        std::vector<const Point *> valid_points;
-        valid_points.reserve(points_to_publish.size());
-        const double max_range2 = robustness_config.max_point_range * robustness_config.max_point_range;
-        for (const auto &point: points_to_publish) {
-            const double range2 = point.x * point.x + point.y * point.y + point.z * point.z;
-            if (std::isfinite(point.timestamp)
-                && std::isfinite(point.x)
-                && std::isfinite(point.y)
-                && std::isfinite(point.z)
-                && std::isfinite(point.intensity)
-                && range2 <= max_range2) {
-                valid_points.push_back(&point);
-            }
-        }
-        if (valid_points.empty()) {
-            return;
-        }
-
+        // 单遍：时间戳范围统计、合法性过滤、点写入一次完成（旧实现分三遍：
+        // min/max 扫描 → valid_points 指针扫描 → 写入扫描，每点 3 次搬运）。
+        // 按最坏情况预分配，写完截断（resize 缩容不搬数据）。
         sensor_msgs::msg::PointCloud2 msg;
-        msg.header.stamp.sec = static_cast<int32_t>(std::floor(min_timestamp));
-        msg.header.stamp.nanosec = static_cast<uint32_t>((min_timestamp - msg.header.stamp.sec) * 1e9);
         msg.header.frame_id = frame_id;
-        msg.width = static_cast<uint32_t>(valid_points.size());
         msg.height = 1;
-        msg.fields.reserve(4);
+        msg.fields.reserve(5);
         sensor_msgs::msg::PointField field;
         field.name = "x";
         field.offset = 0;
@@ -146,21 +107,56 @@ namespace mid360_driver {
         msg.fields.push_back(field);
         msg.is_bigendian = false;
         msg.point_step = 24;
+        msg.data.resize(points_to_publish.size() * msg.point_step);
+
+        const double max_range2 = robustness_config.max_point_range * robustness_config.max_point_range;
+        double min_timestamp = std::numeric_limits<double>::max();
+        double max_timestamp = std::numeric_limits<double>::lowest();
+        std::size_t valid_count = 0;
+        for (const auto &point: points_to_publish) {
+            if (std::isfinite(point.timestamp)) {
+                min_timestamp = std::min(min_timestamp, point.timestamp);
+                max_timestamp = std::max(max_timestamp, point.timestamp);
+            }
+            const double range2 = point.x * point.x + point.y * point.y + point.z * point.z;
+            if (!std::isfinite(point.timestamp)
+                || !std::isfinite(point.x)
+                || !std::isfinite(point.y)
+                || !std::isfinite(point.z)
+                || !std::isfinite(point.intensity)
+                || range2 > max_range2) {
+                continue;
+            }
+            const std::size_t offset = valid_count * msg.point_step;
+            std::memcpy(msg.data.data() + offset, &point.x, 4 * sizeof(float));
+            std::memcpy(msg.data.data() + offset + 16, &point.timestamp, sizeof(double));
+            ++valid_count;
+        }
+
+        if (!std::isfinite(min_timestamp) || !std::isfinite(max_timestamp)) {
+            return;
+        }
+        const double frame_time_span = max_timestamp - min_timestamp;
+        if (frame_time_span < 0.0 || frame_time_span > robustness_config.max_packet_time_span * 2.0) {
+            RCLCPP_WARN(
+                rclcpp::get_logger("mid360_driver"),
+                "drop point cloud with invalid timestamp span: min=%.6f max=%.6f span=%.6f points=%zu",
+                min_timestamp,
+                max_timestamp,
+                frame_time_span,
+                points_to_publish.size()
+            );
+            return;
+        }
+        if (valid_count == 0) {
+            return;
+        }
+
+        msg.header.stamp.sec = static_cast<int32_t>(std::floor(min_timestamp));
+        msg.header.stamp.nanosec = static_cast<uint32_t>((min_timestamp - msg.header.stamp.sec) * 1e9);
+        msg.width = static_cast<uint32_t>(valid_count);
         msg.row_step = msg.width * msg.point_step;
         msg.data.resize(msg.row_step * msg.height);
-        auto* pointer = reinterpret_cast<float*>(msg.data.data());
-        for (const auto *point: valid_points) {
-            *pointer = point->x;
-            ++pointer;
-            *pointer = point->y;
-            ++pointer;
-            *pointer = point->z;
-            ++pointer;
-            *pointer = point->intensity;
-            ++pointer;
-            *reinterpret_cast<double *>(pointer) = point->timestamp;
-            pointer += 2;
-        }
         msg.is_dense = true;
         pointcloud_publisher->publish(msg);
     }

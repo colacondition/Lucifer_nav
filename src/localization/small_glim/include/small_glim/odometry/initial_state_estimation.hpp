@@ -13,15 +13,10 @@ namespace small_glim {
 /**
  * @brief Initial state estimator used by odometry subsystem.
  *
- * The estimator has two operating modes controlled by configuration:
- *   - graph-based (default): builds a small factor graph combining LiDAR
- *     odometry and IMU measurements to estimate initial pose, velocity, and
- *     biases.  This is the original, more sophisticated algorithm.
- *   - naive: when `odometry_estimation.naive_initialization` is true the
- *     estimator simply averages the direction of accelerations collected over
- *     the initialization window and assumes gravity-aligned z axis with zero
- *     initial position.  This mode is cheap and sufficient for many cases where
- *     the platform is stationary at startup.
+ * Estimates the initial state by averaging the direction of accelerations
+ * collected over the initialization window and assuming a gravity-aligned z
+ * axis with zero initial position.  This is cheap and sufficient for many
+ * cases where the platform is stationary at startup.
  */
 class InitialStateEstimation {
 public:

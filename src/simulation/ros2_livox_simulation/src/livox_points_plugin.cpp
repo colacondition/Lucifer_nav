@@ -13,8 +13,8 @@
 #include <gazebo/sensors/RaySensor.hh>
 #include <gazebo/transport/Node.hh>
 #include <gazebo_ros/node.hpp>
-#include <livox_ros_driver2/msg/custom_msg.hpp>
-#include <livox_ros_driver2/msg/custom_point.hpp>
+#include <ros2_livox_simulation/msg/custom_msg.hpp>
+#include <ros2_livox_simulation/msg/custom_point.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -142,10 +142,10 @@ namespace gazebo
 
         node = transport::NodePtr(new transport::Node());
         node->Init(raySensor->WorldName());
-        // PointCloud2 publisher
-        cloud2_pub = node_->create_publisher<sensor_msgs::msg::PointCloud2>(curr_scan_topic + "/pointcloud", 10);
+        // PointCloud2 publisher（SensorDataQoS 与实车 mid360_driver 一致）
+        cloud2_pub = node_->create_publisher<sensor_msgs::msg::PointCloud2>(curr_scan_topic + "/pointcloud", rclcpp::SensorDataQoS());
         // CustomMsg publisher
-        custom_pub = node_->create_publisher<livox_ros_driver2::msg::CustomMsg>(curr_scan_topic, 10);
+        custom_pub = node_->create_publisher<ros2_livox_simulation::msg::CustomMsg>(curr_scan_topic, rclcpp::SensorDataQoS());
 
         scanPub = node->Advertise<msgs::LaserScanStamped>(curr_scan_topic+"laserscan", 50);
 
@@ -222,7 +222,7 @@ namespace gazebo
 
         const auto stamp = node_->get_clock()->now();
 
-        std::optional<livox_ros_driver2::msg::CustomMsg> pp_livox;
+        std::optional<ros2_livox_simulation::msg::CustomMsg> pp_livox;
         if (publish_custom)
         {
             pp_livox.emplace();
@@ -269,7 +269,7 @@ namespace gazebo
 
             if (pp_livox)
             {
-                livox_ros_driver2::msg::CustomPoint p;
+                ros2_livox_simulation::msg::CustomPoint p;
                 p.x = static_cast<float>(point.X());
                 p.y = static_cast<float>(point.Y());
                 p.z = static_cast<float>(point.Z());

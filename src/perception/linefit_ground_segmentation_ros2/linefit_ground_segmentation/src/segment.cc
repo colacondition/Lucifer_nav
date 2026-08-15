@@ -1,5 +1,7 @@
 #include "ground_segmentation/segment.h"
 
+#include <cmath>
+
 Segment::Segment(const unsigned int& n_bins,
                  const double& min_slope,
                  const double& max_slope,
@@ -141,20 +143,29 @@ double Segment::getMaxError(const std::list<Bin::MinZPoint> &points, const Local
 }
 
 Segment::LocalLine Segment::fitLocalLine(const std::list<Bin::MinZPoint> &points) {
-  const unsigned int n_points = points.size();
-  Eigen::MatrixXd X(n_points, 2);
-  Eigen::VectorXd Y(n_points);
-  unsigned int counter = 0;
+  // 闭式最小二乘 z = a*d + b（2×2 正规方程手解）。每条线只有 3~6 个点，但每帧
+  // 要拟合上百次：旧的 MatrixXd 动态分配 + colPivHouseholderQr 是纯浪费。
+  double sum_d = 0.0;
+  double sum_z = 0.0;
+  double sum_d2 = 0.0;
+  double sum_dz = 0.0;
   for (auto iter = points.begin(); iter != points.end(); ++iter) {
-    X(counter, 0) = iter->d;
-    X(counter, 1) = 1;
-    Y(counter) = iter->z;
-    ++counter;
+    sum_d += iter->d;
+    sum_z += iter->z;
+    sum_d2 += iter->d * iter->d;
+    sum_dz += iter->d * iter->z;
   }
-  Eigen::VectorXd result = X.colPivHouseholderQr().solve(Y);
+  const double n = static_cast<double>(points.size());
+  const double denominator = n * sum_d2 - sum_d * sum_d;
   LocalLine line_result;
-  line_result.first = result(0);
-  line_result.second = result(1);
+  if (std::abs(denominator) < 1e-12) {
+    // 所有点的 d 几乎相同（竖直排列）：取 z 均值、斜率 0，与 QR 的病态行为一致。
+    line_result.first = 0.0;
+    line_result.second = sum_z / n;
+  } else {
+    line_result.first = (n * sum_dz - sum_d * sum_z) / denominator;
+    line_result.second = (sum_z - line_result.first * sum_d) / n;
+  }
   return line_result;
 }
 

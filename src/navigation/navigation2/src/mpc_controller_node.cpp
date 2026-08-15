@@ -320,7 +320,7 @@ public:
         {-r, -t}, {-t, -r}, { t, -r}, { r, -t}});
       esdf_obstacle_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         esdf_obstacle_topic_, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
           std::lock_guard<std::mutex> lk(mtx_);
           latest_esdf_obstacle_ = std::move(msg);
         });
@@ -344,7 +344,7 @@ public:
 
     path_sub_ = create_subscription<nav_msgs::msg::Path>(
       path_topic_, rclcpp::QoS(1).reliable(),
-      [this](nav_msgs::msg::Path::SharedPtr msg) {
+      [this](nav_msgs::msg::Path::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lk(mtx_);
         // 只有几何真的变了才算换路径：规划器未重规划时会原样重发。
         if (samePathGeometry(last_path_points_, *msg)) {
@@ -371,7 +371,7 @@ public:
       });
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       odom_topic_, rclcpp::SensorDataQoS(),
-      [this](nav_msgs::msg::Odometry::SharedPtr msg) {
+      [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lk(mtx_);
         odom_ = *msg;
         has_odom_ = true;
@@ -379,7 +379,7 @@ public:
     const auto costmap_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
     local_costmap_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       local_costmap_topic_, costmap_qos,
-      [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+      [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lk(mtx_);
         local_costmap_ = std::move(msg);
       });
@@ -390,7 +390,7 @@ public:
     // 「底盘实际收到什么」而不是「本节点想发什么」。
     executed_cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       executed_cmd_topic_, rclcpp::QoS(10),
-      [this](geometry_msgs::msg::Twist::SharedPtr msg) {
+      [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lk(mtx_);
         executed_speed_ = std::hypot(msg->linear.x, msg->linear.y);
         last_executed_cmd_time_ = now();
@@ -401,13 +401,13 @@ public:
     const auto posture_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
     gimbal_posture_sub_ = create_subscription<decision_interfaces::msg::GimbalPosture>(
       gimbal_posture_topic_, posture_qos,
-      [this](decision_interfaces::msg::GimbalPosture::SharedPtr msg) {
+      [this](decision_interfaces::msg::GimbalPosture::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lk(mtx_);
         gimbal_lower_requested_ = msg->lower;
       });
     gimbal_posture_state_sub_ = create_subscription<decision_interfaces::msg::GimbalPostureState>(
       gimbal_posture_state_topic_, posture_qos,
-      [this](decision_interfaces::msg::GimbalPostureState::SharedPtr msg) {
+      [this](decision_interfaces::msg::GimbalPostureState::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lk(mtx_);
         gimbal_lowered_ = msg->lowered;
         has_gimbal_state_ = true;
@@ -419,7 +419,7 @@ public:
       const auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
       semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
         semantic_map_topic_, map_qos,
-        [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+        [this](decision_interfaces::msg::SemanticMap::ConstSharedPtr msg) {
           std::lock_guard<std::mutex> lk(map_mutex_);
           try {
             if (receiver_.update(*msg)) {
@@ -493,7 +493,7 @@ private:
   {
     nav_msgs::msg::Odometry odom;
     mpc::PathReference ref;
-    nav_msgs::msg::OccupancyGrid::SharedPtr local_costmap;
+    nav_msgs::msg::OccupancyGrid::ConstSharedPtr local_costmap;
     bool ready;
     bool path_changed;
     bool goal_changed;
@@ -914,7 +914,7 @@ private:
   //
   // 返回 true 表示已转入恢复态，调用方应立即 return。
   bool handleVeto(
-    const nav_msgs::msg::OccupancyGrid::SharedPtr & costmap, const Eigen::Vector2d & pos,
+    const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap, const Eigen::Vector2d & pos,
     double dt, const char * reason)
   {
     publishStop();
@@ -961,7 +961,7 @@ private:
   }
 
   void runStuckReverse(
-    const nav_msgs::msg::OccupancyGrid::SharedPtr & costmap, const Eigen::Vector2d & pos,
+    const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap, const Eigen::Vector2d & pos,
     double yaw)
   {
     reverse_travelled_ += (pos - reverse_last_pos_).norm();
@@ -990,7 +990,7 @@ private:
   }
 
   void runHazardRecovery(
-    const nav_msgs::msg::OccupancyGrid::SharedPtr & costmap, const Eigen::Vector2d & pos,
+    const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap, const Eigen::Vector2d & pos,
     double yaw, double dt)
   {
     if (!costmap) {
@@ -1032,7 +1032,7 @@ private:
     }
   }
 
-  bool costmapFresh(const nav_msgs::msg::OccupancyGrid::SharedPtr & costmap) const
+  bool costmapFresh(const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap) const
   {
     if (!costmap) {
       return false;
@@ -1251,7 +1251,7 @@ private:
   double esdf_safety_margin_{0.04};
   int esdf_check_steps_{5};
   std::string esdf_obstacle_topic_;
-  sensor_msgs::msg::PointCloud2::SharedPtr latest_esdf_obstacle_;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_esdf_obstacle_;
 
   // 隧道限速窗口。语义地图在订阅回调里写、在 rebuildSpeedProfile 的窗口查询里读，
   // 两者可能不同线程（单容器多线程执行器），用独立的 map_mutex_ 护住 receiver_ ——
@@ -1269,7 +1269,7 @@ private:
   std::mutex mtx_;
   nav_msgs::msg::Odometry odom_;
   mpc::PathReference ref_;
-  nav_msgs::msg::OccupancyGrid::SharedPtr local_costmap_;
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr local_costmap_;
   bool has_path_ = false;
   bool has_odom_ = false;
   bool path_changed_ = false;

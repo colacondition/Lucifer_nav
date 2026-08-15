@@ -26,6 +26,7 @@ protected:
   std::thread view_thread_;
   std::mutex viewer_mutex_;
   std::atomic<bool> redraw_{true};
+  std::atomic<bool> stop_{false};
 
   void visualizeLines(const std::list<PointLine>& lines);
 

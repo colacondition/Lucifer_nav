@@ -39,6 +39,19 @@ public:
     RobotLocalizationNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
     ~RobotLocalizationNode();
 private:
+    // 此前是 .cpp 文件级全局：单实例侥幸安全，但生命周期脱离节点、多实例必串状态。
+    // 收编为成员（默认值与原全局初始化一致）。
+    std::mutex data_mutex_;
+    std::mutex tf_mutex_;
+    PointCloudXYZI::Ptr global_map_{std::make_shared<PointCloudXYZI>()};
+    PointCloudXYZI::Ptr cur_scan_{std::make_shared<PointCloudXYZI>()};
+    nav_msgs::msg::Odometry::SharedPtr cur_odom_{std::make_shared<nav_msgs::msg::Odometry>()};
+    Eigen::Matrix4f T_pcd_to_odom_{Eigen::Matrix4f::Identity()};
+    Eigen::Matrix4f initial_pcd_to_odom_{Eigen::Matrix4f::Identity()};
+    // 默认使用代码内置零位姿作为初始位姿
+    std::atomic<bool> initial_pose_received_{true};
+    bool initialized_{false};  // 系统是否已初始化
+
     Eigen::Matrix4f poseToMat(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
     Eigen::Matrix4f inverseSE3(const Eigen::Matrix4f &T);
     Eigen::Matrix4f runICP(PointCloudXYZI::Ptr src, PointCloudXYZI::Ptr tgt, const Eigen::Matrix4f &initial_guess, float voxel_scale, int max_iterations, float &fitness_score);
@@ -66,16 +79,6 @@ private:
         const nav_msgs::msg::Odometry &odom,
         float search_radius = -1.0f,
         bool publish_debug_cloud = true);
-
-    // 特征提取方法：提取边缘点和平面点
-    void extractFeatures(PointCloudXYZI::Ptr cloud,
-                         PointCloudXYZI::Ptr edge_features,
-                         PointCloudXYZI::Ptr planar_features,
-                         int num_neighbors = 10,
-                         float edge_threshold = 0.1,
-                         float planar_threshold = 0.01);
-
-
 
     void SubScan(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
     void SubOdom(const nav_msgs::msg::Odometry::SharedPtr msg);
@@ -129,7 +132,6 @@ private:
     float submap_voxel_size_first_;   // 首次定位子图体素尺寸（米）
     float submap_voxel_size_track_;   // 后续跟踪子图体素尺寸（米）
     float fov_far_;             // 视场内的最远距离（米）
-    float refine_fov_far_;      // 精细匹配子图半径（米）
     float localization_th_;     // ICP 匹配成功的阈值（内点比例）
     float first_localization_th_; // 首次匹配阈值（内点比例）
     // 条件数阈值：平移信息矩阵 XY 子块的 λ_max/λ_min 超过此值视为方向退化
@@ -166,7 +168,6 @@ private:
     int gicp_max_iterations_track_ = 20;
     bool publish_tf_ = true; // 是否发布 map->odom TF
     bool publish_map_to_odometry_ = false; // 是否发布 map_to_odometry 里程计话题
-    bool use_fast_gicp_ = false; // 预留参数：是否启用 fast_gicp
     bool use_cuda_ = false;      // 是否启用 GPU 加速
     int gicp_num_threads_ = 0;   // 预留参数：GICP 线程数
     bool enable_global_search_ = true;
@@ -201,8 +202,6 @@ private:
     std::deque<PointCloudXYZI::Ptr> scan_buffer_;
 
     // 性能优化相关
-    std::condition_variable initial_pose_cv_;  // 条件变量，用于等待初始位姿
-    PointCloudXYZI::Ptr accumulated_scan_;     // 累积的扫描点云
     std::unordered_map<int, PointCloudXYZI::Ptr> scan_downsample_cache_;  // 扫描点云下采样缓存
     std::unordered_map<int, PointCloudXYZI::Ptr> map_downsample_cache_;   // 地图点云下采样缓存
     sensor_msgs::msg::PointCloud2 global_map_msg_;

@@ -86,7 +86,6 @@ src/simulation/simulated_gimbal               仿真专用云台模拟器（顶�
 ```text
 launch/sim.launch.py                         仿真入口
 launch/real.launch.py                        实车入口
-config/navigation2.yaml                      导航参数（launch 实际加载的是这份）
 config/fast_location_main.yaml               定位参数
 config/mapper_params_online_async.yaml       slam_toolbox 建图参数（mapping 模式）
 config/{simulation,reality}/                 分环境的外参、分割、LIO 参数

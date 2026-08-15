@@ -63,7 +63,9 @@ def generate_launch_description():
         ' rpy:=', launch_params['base_link2livox_frame']['rpy'],
     ])
 
-    navigation_params = os.path.join(bringup_dir, 'config', 'navigation2.yaml')
+    # 导航参数唯一真源在 navigation2 包的 params/navigation2.yaml（launch 默认值同源）。
+    navigation_params = os.path.join(
+        get_package_share_directory('navigation2'), 'params', 'navigation2.yaml')
     fast_location_params = os.path.join(bringup_dir, 'config', 'fast_location_main.yaml')
     seg_params = os.path.join(bringup_dir, 'config', 'reality', 'segmentation_real.yaml')
     # slam_toolbox 建图参数，实车/仿真共用一份（HL 的 real/sim 两份 diff 为空）。
@@ -144,6 +146,7 @@ def generate_launch_description():
     # 不向雷达发配置命令：需事先用 Livox Viewer 2 把推流目标主机
     # (host_ip, 端口 56301/56401) 持久化写入雷达。话题/frame 等在 yaml 里。
     lidar_driver = Node(
+        respawn=True, respawn_delay=2.0,  # 驱动崩溃自愈（纯被动收包，无状态）
         package='mid360_driver',
         executable='mid360_driver_node',
         output=node_output,
@@ -157,6 +160,7 @@ def generate_launch_description():
     # 话题名（/Odometry、/lio/robo/odom、/Laser_map）直接在包内 params_node.yaml
     # 里按本工作区契约配置，无需 remap。参数顺序有意义：后面的覆盖前面的。
     lio_node = Node(
+        respawn=True, respawn_delay=2.0,  # LIO 崩溃自愈（无状态，重启重新初始化）
         package='small_glim',
         executable='small_glim_node',
         output='log',
@@ -185,6 +189,7 @@ def generate_launch_description():
 
     # ===== 4. 感知链 =====
     lidar_filter_node = Node(
+        respawn=True, respawn_delay=2.0,
         package='cpp_lidar_filter',
         executable='lidar_filter_node',
         name='lidar_filter',
@@ -200,6 +205,7 @@ def generate_launch_description():
         arguments=common_log_arguments)
 
     ground_seg_node = Node(
+        respawn=True, respawn_delay=2.0,
         package='linefit_ground_segmentation_ros',
         executable='ground_segmentation_node',
         name='ground_segmentation',
@@ -257,6 +263,7 @@ def generate_launch_description():
     # ===== 5. fast_location 主定位 =====
     fast_loc_node = Node(
         condition=LaunchConfigurationEquals('mode', 'nav'),
+        respawn=True, respawn_delay=2.0,  # 定位崩溃自愈（重载 PCD 重新初始化）
         package='fast_location',
         executable='robot_localization_node',
         name='robot_localization_node',
@@ -311,6 +318,7 @@ def generate_launch_description():
     # ===== 7. 速度转换 =====
     vel_transform_node = Node(
         condition=nav_condition,
+        respawn=True, respawn_delay=2.0,
         package='fake_vel_transform',
         executable='fake_vel_transform_node',
         name='fake_vel_transform',

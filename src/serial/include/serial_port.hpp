@@ -47,7 +47,6 @@ public:
   bool reopen();
   bool isPortInit();
   bool isPortOpen();
-  bool setPermission(const std::string & name);
 
   int transmit(uint8_t *buff, int writeSize);
   int receive(uint8_t *buffer);

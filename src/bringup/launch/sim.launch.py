@@ -64,7 +64,9 @@ def generate_launch_description():
         ' rpy:=', launch_params['base_link2livox_frame']['rpy'],
     ])
 
-    navigation_params = os.path.join(bringup_dir, 'config', 'navigation2.yaml')
+    # 导航参数唯一真源在 navigation2 包的 params/navigation2.yaml（launch 默认值同源）。
+    navigation_params = os.path.join(
+        get_package_share_directory('navigation2'), 'params', 'navigation2.yaml')
     fast_location_params = os.path.join(bringup_dir, 'config', 'fast_location_main.yaml')
     seg_params = os.path.join(bringup_dir, 'config', 'simulation', 'segmentation_sim.yaml')
     # slam_toolbox 建图参数，实车/仿真共用一份（HL 的 real/sim 两份 diff 为空）。

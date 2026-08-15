@@ -1,5 +1,4 @@
 #include "grid_utils.hpp"
-#include "rc_esdf.h"
 #include "minco/minco_optimizer.hpp"
 #include "semantic_map_consumer.hpp"
 
@@ -26,12 +25,12 @@ public:
     input_path_topic_ = declare_parameter<std::string>("input_path_topic", "/plan_raw");
     output_path_topic_ = declare_parameter<std::string>("output_path_topic", "/plan");
 
-    // MINCO 参数
+    // MINCO 参数。注意：障碍物避让不在平滑器里做——它曾把机器人多边形 SDF
+    // （2m×2m、中心在 map 原点）误当"到最近障碍距离"查询，路径点几乎总在界外，
+    // 障碍代价恒 0。避障由全局规划器 clearance 代价与 MPC 局部代价地图负责，
+    // 平滑器只管几何平滑 + 数据保持 + 隧道轴向对齐。
     smooth_weight_ = declare_parameter<double>("smooth_weight", 1.0);
-    obstacle_weight_ = declare_parameter<double>("obstacle_weight", 10.0);
     data_weight_ = declare_parameter<double>("data_weight", 10.0);
-    robot_radius_ = declare_parameter<double>("robot_radius", 1.0);
-    penalty_mu_ = declare_parameter<double>("penalty_mu", 0.4);
     enable_optimization_ = declare_parameter<bool>("enable_optimization", true);
     // 隧道内偏离轴线的软代价权重。收不到语义地图或图里没隧道时自动失效。
     tunnel_axis_weight_ = declare_parameter<double>("tunnel_axis_weight", 5.0);
@@ -42,43 +41,14 @@ public:
     default_velocity_ = declare_parameter<double>("default_velocity", 1.0);
     min_segment_time_ = declare_parameter<double>("min_segment_time", 0.1);
 
-    // RC-ESDF 参数
-    esdf_width_ = declare_parameter<double>("esdf_width", 2.0);
-    esdf_height_ = declare_parameter<double>("esdf_height", 2.0);
-    esdf_resolution_ = declare_parameter<double>("esdf_resolution", 0.05);
-
-    // 机器人外形（用于生成 RC-ESDF）
-    auto footprint = declare_parameter<std::vector<double>>(
-      "robot_footprint",
-      std::vector<double>{-0.3, -0.25, 0.3, -0.25, 0.3, 0.25, -0.3, 0.25});
-
-    // 解析机器人外形
-    robot_polygon_.clear();
-    for (size_t i = 0; i + 1 < footprint.size(); i += 2) {
-      robot_polygon_.emplace_back(footprint[i], footprint[i + 1]);
-    }
-
-    // 初始化 RC-ESDF
-    esdf_map_.initialize(esdf_width_, esdf_height_, esdf_resolution_);
-    esdf_map_.generateFromPolygon(robot_polygon_);
-
     // 初始化 MINCO 优化器
     minco_optimizer_ = std::make_unique<MincoOptimizer>();
     MincoOptimizer::Params params;
     params.smooth_weight = smooth_weight_;
-    params.obstacle_weight = obstacle_weight_;
     params.data_weight = data_weight_;
-    params.robot_radius = robot_radius_;
-    params.penalty_mu = penalty_mu_;
     params.tunnel_axis_weight = tunnel_axis_weight_;
     params.enable = enable_optimization_;
     minco_optimizer_->setParams(params);
-
-    // 设置 ESDF 查询函数
-    minco_optimizer_->setEsdfQuery(
-      [this](const Eigen::Vector2d & pos, double & dist, Eigen::Vector2d & grad) {
-        return esdf_map_.query(pos, dist, grad);
-      });
 
     // 隧道轴线查询：给 MINCO 的对齐软代价用。语义地图收不到时 receiver_.map() 无效，
     // tunnelAxisAtPoint 恒返回 false，对齐项自动失效。
@@ -93,7 +63,7 @@ public:
     auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
     semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
       semantic_map_topic_, map_qos,
-      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+      [this](decision_interfaces::msg::SemanticMap::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lk(map_mutex_);
         try {
           receiver_.update(*msg);
@@ -104,7 +74,7 @@ public:
 
     path_sub_ = create_subscription<nav_msgs::msg::Path>(
       input_path_topic_, rclcpp::QoS(1).reliable(),
-      [this](nav_msgs::msg::Path::SharedPtr msg) {
+      [this](nav_msgs::msg::Path::ConstSharedPtr msg) {
         smoothAndPublish(*msg);
       });
 
@@ -187,23 +157,13 @@ private:
   std::string output_path_topic_;
 
   double smooth_weight_;
-  double obstacle_weight_;
   double data_weight_;
-  double robot_radius_;
-  double penalty_mu_;
   double tunnel_axis_weight_;
   bool enable_optimization_;
   std::string semantic_map_topic_;
 
   double default_velocity_;
   double min_segment_time_;
-
-  double esdf_width_;
-  double esdf_height_;
-  double esdf_resolution_;
-
-  std::vector<Eigen::Vector2d> robot_polygon_;
-  RcEsdfMap esdf_map_;
 
   std::unique_ptr<MincoOptimizer> minco_optimizer_;
 

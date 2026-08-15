@@ -7,10 +7,8 @@
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam_points/types/point_cloud.hpp>
-#include <gtsam_points/types/gaussian_voxelmap.hpp>
 #include <gtsam_points/factors/linear_damping_factor.hpp>
 #include <gtsam_points/factors/integrated_gicp_factor.hpp>
-#include <gtsam_points/factors/integrated_vgicp_factor.hpp>
 #include <gtsam_points/optimizers/levenberg_marquardt_ext.hpp>
 #include <gtsam_points/optimizers/incremental_fixed_lag_smoother_with_fallback.hpp>
 #include <gtsam_points/ann/ivox.hpp>
@@ -54,14 +52,10 @@ public:
     int num_threads; // Number of threads for preprocessing and per-factor parallelism
 
     // Registration params
-    enum class RegistrationType { GICP, VGICP } registration_type; ///< Registration type (GICP or VGICP)
     int lru_thresh; ///< LRU cache threshold
     double target_downsampling_rate; ///< Downsampling rate for points to be inserted into the target
     double ivox_resolution; ///< iVox resolution (for GICP)
     double ivox_min_dist; ///< Minimum distance between points in an iVox cell (for GICP)
-    double vgicp_resolution; ///< Voxelmap resolution (for VGICP)
-    int vgicp_voxelmap_levels; ///< Multi-resolution voxelmap levesl (for VGICP)
-    double vgicp_voxelmap_scaling_factor; ///< Multi-resolution voxelmap scaling factor (for VGICP)
 
     // iVox delayed update & impact pause
     double ivox_update_delay; ///< Time delay before inserting frames into target map [sec]
@@ -111,7 +105,6 @@ private:
     // Registration target
     std::mt19937 mt; ///< RNG
     Eigen::Isometry3d last_T_target_imu; ///< Last IMU pose w.r.t. target model
-    std::vector<std::shared_ptr<gtsam_points::GaussianVoxelMapCPU>> target_voxelmaps; ///< VGICP target voxelmap
     std::shared_ptr<gtsam_points::iVox> target_ivox; ///< GICP target iVox
 
     // Delayed target map update

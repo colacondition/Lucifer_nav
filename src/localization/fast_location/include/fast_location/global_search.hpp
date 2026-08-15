@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
@@ -98,9 +99,10 @@ std::vector<Eigen::Matrix4f> generatePlanarCandidates(
   const Eigen::Matrix4f & odom_from_base,
   const GlobalSearchConfig & config);
 
-// 给每个候选位姿打分，分数越高越像当前扫描。
+// 给每个候选位姿打分，分数越高越像当前扫描。kdtree 由调用方传入并复用
+// （节点已持有全局图的 kd-tree，每次调用重建是 O(N log N) 的浪费）。
 std::vector<GlobalSearchCandidate> scoreGlobalCandidates(
-  const PointCloudXYZI::ConstPtr & global_map,
+  const pcl::KdTreeFLANN<Point> & kdtree,
   const PointCloudXYZI::ConstPtr & scan,
   const std::vector<Eigen::Matrix4f> & candidates,
   const GlobalSearchConfig & config);
@@ -113,7 +115,7 @@ std::vector<GlobalSearchCandidate> selectSeparatedCandidates(
 // 对已经入选的少量候选做一次精细打分(stride=1、距离更严),用于打破粗搜的粒度。
 // 只作用在 ~top_k 个候选上,几乎不增加总耗时。
 std::vector<GlobalSearchCandidate> refineCandidateScores(
-  const PointCloudXYZI::ConstPtr & global_map,
+  const pcl::KdTreeFLANN<Point> & kdtree,
   const PointCloudXYZI::ConstPtr & scan,
   const std::vector<GlobalSearchCandidate> & selected,
   const GlobalSearchConfig & config);

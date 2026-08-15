@@ -34,8 +34,10 @@ Viewer::Viewer() {
 
 
 Viewer::~Viewer() {
-  redraw_ = false;
-
+  // 先置 stop 再 close：drawThread 每轮只持锁 spinOnce 一次就放锁，close 总能
+  // 拿到锁；stop_ 保证循环退出、join 必返回（旧实现 spin 循环持锁不撒手，
+  // 析构与 visualize 都可能永久卡在抢锁上，进程关停时挂起）。
+  stop_ = true;
   {
     std::lock_guard<std::mutex> lock(viewer_mutex_);
     viewer_.close();
@@ -58,6 +60,8 @@ void Viewer::visualize(const std::list<PointLine>& lines,
   visualizePointCloud(ground_cloud, "ground_cloud");
   visualizePointCloud(obstacle_cloud, "obstacle_cloud");
   visualizeLines(lines);
+  // 数据换完，恢复绘制。
+  redraw_ = true;
 }
 
 
@@ -85,17 +89,20 @@ void Viewer::addEmptyPointCloud(const std::string& id) {
 
 
 void Viewer::drawThread() {
-  bool stopped = false;
-  while (!stopped) {
-    {
-      std::lock_guard<std::mutex> lock(viewer_mutex_);
-      redraw_ = true;
-      while (redraw_) {
+  while (!stop_) {
+    if (redraw_) {
+      // 每轮只持锁 spin 一次：visualize()/析构随时能插进来，不会死锁。
+      bool stopped = false;
+      {
+        std::lock_guard<std::mutex> lock(viewer_mutex_);
         viewer_.spinOnce(1);
+        stopped = viewer_.wasStopped();
       }
+      if (stopped) {
+        break;
+      }
+    } else {
+      std::this_thread::sleep_for(1ms);
     }
-    std::this_thread::sleep_for(1ms);
-    std::lock_guard<std::mutex> lock(viewer_mutex_);
-    stopped = viewer_.wasStopped();
   }
 }

@@ -59,6 +59,12 @@ public:
         std::vector<EstimationFrame::ConstPtr>& marginalized_frames
     );
 
+    /**
+     * @brief 开关 ivox 帧输出。没有订阅者时（RViz 没开 ivox_cloud 显示）关闭，
+     *        省掉每帧把整张体素图拷成点云的成本。默认开，保持旧行为。
+     */
+    void set_output_ivox(bool enabled);
+
 private:
     void run();
 
@@ -68,6 +74,7 @@ private:
     double max_imu_wait_wall_time;
     int max_internal_frame_queue;
 
+    std::atomic_bool output_ivox_enabled{true};
     std::atomic_bool kill_switch;      // Flag to stop the thread immediately (Hard kill switch)
     std::atomic_bool end_of_sequence;  // Flag to stop the thread when the input queues become empty (Soft kill switch)
     std::thread thread;

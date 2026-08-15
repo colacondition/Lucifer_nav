@@ -39,7 +39,6 @@ def get_world_config(world_type):
             'z': '0.170',    # base_link 在地面上方（轮子接触地面）
             'yaw': '1.57',
             'world_path': 'RMUL2024_world/rmul27.world'
-            # 'world_path': 'RMUL2024_world/RMUL2024_world_dynamic_obstacles.world'
         }
     }
     return world_configs.get(world_type, None)
@@ -69,11 +68,8 @@ def generate_launch_description():
     log_level = LaunchConfiguration('log_level')
     node_output = LaunchConfiguration('node_output')
 
-    # Set Gazebo plugin path
-    append_enviroment = AppendEnvironmentVariable(
-        'GAZEBO_PLUGIN_PATH',
-        os.path.join(os.path.join(get_package_share_directory('pb_rm_simulation'), 'meshes', 'obstacles', 'obstacle_plugin', 'lib'))
-    )
+    # 动态障碍物插件（obstacle_plugin/*.so）与 dynamic_obstacles world 已删除：
+    # 场景从未启用（world 配置里被注释），插件还是 gitignore 的预编译产物。
     append_model_path = AppendEnvironmentVariable(
         'GAZEBO_MODEL_PATH',
         os.path.join(get_package_share_directory('pb_rm_simulation'), 'meshes')
@@ -241,7 +237,6 @@ def generate_launch_description():
     ld = LaunchDescription()
 
     # Set environment variables
-    ld.add_action(append_enviroment)
     ld.add_action(append_model_path)
 
     ld.add_action(declare_use_sim_time_cmd)

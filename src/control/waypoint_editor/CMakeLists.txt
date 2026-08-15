@@ -10,6 +10,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(decision_interfaces REQUIRED)
 find_package(rviz_common REQUIRED)
 find_package(rviz_default_plugins REQUIRED)
 find_package(pluginlib REQUIRED)
@@ -112,10 +114,15 @@ ament_export_dependencies(
   tf2_ros
 )
 
-add_executable(waypoint_patrol_executor src/waypoint_patrol_executor.cpp)
+# 同一份 waypoint_executor.cpp 编出两个可执行文件：差异（节点名/服务名/状态话题
+# 默认值/到点判定语义）由 WAYPOINT_EXECUTOR_DEFAULT_MODE 编译定义 + mode 参数决定。
+add_executable(waypoint_patrol_executor src/waypoint_executor.cpp)
+target_compile_definitions(waypoint_patrol_executor PRIVATE WAYPOINT_EXECUTOR_DEFAULT_MODE=\"patrol\")
 
 ament_target_dependencies(waypoint_patrol_executor
   rclcpp
+  rclcpp_action
+  decision_interfaces
   geometry_msgs
   nav_msgs
   std_srvs
@@ -124,10 +131,13 @@ ament_target_dependencies(waypoint_patrol_executor
   tf2_ros
 )
 
-add_executable(waypoint_follow_executor src/waypoint_follow_executor.cpp)
+add_executable(waypoint_follow_executor src/waypoint_executor.cpp)
+target_compile_definitions(waypoint_follow_executor PRIVATE WAYPOINT_EXECUTOR_DEFAULT_MODE=\"follow\")
 
 ament_target_dependencies(waypoint_follow_executor
   rclcpp
+  rclcpp_action
+  decision_interfaces
   geometry_msgs
   nav_msgs
   std_srvs

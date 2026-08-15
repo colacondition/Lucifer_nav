@@ -184,6 +184,10 @@ int SerialDriverNode::transmit()
 
 void SerialDriverNode::receive()
 {
+  // write_mutex_ 同时保护 fd 的 close/open 切换（reopenPort 用它）：读也纳入
+  // 同一把锁，避免与重连的 close/open 形成数据竞争。read 是非阻塞的，锁只
+  // 包住单次 read 不包整个 while。
+  std::lock_guard<std::mutex> port_lock(write_mutex_);
   if (!port_->isPortOpen()) {
     return;
   }
@@ -328,6 +332,20 @@ void SerialDriverNode::ChassisCmdCallback(const geometry_msgs::msg::Twist::Share
     std::size_t queue_bytes = 0;
     {
       std::lock_guard<std::mutex> lock(transmit_mutex);
+      // 端口关闭时 transmit() 直接丢弃、队列只进不出会无界增长。给队列设上限
+      // （10 包 ≈ 240 B），超限丢最旧——对速度指令流来说旧指令本来就不该在
+      // 重连后一股脑灌给底盘，保留最新才是安全语义。
+      constexpr std::size_t kMaxQueuedChassisBytes = sizeof(ChassisCommandPacket) * 10;
+      while (transmit_buffer.size() + sizeof(packet) > kMaxQueuedChassisBytes &&
+             !transmit_buffer.empty())
+      {
+        if (transmit_buffer.size() < sizeof(ChassisCommandPacket)) {
+          transmit_buffer.clear();
+          break;
+        }
+        transmit_buffer.erase(
+          transmit_buffer.begin(), transmit_buffer.begin() + sizeof(ChassisCommandPacket));
+      }
       transmit_buffer.insert(transmit_buffer.end(), buffer, buffer + sizeof(packet));
       queue_bytes = transmit_buffer.size();
     }
@@ -495,14 +513,22 @@ bool SerialDriverNode::reopenPort(const char * reason)
 {
   RCLCPP_WARN(get_logger(), "%s. Reopening serial port...", reason);
   {
-    // 关 / 开端口期间不能有别的线程在写：fd 会在 write 中途被换掉。
+    // 关端口瞬间锁住 fd 切换（receive/transmit 都经 write_mutex_ 访问 fd）。
     std::lock_guard<std::mutex> lock(write_mutex_);
     port_->closePort();
     {
       std::lock_guard<std::mutex> receive_lock(receive_mutex_);
       receive_buffer_.clear();
     }
-    rclcpp::sleep_for(kReconnectDelay);
+  }
+
+  // 重连延时放在锁外：旧实现锁内 sleep 1s，单线程执行器下整节点（含串口接收
+  // 解析与云台姿态处理）都会冻结。锁外睡眠期间 receive/transmit 因端口关闭
+  // 自然失败返回，不影响其他路径。
+  rclcpp::sleep_for(kReconnectDelay);
+
+  {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     port_->openPort();
   }
 
@@ -527,7 +553,8 @@ void SerialDriverNode::getParam()
 
   try {
     device_name_ = declare_parameter<std::string>("device_name", "/dev/ttyACM0");
-    baud_rate = declare_parameter<int>("baud_rate", 961200);
+    // 默认与 config/serial_driver.yaml 一致（标准 POSIX 速率；串口层不再支持非标速率）。
+    baud_rate = declare_parameter<int>("baud_rate", 115200);
     flowcontrol = declare_parameter<bool>("flow_control", false);
     chassis_vel_x_scale_ = declare_parameter<double>("chassis_vel_x_scale", -1.0);
     chassis_vel_y_scale_ = declare_parameter<double>("chassis_vel_y_scale", -1.0);

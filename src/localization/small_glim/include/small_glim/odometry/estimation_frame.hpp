@@ -4,12 +4,11 @@
 #include <array>
 #include <Eigen/Dense>
 #include <gtsam_points/types/point_cloud.hpp>
-#include <gtsam_points/types/gaussian_voxelmap.hpp>
 #include <small_glim/preprocess/preprocessed_frame.hpp>
 
 namespace small_glim {
 
-enum class FrameType { WORLD, LIDAR, IMU };
+enum class FrameType { WORLD, IMU };
 
 /**
 * @brief Odometry estimation frame
@@ -20,29 +19,10 @@ struct EstimationFrame {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     /**
-    * @brief Make a clone of the estimation frame. (Points data are shallow copied)
-    * @return EstimationFrame::Ptr   Cloned frame
-    */
-    EstimationFrame::Ptr clone() const;
-
-    /**
-    * @brief Make a clone of the estimation frame instance but without points data.
-    * @return EstimationFrame::Ptr   Cloned frame without points
-    */
-    EstimationFrame::Ptr clone_wo_points() const;
-
-    /**
     * @brief Get the sensor pose according to frame_type.
     * @return const Eigen::Isometry3d  Sensor pose
     */
     const Eigen::Isometry3d T_world_frame() const;
-
-    /**
-    * @brief Set the sensor pose.
-    * @param frame_type  Sensor coodinate frame
-    * @param T           Sensor pose
-    */
-    void set_T_world_frame(FrameType frame_type, const Eigen::Isometry3d& T);
 
 public:
     size_t id; ///< Frame ID
@@ -69,7 +49,6 @@ public:
 
     FrameType frame_type; ///< Coordinate center type of $frame
     gtsam_points::PointCloud::ConstPtr frame; ///< Deskewed points for state estimation
-    std::vector<gtsam_points::GaussianVoxelMap::Ptr> voxelmaps; ///< Multi-resolution voxelmaps
 };
 
 }

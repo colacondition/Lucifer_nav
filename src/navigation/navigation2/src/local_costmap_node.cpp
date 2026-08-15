@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -25,6 +26,25 @@
 namespace navigation2
 {
 
+// 逐格膨胀上限缓存：local cell → (是否在隧道影响区, 该格上限)。
+// 局部栅格 origin 每帧随车按整数格平移（snapOrigin 保证 origin 是分辨率的整数倍），
+// 语义格映射随之整体平移，只需平移缓存 + 补新露出的边，不必每帧逐格
+// mapToWorld + 查语义格。语义地图/尺寸/分辨率变化时整体重建。
+struct InflationLimitCache
+{
+  int width{0};
+  int height{0};
+  double resolution{0.0};
+  double origin_x{0.0};
+  double origin_y{0.0};
+  // in_tunnel[i] == 1 表示第 i 格落在隧道影响区内。
+  std::vector<std::uint8_t> in_tunnel;
+  // limit[i]：隧道格 = min(inflation_radius_, clearance)，非隧道格 = inflation_radius_。
+  // 有隧道时直接作为返回值；无隧道时返回空向量（与 makeInflationRadiusLimit 一致）。
+  std::vector<float> limit;
+  bool has_tunnel{false};
+};
+
 class RmLocalCostmap : public rclcpp::Node
 {
 public:
@@ -35,27 +55,35 @@ public:
   {
     loadParameters();
 
+    // mt 容器下订阅回调与定时器回调读写同一批 latest_*/semantic 成员，
+    // 全部放进一个互斥回调组串行化（与 rm_global_planner 同款纪律）。
+    cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions sub_options;
+    sub_options.callback_group = cb_group_;
+
     // 按开关订阅不同传感器输入。
     if (subscribe_scan_) {
       scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
         scan_topic_, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::LaserScan::SharedPtr msg) {
+        [this](sensor_msgs::msg::LaserScan::ConstSharedPtr msg) {
           latest_scan_ = std::move(msg);
-        });
+        },
+        sub_options);
     }
     if (subscribe_pointcloud_) {
       pointcloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         pointcloud_topic_, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
           latest_pointcloud_ = std::move(msg);
-        });
+        },
+        sub_options);
     }
 
     // 语义地图：局部代价地图自己不加载 /map，但隧道顶板必须在这里也被滤掉 ——
     // 局部图才是 MPC 的碰撞依据，只在全局图上放行等于让车看见洞口却撞在顶板上。
     semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
       semantic_map_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
-      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+      [this](decision_interfaces::msg::SemanticMap::ConstSharedPtr msg) {
         try {
           // 内容没变就不重建 —— rm_map_server 每秒重发一次，重建 RMUC 大小的方向场
           // 要 16 万次三角函数，而这个节点和 MPC 共用执行器。
@@ -70,10 +98,13 @@ public:
         // 隧道影响区（本体 + 边距）随地图重建。顶板豁免和膨胀上限都按它判定：
         // 门楣点云和洞口格都在本体格外一到两格，只认本体格会把洞口整体封死。
         tunnel_region_ = TunnelRegionGrid::build(receiver_.map(), tunnel_margin_m_);
+        // 影响区变了，逐格膨胀上限缓存失效，下次 updateAndPublish 整体重建。
+        infl_limit_cache_ = InflationLimitCache{};
         RCLCPP_INFO(
           get_logger(), "Local costmap got semantic map: %zu tunnels",
           receiver_.map().tunnels().size());
-      });
+      },
+      sub_options);
 
     // 输出栅格给规划器和控制器。
     auto costmap_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
@@ -90,7 +121,8 @@ public:
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
       [this]() {
         updateAndPublish();
-      });
+      },
+      cb_group_);
 
     RCLCPP_INFO(
       get_logger(), "rm_local_costmap ready: scan=%s pointcloud=%s output=%s",
@@ -798,6 +830,134 @@ private:
     marked_cloud_pub_->publish(cloud);
   }
 
+  // 语义地图/尺寸/分辨率变化或 origin 非整数平移时整体重建。语义地图决定隧道影响区
+  // （tunnel_region_），尺寸/分辨率决定格号映射，二者变化都必须重算。
+  void rebuildInflationLimitCache(const nav_msgs::msg::OccupancyGrid & grid)
+  {
+    const int width = static_cast<int>(grid.info.width);
+    const int height = static_cast<int>(grid.info.height);
+    const std::size_t n = grid.data.size();
+    infl_limit_cache_.width = width;
+    infl_limit_cache_.height = height;
+    infl_limit_cache_.resolution = static_cast<double>(grid.info.resolution);
+    infl_limit_cache_.origin_x = grid.info.origin.position.x;
+    infl_limit_cache_.origin_y = grid.info.origin.position.y;
+    infl_limit_cache_.in_tunnel.assign(n, 0);
+    infl_limit_cache_.limit.assign(n, static_cast<float>(inflation_radius_));
+
+    bool any = false;
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        double world_x = 0.0;
+        double world_y = 0.0;
+        mapToWorld(grid, x, y, world_x, world_y);
+        const TunnelSpec * spec = tunnel_region_.specNearPoint(world_x, world_y);
+        if (spec == nullptr) {
+          continue;
+        }
+        any = true;
+        const std::size_t idx = gridIndex(grid, x, y);
+        infl_limit_cache_.in_tunnel[idx] = 1;
+        const double clearance = std::max(0.0, spec->clear_width * 0.5 - robot_radius_);
+        infl_limit_cache_.limit[idx] =
+          static_cast<float>(std::min(inflation_radius_, clearance));
+      }
+    }
+    infl_limit_cache_.has_tunnel = any;
+  }
+
+  // origin 按整数格平移 (shift_x, shift_y) 后的增量更新：新格 (x,y) 复用旧格
+  // (x+shift_x, y+shift_y) 的结果，只有新露出的边需要逐格算。
+  void shiftInflationLimitCache(
+    const nav_msgs::msg::OccupancyGrid & grid, int shift_x, int shift_y)
+  {
+    const int width = infl_limit_cache_.width;
+    const int height = infl_limit_cache_.height;
+    const std::size_t n = infl_limit_cache_.limit.size();
+    std::vector<std::uint8_t> new_in_tunnel(n, 0);
+    std::vector<float> new_limit(n, static_cast<float>(inflation_radius_));
+
+    bool any = false;
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        const int old_x = x + shift_x;
+        const int old_y = y + shift_y;
+        const std::size_t idx =
+          static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+          static_cast<std::size_t>(x);
+        if (old_x >= 0 && old_x < width && old_y >= 0 && old_y < height) {
+          const std::size_t old_idx =
+            static_cast<std::size_t>(old_y) * static_cast<std::size_t>(width) +
+            static_cast<std::size_t>(old_x);
+          new_in_tunnel[idx] = infl_limit_cache_.in_tunnel[old_idx];
+          new_limit[idx] = infl_limit_cache_.limit[old_idx];
+        } else {
+          double world_x = 0.0;
+          double world_y = 0.0;
+          mapToWorld(grid, x, y, world_x, world_y);
+          const TunnelSpec * spec = tunnel_region_.specNearPoint(world_x, world_y);
+          if (spec != nullptr) {
+            new_in_tunnel[idx] = 1;
+            const double clearance = std::max(0.0, spec->clear_width * 0.5 - robot_radius_);
+            new_limit[idx] =
+              static_cast<float>(std::min(inflation_radius_, clearance));
+          }
+        }
+        if (new_in_tunnel[idx] != 0) {
+          any = true;
+        }
+      }
+    }
+
+    infl_limit_cache_.in_tunnel.swap(new_in_tunnel);
+    infl_limit_cache_.limit.swap(new_limit);
+    infl_limit_cache_.has_tunnel = any;
+    infl_limit_cache_.origin_x = grid.info.origin.position.x;
+    infl_limit_cache_.origin_y = grid.info.origin.position.y;
+  }
+
+  // 本帧的逐格膨胀上限：有隧道返回缓存数组，无隧道返回空（空 = 无逐格上限）。
+  const std::vector<float> & inflationLimit(const nav_msgs::msg::OccupancyGrid & grid)
+  {
+    static const std::vector<float> empty_limit;
+
+    // region 为空时原实现会退回只认本体格的版本，而该版本在这些条件下同样返回空；
+    // 这里直接等价为「无逐格上限」。
+    if (tunnel_region_.empty() || grid.data.empty() || grid.info.resolution <= 0.0F) {
+      return empty_limit;
+    }
+
+    const int width = static_cast<int>(grid.info.width);
+    const int height = static_cast<int>(grid.info.height);
+    const bool same_shape =
+      infl_limit_cache_.width == width && infl_limit_cache_.height == height &&
+      std::abs(infl_limit_cache_.resolution - static_cast<double>(grid.info.resolution)) <= 1e-6;
+
+    if (!same_shape) {
+      rebuildInflationLimitCache(grid);
+    } else {
+      const double dx =
+        (grid.info.origin.position.x - infl_limit_cache_.origin_x) / infl_limit_cache_.resolution;
+      const double dy =
+        (grid.info.origin.position.y - infl_limit_cache_.origin_y) / infl_limit_cache_.resolution;
+      const int shift_x = static_cast<int>(std::lround(dx));
+      const int shift_y = static_cast<int>(std::lround(dy));
+      if (std::abs(dx - static_cast<double>(shift_x)) > 1e-3 ||
+        std::abs(dy - static_cast<double>(shift_y)) > 1e-3)
+      {
+        // 非整数格平移（如 snap_origin_to_grid 关闭）：退化为整体重建。
+        rebuildInflationLimitCache(grid);
+      } else if (shift_x != 0 || shift_y != 0) {
+        shiftInflationLimitCache(grid, shift_x, shift_y);
+      }
+    }
+
+    if (!infl_limit_cache_.has_tunnel) {
+      return empty_limit;
+    }
+    return infl_limit_cache_.limit;
+  }
+
   void updateAndPublish()
   {
     publishCurrentFootprint();
@@ -853,13 +1013,12 @@ private:
     }
 
     auto inflated_grid = raw_grid;
-    // 局部栅格跟车滚动，origin 每帧都变，逐格上限不能跨帧缓存。地图里没有隧道时
-    // makeInflationRadiusLimit 直接返回空，不用逐格扫。传影响区版本：洞口格
-    // （本体外一小圈）同样吃 clearance 上限，不再被两侧墙的全量膨胀涂满。
+    // 逐格膨胀上限走缓存：origin 每帧整数格平移，只平移缓存 + 补边，不再逐格
+    // mapToWorld + 查语义格。传影响区版本：洞口格（本体外一小圈）同样吃 clearance
+    // 上限，不再被两侧墙的全量膨胀涂满。无隧道时返回空 = 无逐格上限。
     applyInflationCostGradient(
       inflated_grid, inflation_radius_, 50, inflation_cost_scaling_factor_,
-      makeInflationRadiusLimit(
-        raw_grid, receiver_.map(), inflation_radius_, robot_radius_, tunnel_region_));
+      inflationLimit(raw_grid));
     markRobotFootprintFree(inflated_grid, robot_transform);
     previous_inflated_grid_ = inflated_grid;
 
@@ -910,8 +1069,8 @@ private:
   bool reuse_previous_grid_{true};
   int previous_obstacle_decay_{0};
 
-  sensor_msgs::msg::LaserScan::SharedPtr latest_scan_;
-  sensor_msgs::msg::PointCloud2::SharedPtr latest_pointcloud_;
+  sensor_msgs::msg::LaserScan::ConstSharedPtr latest_scan_;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_pointcloud_;
   std::optional<nav_msgs::msg::OccupancyGrid> previous_raw_grid_;
   std::optional<nav_msgs::msg::OccupancyGrid> previous_inflated_grid_;
   std::optional<builtin_interfaces::msg::Time> last_processed_observation_stamp_;
@@ -921,8 +1080,11 @@ private:
   // 隧道影响区（本体 + tunnel_margin_m_ 边距）的查表，随语义地图重建。空表时
   // specNearPoint 恒返回 nullptr，与「没有隧道」等价。
   TunnelRegionGrid tunnel_region_;
+  // 逐格膨胀上限缓存（见 InflationLimitCache 定义）。
+  InflationLimitCache infl_limit_cache_;
 
   rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
+  rclcpp::CallbackGroup::SharedPtr cb_group_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_pub_;

@@ -13,6 +13,8 @@
   <exec_depend>rosidl_default_runtime</exec_depend>
   <!-- SemanticMap.msg 带 std_msgs/Header -->
   <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclcpp_action</depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>

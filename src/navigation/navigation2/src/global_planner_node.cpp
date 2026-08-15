@@ -1,4 +1,4 @@
-#include "distance_field.hpp"
+#include "distance_transform.hpp"
 #include "grid_utils.hpp"
 #include "path_stitching.hpp"
 #include "semantic_map_consumer.hpp"
@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -30,6 +31,30 @@
 namespace navigation2
 {
 
+namespace
+{
+
+// 清障场的缓存键：地图内容（FNV-1a）+ 阈值语义 + 分辨率 + 尺寸。
+std::uint64_t clearanceFieldHash(
+  const nav_msgs::msg::OccupancyGrid & grid, int threshold, bool unknown_is_obstacle)
+{
+  std::uint64_t h = 14695981039346656037ULL;
+  for (const auto byte : grid.data) {
+    h ^= static_cast<std::uint8_t>(byte);
+    h *= 1099511628211ULL;
+  }
+  h ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(threshold)) * 0x9E3779B97F4A7C15ULL;
+  h ^= unknown_is_obstacle ? 0x7F4A7C15C4B45C3EULL : 0x3B64AD1F0E62D1A7ULL;
+  std::uint64_t resolution_bits = 0;
+  std::memcpy(&resolution_bits, &grid.info.resolution, sizeof(resolution_bits));
+  h ^= resolution_bits + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+  h ^= static_cast<std::uint64_t>(grid.info.width) * 0xC2B2AE3D27D4EB4FULL;
+  h ^= static_cast<std::uint64_t>(grid.info.height) * 0x165667B19E3779F9ULL;
+  return h;
+}
+
+}  // namespace
+
 class RmGlobalPlanner : public rclcpp::Node
 {
 public:
@@ -40,11 +65,21 @@ public:
   {
     loadParameters();
 
+    // 本节点跑在 component_container_mt（多线程 executor）里，而所有订阅回调
+    // 和定时器回调都读写同一批成员（map_、goal_、last_path_、清障缓存、
+    // 语义地图轴线表）并可能触发同步 A*。全部放进同一个互斥回调组，让
+    // rclcpp 串行化这些回调——这比手写锁更不容易漏（此前 plan_mtx_ 声明了
+    // 却从未加锁，goal/map/timer 回调在 mt 容器下真会并发）。
+    planner_callback_group_ = create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions sub_options;
+    sub_options.callback_group = planner_callback_group_;
+
     // 地图是静态输入，用 transient_local 直接补最新值。
     auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
     map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       map_topic_, map_qos,
-      [this](nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+      [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
         const bool had_map = static_cast<bool>(map_);
         map_ = std::move(msg);
         if (!had_map) {
@@ -55,13 +90,14 @@ public:
         if (goal_ && (!had_map || replan_on_source_update_)) {
           planFromCurrentPose(true);
         }
-      });
+      },
+      sub_options);
 
     // 语义地图和代价地图同源同 QoS，收不到时行为退回纯几何 A*（隧道被当普通空地，
     // 斜切进洞口不会被拦），不报错。
     semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
       semantic_map_topic_, map_qos,
-      [this](decision_interfaces::msg::SemanticMap::SharedPtr msg) {
+      [this](decision_interfaces::msg::SemanticMap::ConstSharedPtr msg) {
         try {
           if (!receiver_.update(*msg)) {
             return;
@@ -80,11 +116,12 @@ public:
         if (goal_) {
           planFromCurrentPose(true);
         }
-      });
+      },
+      sub_options);
 
     goal_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       goal_topic_, rclcpp::QoS(10),
-      [this](geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+      [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
         goal_ = *msg;
         last_path_.reset();
         last_planned_start_.reset();
@@ -94,19 +131,21 @@ public:
           get_logger(), "Received goal at (%.2f, %.2f) in frame %s",
           goal_->pose.position.x, goal_->pose.position.y, goal_->header.frame_id.c_str());
         planFromCurrentPose(true);
-      });
+      },
+      sub_options);
 
     path_pub_ = create_publisher<nav_msgs::msg::Path>(path_topic_, rclcpp::QoS(1).reliable());
     replan_sub_ = create_subscription<std_msgs::msg::Empty>(
       replan_request_topic_, rclcpp::QoS(1),
-      [this](std_msgs::msg::Empty::SharedPtr) {
+      [this](std_msgs::msg::Empty::ConstSharedPtr) {
         if (goal_) {
           RCLCPP_INFO(get_logger(), "Received explicit replan request");
           // 明确重规划 → 代次自增，确保此次结果不被旧的慢请求覆盖。
           ++plan_gen_;
           planFromCurrentPose(true);
         }
-      });
+      },
+      sub_options);
 
     // 定时重规划作为兜底。
     if (planning_frequency_ > 0.0 && replan_on_timer_) {
@@ -118,7 +157,8 @@ public:
           if (goal_) {
             planFromCurrentPose(false);
           }
-        });
+        },
+        planner_callback_group_);
     }
 
     RCLCPP_INFO(
@@ -126,13 +166,7 @@ public:
       path_topic_.c_str());
   }
 
-  ~RmGlobalPlanner()
-  {
-    // 若将来把 A* 移到后台线程，确保析构时等它结束。
-    if (plan_thread_.joinable()) {
-      plan_thread_.join();
-    }
-  }
+  ~RmGlobalPlanner() = default;
 
 private:
   struct QueueItem
@@ -527,6 +561,27 @@ private:
     return grid;
   }
 
+  // A* 工作缓冲：按需扩到地图尺寸并重置（尺寸不变时零分配）。
+  void resetAstarBuffers(std::size_t cells)
+  {
+    constexpr double kInf = std::numeric_limits<double>::infinity();
+    if (astar_g_score_.size() != cells) {
+      astar_g_score_.assign(cells, kInf);
+    } else {
+      std::fill(astar_g_score_.begin(), astar_g_score_.end(), kInf);
+    }
+    if (astar_parent_.size() != cells) {
+      astar_parent_.assign(cells, -1);
+    } else {
+      std::fill(astar_parent_.begin(), astar_parent_.end(), -1);
+    }
+    if (astar_closed_.size() != cells) {
+      astar_closed_.assign(cells, 0);
+    } else {
+      std::fill(astar_closed_.begin(), astar_closed_.end(), 0);
+    }
+  }
+
   std::optional<nav_msgs::msg::Path> planPath(
     const nav_msgs::msg::OccupancyGrid & source_map,
     const geometry_msgs::msg::PoseStamped & start,
@@ -563,14 +618,40 @@ private:
     }
 
     const int total_cells = static_cast<int>(grid.data.size());
-    std::vector<double> g_score(
-      static_cast<std::size_t>(total_cells), std::numeric_limits<double>::infinity());
-    std::vector<int> parent(static_cast<std::size_t>(total_cells), -1);
-    std::vector<uint8_t> closed(static_cast<std::size_t>(total_cells), 0);
+    // A* 工作缓冲提为成员复用：地图尺寸不变时零分配（否则每次规划要
+    // 分配/释放 g_score 8B×cells + parent 4B×cells + closed 1B×cells）。
+    // 本函数只在互斥回调组内执行，成员缓冲无并发风险。
+    resetAstarBuffers(static_cast<std::size_t>(total_cells));
+    auto & g_score = astar_g_score_;
+    auto & parent = astar_parent_;
+    auto & closed = astar_closed_;
     std::priority_queue<QueueItem, std::vector<QueueItem>, std::greater<QueueItem>> open;
-    // 清障代价场用来让路径尽量远离障碍，而不是只追求最短。
-    const auto clearance_field = use_clearance_cost_ ?
-      buildDistanceField(grid, obstacle_threshold_, !allow_unknown_) : GridDistanceField{};
+    // 清障代价场用来让路径尽量远离障碍，而不是只追求最短。精确 EDT（O(n)，无堆）
+    // 替代八邻域 Dijkstra，并按地图内容哈希缓存；惩罚值物化成 float 查表，
+    // A* 扩展时零浮点开销。地图内容没变时（导航期常态）整场直接复用。
+    if (use_clearance_cost_) {
+      const std::uint64_t hash =
+        clearanceFieldHash(grid, obstacle_threshold_, !allow_unknown_);
+      if (!clearance_cache_.built || clearance_cache_.hash != hash) {
+        if (clearance_cache_.cost.size() != grid.data.size()) {
+          clearance_cache_.cost.assign(grid.data.size(), 0.0F);
+        }
+        std::vector<std::uint8_t> seeds(grid.data.size(), 0U);
+        for (std::size_t i = 0; i < grid.data.size(); ++i) {
+          seeds[i] =
+            isOccupied(grid.data[i], obstacle_threshold_, !allow_unknown_) ? 1U : 0U;
+        }
+        const auto dist_cells = exactSquaredDistanceTransform(
+          seeds, static_cast<int>(grid.info.width), static_cast<int>(grid.info.height));
+        for (std::size_t i = 0; i < grid.data.size(); ++i) {
+          const double dist_m = dist_cells[i] * grid.info.resolution;
+          clearance_cache_.cost[i] = static_cast<float>(
+            clearancePenalty(dist_m, clearance_desired_distance_, clearance_cost_weight_));
+        }
+        clearance_cache_.hash = hash;
+        clearance_cache_.built = true;
+      }
+    }
 
     const auto heuristic = [&grid](int a, int b) {
       const int ax = a % static_cast<int>(grid.info.width);
@@ -579,13 +660,11 @@ private:
       const int by = b / static_cast<int>(grid.info.width);
       return std::hypot(static_cast<double>(ax - bx), static_cast<double>(ay - by));
     };
-    const auto clearance_cost = [&clearance_field, this](int index) {
-      if (!clearance_field.valid()) {
+    const auto clearance_cost = [this](int index) {
+      if (!clearance_cache_.built) {
         return 0.0;
       }
-      return clearancePenalty(
-        clearance_field.distanceAt(static_cast<std::size_t>(index)),
-        clearance_desired_distance_, clearance_cost_weight_);
+      return static_cast<double>(clearance_cache_.cost[static_cast<std::size_t>(index)]);
     };
 
     // 轴线表按 grid 的格号索引，而 grid 来自 preparePlanningGrid（可能加了膨胀，但
@@ -928,17 +1007,26 @@ private:
   double path_resample_distance_{0.18};
   double inflation_cost_scaling_factor_{8.0};
 
-  nav_msgs::msg::OccupancyGrid::SharedPtr map_;
+  nav_msgs::msg::OccupancyGrid::ConstSharedPtr map_;
   std::optional<geometry_msgs::msg::PoseStamped> goal_;
   std::optional<geometry_msgs::msg::PoseStamped> last_planned_start_;
   std::optional<nav_msgs::msg::Path> last_path_;
-  // 异步规划状态。规划器把 A* 搬到后台线程，不阻塞 ROS executor。
-  // plan_gen_ 是代次计数器：目标变化时自增，发布前对照代次，旧结果直接丢弃。
-  mutable std::mutex plan_mtx_;               // 保护 last_path_, last_planned_start_,
-                                              // last_fail_time_, last_fail_goal_
-  std::thread plan_thread_;
-  std::atomic<bool> plan_in_flight_{false};
+  // 并发纪律：A* 同步跑在 executor 回调里（无后台线程）。component_container_mt
+  // 下不同回调线程可能并发触发 planFromCurrentPose，靠 plan_gen_ 代次计数保证
+  // 只有最新一次目标对应的结果能发布；last_path_ 等成员是「最后写入者胜」语义。
   std::atomic<uint64_t> plan_gen_{0};
+  // 清障场缓存：按地图内容哈希，地图不变则整场复用（EDT 结果 + 物化惩罚表）。
+  struct ClearanceCache
+  {
+    std::uint64_t hash{0};
+    bool built{false};
+    std::vector<float> cost;
+  };
+  ClearanceCache clearance_cache_;
+  // A* 工作缓冲（成员复用，见 resetAstarBuffers）。
+  std::vector<double> astar_g_score_;
+  std::vector<int> astar_parent_;
+  std::vector<uint8_t> astar_closed_;
   // 规划失败冷却：记录上次失败的时间和当时的目标，避免对不可达目标以规划
   // 频率空转重试。目标明显移动（超过 planner_tolerance_）时视为新目标，清除
   // 冷却计时。
@@ -967,6 +1055,8 @@ private:
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr replan_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  // 串行化订阅/定时器回调（mt 容器下共享成员 map_/goal_/last_path_ 等）。
+  rclcpp::CallbackGroup::SharedPtr planner_callback_group_;
 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;

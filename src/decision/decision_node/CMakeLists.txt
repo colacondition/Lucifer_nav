@@ -13,11 +13,10 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(decision_interfaces REQUIRED)
-find_package(ament_index_cpp REQUIRED)
 
 set(DECISION_LIBRARY_SOURCES
   src/decision_config.cpp
@@ -39,9 +38,8 @@ ament_target_dependencies(decision_core
   geometry_msgs
   nav_msgs
   std_msgs
-  std_srvs
+  rclcpp_action
   decision_interfaces
-  ament_index_cpp
 )
 
 add_executable(bt_action_replacement_node
@@ -53,7 +51,7 @@ ament_target_dependencies(bt_action_replacement_node
   geometry_msgs
   nav_msgs
   std_msgs
-  std_srvs
+  rclcpp_action
   tf2
   tf2_ros
   decision_interfaces

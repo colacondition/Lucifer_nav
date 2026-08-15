@@ -13,7 +13,6 @@ struct MincoOptimizer::Impl
   minco::MINCO_S3NU minco_;
   lbfgs::lbfgs_parameter_t lbfgs_params_;
 
-  std::function<bool(const Eigen::Vector2d &, double &, Eigen::Vector2d &)> esdf_query_;
   std::function<bool(const Eigen::Vector2d &, Eigen::Vector2d &)> tunnel_axis_query_;
 
   // 优化过程中的临时变量
@@ -35,26 +34,6 @@ struct MincoOptimizer::Impl
     lbfgs_params_.s_curv_coeff = 0.9;
   }
 
-  // Smoothed L1 penalty function
-  static inline bool smoothed_l1(
-    const double & x, const double & mu, double & f, double & df) noexcept
-  {
-    if (x < 0.0) {
-      return false;
-    } else if (x > mu) {
-      f = x - 0.5 * mu;
-      df = 1.0;
-      return true;
-    } else {
-      const double xdmu = x / mu;
-      const double sqrxdmu = xdmu * xdmu;
-      const double mumxd2 = mu - 0.5 * x;
-      f = mumxd2 * sqrxdmu * xdmu;
-      df = sqrxdmu * ((-0.5) * xdmu + 3.0 * mumxd2 / mu);
-      return true;
-    }
-  }
-
   // Kahan summation for numerical stability
   static inline double kahan_sum(double & sum, double & c, const double & val) noexcept
   {
@@ -63,45 +42,6 @@ struct MincoOptimizer::Impl
     c = (t - sum) - y;
     sum = t;
     return sum;
-  }
-
-  // 障碍物代价项
-  Eigen::Vector2d obstacle_term(const Eigen::Vector2d & xcur, double & nearest_cost) const noexcept
-  {
-    nearest_cost = 0.0;
-    Eigen::Vector2d grad = Eigen::Vector2d::Zero();
-
-    const double R = params_.robot_radius;
-    const double mu = params_.penalty_mu;
-
-    double d;
-    Eigen::Vector2d g;
-
-    // 调用 ESDF 查询函数
-    if (!esdf_query_ || !esdf_query_(xcur, d, g) || !std::isfinite(d)) {
-      return grad;
-    }
-
-    if (d > R) {
-      return grad;
-    }
-
-    double penetration = R - d;
-    double cost_s1 = 0.0, dcost_s1 = 0.0;
-    if (!smoothed_l1(penetration, mu, cost_s1, dcost_s1)) {
-      return grad;
-    }
-
-    const auto w_obs = params_.obstacle_weight;
-    nearest_cost = w_obs * cost_s1;
-    Eigen::Vector2d dir = (g.norm() > 1e-6) ? g.normalized() : Eigen::Vector2d::Zero();
-    grad = w_obs * dcost_s1 * (-dir);
-
-    if (!grad.allFinite()) {
-      grad.setZero();
-    }
-
-    return grad;
   }
 
   // 隧道轴线对齐软代价，逐段累加。段 k 从 point(k) 走到 point(k+1)，若该段落在
@@ -177,7 +117,7 @@ struct MincoOptimizer::Impl
     return cost_val;
   }
 
-  // 附加障碍物惩罚项到梯度
+  // 数据保持项：把每个内部点拉回原始路径点。
   double attach_penalty_functional(const Eigen::Matrix2Xd & in_ps, Eigen::Matrix2Xd & gradp) const noexcept
   {
     const int N = in_ps.cols();
@@ -189,15 +129,9 @@ struct MincoOptimizer::Impl
     double c_cost = 0.0;
 
     for (int i = 0; i < N - 1; i++) {
-      double nearest_cost = 0.0;
       const Eigen::Vector2d & p0 = in_ps.col(i);
 
-      // 1. 障碍物代价
-      Eigen::Vector2d obs_grad = obstacle_term(p0, nearest_cost);
-      kahan_sum(cost_val, c_cost, nearest_cost);
-      gradp.col(i).noalias() += obs_grad;
-
-      // 2. 数据项代价（保持接近原路径）
+      // 数据项代价（保持接近原路径）
       const Eigen::Vector2d & original = waypoints_[i + 1];
       Eigen::Vector2d deviation = p0 - original;
       double data_cost = params_.data_weight * deviation.squaredNorm();
@@ -378,12 +312,6 @@ MincoOptimizer::~MincoOptimizer() = default;
 void MincoOptimizer::setParams(const Params & params)
 {
   impl_->params_ = params;
-}
-
-void MincoOptimizer::setEsdfQuery(
-  std::function<bool(const Eigen::Vector2d &, double &, Eigen::Vector2d &)> query_fn)
-{
-  impl_->esdf_query_ = query_fn;
 }
 
 void MincoOptimizer::setTunnelAxisQuery(

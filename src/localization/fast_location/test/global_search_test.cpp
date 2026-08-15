@@ -57,8 +57,10 @@ TEST(GlobalSearchTest, RanksKnownSyntheticPoseFirst)
     fast_location::planarPoseMatrix({-1.0, 2.0, M_PI_2}),
   };
 
+  pcl::KdTreeFLANN<fast_location::Point> kdtree;
+  kdtree.setInputCloud(global_map);
   const auto ranked = fast_location::scoreGlobalCandidates(
-    global_map, scan, candidates, config);
+    kdtree, scan, candidates, config);
 
   ASSERT_EQ(ranked.size(), candidates.size());
   EXPECT_TRUE(ranked.front().pcd_from_odom.isApprox(expected, 1e-6f));
@@ -85,8 +87,10 @@ TEST(GlobalSearchTest, BreaksScoreTiesByMeanResidual)
   config.score_tie_epsilon = 0.05f;  // 命中率相同 -> 触发残差决胜
   std::vector<Eigen::Matrix4f> candidates{shifted, exact};
 
+  pcl::KdTreeFLANN<fast_location::Point> kdtree;
+  kdtree.setInputCloud(global_map);
   const auto ranked = fast_location::scoreGlobalCandidates(
-    global_map, scan, candidates, config);
+    kdtree, scan, candidates, config);
 
   ASSERT_EQ(ranked.size(), candidates.size());
   EXPECT_NEAR(ranked.front().score, ranked.back().score, 1e-6f);
@@ -117,8 +121,10 @@ TEST(GlobalSearchTest, RefinesTopCandidatesWithTighterMetric)
     {exact, 1.0f, 0.0f},
   };
 
+  pcl::KdTreeFLANN<fast_location::Point> kdtree;
+  kdtree.setInputCloud(global_map);
   const auto refined = fast_location::refineCandidateScores(
-    global_map, scan, selected, config);
+    kdtree, scan, selected, config);
 
   ASSERT_EQ(refined.size(), 2u);
   EXPECT_TRUE(refined.front().pcd_from_odom.isApprox(exact, 1e-6f));

@@ -69,6 +69,18 @@ rclcpp_components_register_node(${PROJECT_NAME}
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN "navigation2::RmGimbalVisualizer" EXECUTABLE rm_gimbal_visualizer_node)
 
+# 固定线程数组件容器：Humble 的 component_container_mt 无法配置 executor
+# 线程数（恒为 hardware_concurrency），核多的机器会起一大把空转线程。
+# 第一个位置参数指定线程数（默认 6），launch 里 arguments=['6']。
+add_executable(nav_container_mt executable/container_fixed_main.cpp)
+target_link_libraries(nav_container_mt
+  rclcpp::rclcpp
+  rclcpp_components::component_manager
+)
+install(TARGETS nav_container_mt
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY include/
   DESTINATION include
 )
@@ -102,11 +114,6 @@ if(BUILD_TESTING)
     test/test_tunnel_posture.cpp
   )
   target_link_libraries(test_tunnel_posture ${PROJECT_NAME})
-
-  ament_add_gtest(test_distance_field
-    test/test_distance_field.cpp
-  )
-  target_link_libraries(test_distance_field ${PROJECT_NAME})
 
   ament_add_gtest(test_path_stitching
     test/test_path_stitching.cpp

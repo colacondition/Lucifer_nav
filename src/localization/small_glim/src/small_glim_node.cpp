@@ -117,14 +117,16 @@ SmallGlimNode::SmallGlimNode(const rclcpp::NodeOptions& options): Node("small_gl
     const std::string ivox_cloud_pub_topic = config->param<std::string>("node.ivox_cloud_pub_topic");
 
     // Subscribers
+    // SensorDataQoS（best-effort）与 mid360_driver 的发布端一致：传感器流丢帧
+    // 比可靠重传更健康。仿真的 ros2_livox_simulation 发布端同为 best-effort 兼容。
     imu_sub = create_subscription<sensor_msgs::msg::Imu>(
         imu_sub_topic,
-        rclcpp::QoS(3),
+        rclcpp::SensorDataQoS(),
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) { imu_callback(msg); }
     );
     lidar_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
         lidar_sub_topic,
-        rclcpp::QoS(1),
+        rclcpp::SensorDataQoS(),
         [this](const sensor_msgs::msg::PointCloud2::SharedPtr msg) { lidar_callback(msg); }
     );
     odometry_pub = create_publisher<nav_msgs::msg::Odometry>(odometry_pub_topic, rclcpp::QoS(1));
@@ -189,7 +191,23 @@ size_t SmallGlimNode::lidar_callback(const sensor_msgs::msg::PointCloud2::ConstS
     }
     // Denser cloud for fast_location, decoupled from the odometry downsampling. Produced
     // here (once per accepted frame) and transformed at publish time with the odometry pose.
-    latest_localization_frame = preprocessor->preprocess_for_localization(raw_points);
+    // 两档分辨率相同（默认都是 0.05）且 odometry 路径没有额外的 cropbox/outlier/
+    // random-grid 过滤时，直接复用里程计的降采样结果：同一帧不再做第二次体素降采样
+    // 和全量拷贝（deskew 是拷出新的，不会原地改 raw 点，复用安全）。只有配置了更细
+    // 的 localization 分辨率或额外过滤时才单独算。
+    const double loc_res = config->param<double>("preprocess.localization_downsample_resolution");
+    const double odom_res = config->param<double>("preprocess.downsample_resolution");
+    const bool odom_has_extra_filters =
+      config->param<bool>("preprocess.enable_cropbox_filter") ||
+      config->param<bool>("preprocess.enable_outlier_removal") ||
+      config->param<bool>("preprocess.use_random_grid_downsampling");
+    if (loc_res <= 0.0) {
+        latest_localization_frame = nullptr;
+    } else if (std::abs(loc_res - odom_res) < 1e-9 && !odom_has_extra_filters) {
+        latest_localization_frame = preprocessed;
+    } else {
+        latest_localization_frame = preprocessor->preprocess_for_localization(raw_points);
+    }
     odometry_estimation->insert_frame(preprocessed);
     const size_t workload = odometry_estimation->workload();
     logger::debug("node", "workload={}", workload);
@@ -197,16 +215,26 @@ size_t SmallGlimNode::lidar_callback(const sensor_msgs::msg::PointCloud2::ConstS
 }
 
 void SmallGlimNode::timer_callback() {
+    // 每拍同步一次 ivox 订阅者状态：没人在看就不让里程计线程构建 ivox 帧
+    // （构建本身是全量点云拷贝，与发布无关）。
+    odometry_estimation->set_output_ivox(ivox_cloud_pub->get_subscription_count() > 0);
+
     std::vector<EstimationFrame::ConstPtr> estimation_frames;
     std::vector<EstimationFrame::ConstPtr> target_ivox_frames;
     std::vector<EstimationFrame::ConstPtr> marginalized_frames;
     odometry_estimation->get_results(estimation_frames, target_ivox_frames, marginalized_frames);
     if (!estimation_frames.empty()) {
         pub_odometry(estimation_frames.back());
-        pub_cloud(estimation_frames.back(), registered_cloud_pub);
-        pub_localization_cloud(estimation_frames.back(), localization_cloud_pub);
+        // 点云只在有订阅者时才拼装/发布：/Laser_map（RViz 调试）常处于无人订阅
+        // 状态，之前每帧都要把几万点拷成 PointCloud2 再序列化，纯浪费。
+        if (registered_cloud_pub->get_subscription_count() > 0) {
+            pub_cloud(estimation_frames.back(), registered_cloud_pub);
+        }
+        if (localization_cloud_pub->get_subscription_count() > 0) {
+            pub_localization_cloud(estimation_frames.back(), localization_cloud_pub);
+        }
     }
-    if (!target_ivox_frames.empty()) {
+    if (!target_ivox_frames.empty() && ivox_cloud_pub->get_subscription_count() > 0) {
         pub_cloud(target_ivox_frames.back(), ivox_cloud_pub);
     }
     if (mapping) {
