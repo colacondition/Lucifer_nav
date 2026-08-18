@@ -152,11 +152,14 @@ private:
       return;
     }
 
-    sensor_msgs::msg::PointCloud2 output;
-    pcl::toROSMsg(filtered_cloud_, output);
-    output.header = msg->header;
+    // 用 unique_ptr 发布：与 ground_segmentation 同容器且开启 intra-process 时，
+    // rclcpp 直接把所有权转成 shared_ptr 投递给进程内订阅者，整帧点云不再经过
+    // DDS 序列化/反序列化，也不会为 const& publish 再做一次堆上深拷贝。
+    auto output = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(filtered_cloud_, *output);
+    output->header = msg->header;
 
-    pub_->publish(output);
+    pub_->publish(std::move(output));
   }
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;

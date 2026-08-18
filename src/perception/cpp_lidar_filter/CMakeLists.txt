@@ -27,6 +27,19 @@ rclcpp_components_register_node(${PROJECT_NAME}
   EXECUTABLE lidar_filter_node
 )
 
+# 固定线程数感知容器：替代 rclcpp_components 的 component_container_mt。
+# Humble 的 component_container_mt 线程数恒为 hardware_concurrency()（本机 24），
+# 感知链只需 2 个 executor 线程即可保留相邻帧的流水线重叠，其余线程都是空转。
+# 用法：perception_container_mt [线程数] [--ros-args ...]
+add_executable(perception_container_mt executable/container_fixed_main.cpp)
+target_link_libraries(perception_container_mt
+  rclcpp::rclcpp
+  rclcpp_components::component_manager
+)
+install(TARGETS perception_container_mt
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_single_pass_filter test/test_single_pass_filter.cpp)

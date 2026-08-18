@@ -63,6 +63,9 @@ TUNNEL_ID_TINT = [
 
 MAX_UNDO = 30
 TWO_PI = 2.0 * math.pi
+# 底图 PhotoImage 最长边上限。低配设备（车载工控机/Jetson）上 Tk 照片太大容易
+# 卡死或吃光内存；超过就强制降低 zoom，而不是等 resize 爆掉再报错。
+MAX_PHOTO_EDGE = 3000
 
 # 隧道规格字段：(键, 界面标签, 默认值)。顺序即界面里输入框的排布顺序。
 # 与 semantic_map.hpp 的 TunnelSpec 一一对应。
@@ -258,7 +261,10 @@ class EditorApp:
         self.mode = "pixel"          # pixel | rect | line
         self.brush = 1
         self.active_tunnel = 0        # 当前隧道在 self.model.tunnels 里的下标
-        self.undo_stack: list[tuple] = []
+        self.undo_stack: list[dict] = []
+        self._op: Optional[dict] = None
+        self._op_before: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+        self._poly_points: list[tuple[int, int]] = []
         self.drag_start: Optional[tuple[int, int]] = None
         self.pcd_overlay: Optional[np.ndarray] = None   # (h, w) 归一化高度或 None
         self.show_overlay = tk.BooleanVar(value=False)
@@ -278,9 +284,11 @@ class EditorApp:
         return f"语义地图编辑器 — {name}"
 
     def _fit_zoom(self) -> int:
-        # 让整张图初始时大致铺满一个 1000px 窗口，限制在 1~12 之间。
+        # 让整张图初始时大致铺满一个 1000px 窗口，限制在 1~12 之间，
+        # 同时不超过低配设备可承受的底图最长边。
         span = max(self.model.width, self.model.height)
-        return max(1, min(12, 1000 // max(1, span)))
+        return max(1, min(12, 1000 // max(1, span),
+                          MAX_PHOTO_EDGE // max(1, span)))
 
     def _build_toolbar(self) -> None:
         bar = ttk.Frame(self.root, padding=4)
@@ -295,7 +303,8 @@ class EditorApp:
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Label(bar, text="工具:").pack(side=tk.LEFT)
         self._mode_var = tk.StringVar(value=self.mode)
-        for value, name in (("pixel", "点/刷"), ("rect", "矩形"), ("line", "隧道轴线")):
+        for value, name in (("pixel", "点/刷"), ("rect", "矩形"), ("line", "隧道轴线"),
+                            ("poly", "多边形")):
             ttk.Radiobutton(bar, text=name, value=value, variable=self._mode_var,
                             command=self._on_mode_change).pack(side=tk.LEFT)
 
@@ -344,7 +353,9 @@ class EditorApp:
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<Motion>", self._on_hover)
+        self.root.bind("<Escape>", self._on_escape)
 
         self._build_tunnel_panel()
 
@@ -416,6 +427,17 @@ class EditorApp:
         gray_rgb = np.stack([gray, gray, gray], axis=-1)
         return ((rgb.astype(np.uint16) + gray_rgb.astype(np.uint16)) // 2).astype(np.uint8)
 
+    def _cell_color(self, gx: int, gy: int) -> str:
+        """单格的画布填充色，与 _base_rgb 的配色保持一致。"""
+        label = int(self.model.terrain[gy, gx])
+        if label == TERRAIN_TUNNEL:
+            tid = int(self.model.tunnel_id[gy, gx])
+            if 0 < tid <= len(self.model.tunnels):
+                r, g, b = TUNNEL_ID_TINT[(tid - 1) % len(TUNNEL_ID_TINT)]
+                return f"#{r:02x}{g:02x}{b:02x}"
+        r, g, b = LABEL_COLOR.get(label, LABEL_COLOR[TERRAIN_UNKNOWN])
+        return f"#{r:02x}{g:02x}{b:02x}"
+
     def _render(self) -> None:
         rgb = self._blend_overlay(self._base_rgb())
         # 模型 y=0 在下，画布 y=0 在上 —— 纵向翻转一次，之后不再翻。
@@ -426,13 +448,35 @@ class EditorApp:
                                   self.model.height * self.zoom), Image.NEAREST)
         self._photo = ImageTk.PhotoImage(image)
         self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo,
+                                 tags=("grid",))
         self.canvas.configure(scrollregion=(0, 0, image.width, image.height))
         if self.show_arrows.get():
             self._draw_axes()
+        self._draw_poly_preview()
+
+    def _render_patch(self, ys: Iterable[int], xs: Iterable[int]) -> None:
+        """只把刚改过的格画成色块覆盖到底图上，不做全图 resize。
+
+        pixel 模式拖动时每帧只画几十个矩形，低配设备也扛得住；轴线在拖动期间
+        先删掉（被色块压住会花屏），松开左键后由 _render 全量恢复。
+        """
+        ys = list(ys)
+        xs = list(xs)
+        if not ys:
+            return
+        self.canvas.delete("axes")
+        z = self.zoom
+        top = self.model.height - 1
+        for gy, gx in zip(ys, xs):
+            color = self._cell_color(int(gx), int(gy))
+            self.canvas.create_rectangle(
+                gx * z, (top - gy) * z, (gx + 1) * z, (top - gy + 1) * z,
+                fill=color, width=0, outline="", tags=("patch",))
 
     def _draw_axes(self) -> None:
         """给每条隧道画一根贯穿其格子的双头轴杆（无向，两端对称）。"""
+        self.canvas.delete("axes")
         tunnel_mask = self.model.terrain == TERRAIN_TUNNEL
         if not np.any(tunnel_mask):
             return
@@ -455,11 +499,35 @@ class EditorApp:
             top = self.model.height - 1
             x0, y0 = (cx - dx + 0.5) * z, (top - (cy - dy) + 0.5) * z
             x1, y1 = (cx + dx + 0.5) * z, (top - (cy + dy) + 0.5) * z
-            self.canvas.create_line(x0, y0, x1, y1, fill="#ffef60", width=2)
+            self.canvas.create_line(x0, y0, x1, y1, fill="#ffef60", width=2,
+                                    tags=("axes",))
             # 两端各画个小圆点，强调无向。
             for ex, ey in ((x0, y0), (x1, y1)):
                 self.canvas.create_oval(ex - 3, ey - 3, ex + 3, ey + 3,
-                                        fill="#ffef60", outline="")
+                                        fill="#ffef60", outline="",
+                                        tags=("axes",))
+
+    def _draw_poly_preview(self) -> None:
+        """画当前多边形编辑中的轮廓线（蓝色）与顶点。"""
+        self.canvas.delete("poly")
+        if not self._poly_points:
+            return
+        z = self.zoom
+        top = self.model.height - 1
+        pts = [(gx * z + z / 2, (top - gy) * z + z / 2)
+               for gx, gy in self._poly_points]
+        if len(pts) == 1:
+            x, y = pts[0]
+            self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                                    fill="#00aaff", outline="", tags=("poly",))
+        else:
+            flat = [c for p in pts for c in p]
+            self.canvas.create_line(*flat, fill="#00aaff", width=2,
+                                    tags=("poly",))
+            for x, y in pts:
+                self.canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                                        fill="#00aaff", outline="",
+                                        tags=("poly",))
 
     # ---- 坐标换算 ----
     def _canvas_to_cell(self, ex: float, ey: float) -> Optional[tuple[int, int]]:
@@ -473,13 +541,70 @@ class EditorApp:
         return None
 
     # ---- 编辑操作 ----
-    def _snapshot(self) -> None:
-        """入栈一份撤销点。三通道一起存，撤销时整体还原。"""
-        self.undo_stack.append((
-            self.model.terrain.copy(),
-            self.model.direction.copy(),
-            self.model.tunnel_id.copy(),
-        ))
+    def _begin_op(self) -> None:
+        """开始收集一次编辑的 diff（旧值），供撤销用。
+
+        同时保留操作前的整图旧值：小改动走 diff，改动超过半图时直接存整图，
+        否则全图操作存 diff 反而比整图还大。
+        """
+        self._op = {"seen": set(), "ys": [], "xs": [],
+                    "old_t": [], "old_d": [], "old_id": [],
+                    "overflow": False}
+        self._op_before = (self.model.terrain.copy(),
+                           self.model.direction.copy(),
+                           self.model.tunnel_id.copy())
+
+    def _end_op(self) -> None:
+        """把当前收集到的 diff 压入撤销栈；超过半图时改存操作前整图快照。"""
+        op = self._op
+        before = self._op_before
+        self._op = None
+        self._op_before = None
+        if op is None:
+            return
+        if op.get("overflow"):
+            # 单次写入就超过半图：diff 比整图还大，直接用操作前快照。
+            self.undo_stack.append({
+                "kind": "full",
+                "terrain": before[0],
+                "direction": before[1],
+                "tunnel_id": before[2],
+            })
+            if len(self.undo_stack) > MAX_UNDO:
+                self.undo_stack.pop(0)
+            return
+        if not op["ys"]:
+            return
+
+        ys = np.asarray(op["ys"], dtype=np.int32)
+        xs = np.asarray(op["xs"], dtype=np.int32)
+        total = self.model.width * self.model.height
+        if len(ys) > total // 2:
+            self.undo_stack.append({
+                "kind": "full",
+                "terrain": before[0],
+                "direction": before[1],
+                "tunnel_id": before[2],
+            })
+        else:
+            self.undo_stack.append({
+                "kind": "diff",
+                "ys": ys, "xs": xs,
+                "old_t": np.asarray(op["old_t"], dtype=np.uint8),
+                "old_d": np.asarray(op["old_d"], dtype=np.uint8),
+                "old_id": np.asarray(op["old_id"], dtype=np.uint8),
+            })
+        if len(self.undo_stack) > MAX_UNDO:
+            self.undo_stack.pop(0)
+
+    def _snapshot_full(self) -> None:
+        """整图三通道快照入栈。给删除隧道这类直接改数组、不经过 _paint_cells 的操作用。"""
+        self.undo_stack.append({
+            "kind": "full",
+            "terrain": self.model.terrain.copy(),
+            "direction": self.model.direction.copy(),
+            "tunnel_id": self.model.tunnel_id.copy(),
+        })
         if len(self.undo_stack) > MAX_UNDO:
             self.undo_stack.pop(0)
 
@@ -487,22 +612,69 @@ class EditorApp:
         if not self.undo_stack:
             self.status.set("没有可撤销的操作")
             return
-        self.model.terrain, self.model.direction, self.model.tunnel_id = \
-            self.undo_stack.pop()
+        op = self.undo_stack.pop()
+        if op["kind"] == "full":
+            self.model.terrain = op["terrain"]
+            self.model.direction = op["direction"]
+            self.model.tunnel_id = op["tunnel_id"]
+        else:
+            self.model.terrain[op["ys"], op["xs"]] = op["old_t"]
+            self.model.direction[op["ys"], op["xs"]] = op["old_d"]
+            self.model.tunnel_id[op["ys"], op["xs"]] = op["old_id"]
         self._render()
         self.status.set("已撤销")
 
-    def _paint_cells(self, xs: Iterable[int], ys: Iterable[int]) -> None:
-        """把一批格子设成当前标签。隧道格顺带写 id 与轴向；非隧道格清掉两者。"""
-        xs = np.asarray(list(xs))
-        ys = np.asarray(list(ys))
-        self.model.terrain[ys, xs] = self.active_label
-        if self.active_label == TERRAIN_TUNNEL:
-            self.model.tunnel_id[ys, xs] = self.active_tunnel + 1
-            # 单点/矩形涂隧道时方向暂设 0，靠「隧道轴线」工具补；这里不覆盖已有轴向。
+    def _paint_cells(self, xs: Iterable[int], ys: Iterable[int],
+                     direction: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
+        """把一批格子设成当前标签，返回实际写入的 (ys, xs)。
+
+        隧道格顺带写 id；direction 显式给出时写轴向（轴线工具用），否则
+        单点/矩形涂隧道不覆盖已有轴向，非隧道格清掉方向与 id。
+        """
+        xs = np.asarray(list(xs), dtype=np.int32)
+        ys = np.asarray(list(ys), dtype=np.int32)
+        if xs.size == 0:
+            return ys, xs
+
+        new_t = self.active_label
+        if new_t == TERRAIN_TUNNEL:
+            new_id = self.active_tunnel + 1
+            if direction is None:
+                new_d = self.model.direction[ys, xs]
+            else:
+                new_d = np.full(xs.shape, direction, dtype=np.uint8)
         else:
-            self.model.direction[ys, xs] = 0
-            self.model.tunnel_id[ys, xs] = 0
+            new_id = 0
+            new_d = 0
+
+        # 先记录本次真正发生变化的格子的旧值（同一格在一次操作里只记一次）。
+        # 单次写入就超过半图时直接标记 overflow，_end_op 会改用操作前整图快照，
+        # 避免大矩形/多边形还要逐格跑 Python 循环。
+        if self._op is not None:
+            changed = (
+                (self.model.terrain[ys, xs] != new_t) |
+                (self.model.direction[ys, xs] != new_d) |
+                (self.model.tunnel_id[ys, xs] != new_id)
+            )
+            if np.any(changed):
+                if int(np.count_nonzero(changed)) > self.model.width * self.model.height // 2:
+                    self._op["overflow"] = True
+                else:
+                    seen = self._op["seen"]
+                    for gy, gx in zip(ys[changed].tolist(), xs[changed].tolist()):
+                        key = (int(gx), int(gy))
+                        if key not in seen:
+                            seen.add(key)
+                            self._op["ys"].append(int(gy))
+                            self._op["xs"].append(int(gx))
+                            self._op["old_t"].append(int(self.model.terrain[gy, gx]))
+                            self._op["old_d"].append(int(self.model.direction[gy, gx]))
+                            self._op["old_id"].append(int(self.model.tunnel_id[gy, gx]))
+
+        self.model.terrain[ys, xs] = new_t
+        self.model.direction[ys, xs] = new_d
+        self.model.tunnel_id[ys, xs] = new_id
+        return ys, xs
 
     def _apply_pixel(self, cell: tuple[int, int]) -> None:
         gx, gy = cell
@@ -512,7 +684,8 @@ class EditorApp:
             for xx in range(max(0, gx - r), min(self.model.width, gx + r + 1)):
                 xs.append(xx)
                 ys.append(yy)
-        self._paint_cells(xs, ys)
+        ys, xs = self._paint_cells(xs, ys)
+        self._render_patch(ys, xs)
 
     def _apply_rect(self, a: tuple[int, int], b: tuple[int, int]) -> None:
         x0, x1 = sorted((a[0], b[0]))
@@ -548,15 +721,7 @@ class EditorApp:
                     xs.append(xx)
                     ys.append(yy)
 
-        xs_a = np.asarray(xs)
-        ys_a = np.asarray(ys)
-        self.model.terrain[ys_a, xs_a] = self.active_label
-        if self.active_label == TERRAIN_TUNNEL:
-            self.model.direction[ys_a, xs_a] = enc
-            self.model.tunnel_id[ys_a, xs_a] = self.active_tunnel + 1
-        else:
-            self.model.direction[ys_a, xs_a] = 0
-            self.model.tunnel_id[ys_a, xs_a] = 0
+        self._paint_cells(xs, ys, direction=enc)
 
     @staticmethod
     def _bresenham(a: tuple[int, int], b: tuple[int, int]) -> list[tuple[int, int]]:
@@ -586,9 +751,12 @@ class EditorApp:
         if cell is None:
             return
         if self.mode == "pixel":
-            self._snapshot()
+            self._begin_op()
             self._apply_pixel(cell)
-            self._render()
+        elif self.mode == "poly":
+            self._poly_points.append(cell)
+            self._draw_poly_preview()
+            self._update_hover(cell)
         else:
             # 矩形 / 轴线：按下记起点，松开时一次成型。
             self.drag_start = cell
@@ -599,24 +767,103 @@ class EditorApp:
             return
         if self.mode == "pixel":
             self._apply_pixel(cell)
-            self._render()
         self._update_hover(cell)
 
     def _on_release(self, event: tk.Event) -> None:
         cell = self._canvas_to_cell(event.x, event.y)
         if self.mode == "pixel":
-            self.drag_start = None
+            self._end_op()
+            # 拖动结束做一次全量渲染，清掉临时色块、恢复轴线显示。
+            self.canvas.delete("patch")
+            self._render()
+            return
+        if self.mode == "poly":
             return
         if cell is None or self.drag_start is None:
             self.drag_start = None
             return
-        self._snapshot()
+        self._begin_op()
         if self.mode == "rect":
             self._apply_rect(self.drag_start, cell)
         elif self.mode == "line":
             self._apply_line(self.drag_start, cell)
+        self._end_op()
         self.drag_start = None
         self._render()
+
+    def _on_right_click(self, _event: tk.Event) -> None:
+        """右键完成多边形填充（顶点数 ≥ 3）。"""
+        if self.mode != "poly":
+            return
+        if len(self._poly_points) >= 3:
+            self._begin_op()
+            self._apply_poly(self._poly_points)
+            self._end_op()
+            self.status.set(f"已填充 {len(self._poly_points)} 边形区域")
+        else:
+            self.status.set("多边形至少需要 3 个顶点，已取消")
+        self._poly_points.clear()
+        self._render()
+
+    def _on_escape(self, _event: tk.Event) -> None:
+        if self._poly_points:
+            self._poly_points.clear()
+            self.canvas.delete("poly")
+            self.status.set("已取消多边形")
+
+    @staticmethod
+    def _points_in_polygon(px: np.ndarray, py: np.ndarray,
+                           poly: list[tuple[int, int]]) -> np.ndarray:
+        """向量化射线法：判断格心坐标是否在多边形内部（含边）。"""
+        px = np.asarray(px, dtype=np.float64)
+        py = np.asarray(py, dtype=np.float64)
+        inside = np.zeros(px.shape, dtype=bool)
+        n = len(poly)
+        for i in range(n):
+            x1, y1 = float(poly[i][0]), float(poly[i][1])
+            x2, y2 = float(poly[(i + 1) % n][0]), float(poly[(i + 1) % n][1])
+            if y1 > y2:
+                x1, x2 = x2, x1
+                y1, y2 = y2, y1
+            # 水平射线只穿过 (y1, y2] 的边，避免顶点重复计数。
+            cross = (y1 <= py) & (py < y2)
+            if not np.any(cross):
+                continue
+            if y2 == y1:
+                continue
+            x_int = x1 + (py[cross] - y1) * (x2 - x1) / (y2 - y1)
+            inside[cross] ^= (px[cross] > x_int)
+        return inside
+
+    def _apply_poly(self, points: list[tuple[int, int]]) -> None:
+        """把多边形包围的格子批量填充为当前标签（借鉴 map_edit RegionTool 的交互）。
+
+        顶点存的是格索引；判断时把顶点抬到格心坐标做射线法，再把顶点格和边
+        经过的格强制纳入边界，保证用户点过的顶点格不会被漏在区域外。
+        """
+        pts = np.asarray(points, dtype=np.int32)
+        x0, x1 = int(pts[:, 0].min()), int(pts[:, 0].max())
+        y0, y1 = int(pts[:, 1].min()), int(pts[:, 1].max())
+        gx = np.arange(max(0, x0), min(self.model.width, x1 + 1))
+        gy = np.arange(max(0, y0), min(self.model.height, y1 + 1))
+        if gx.size == 0 or gy.size == 0:
+            return
+        xx, yy = np.meshgrid(gx, gy)
+        center_pts = [(float(x) + 0.5, float(y) + 0.5) for x, y in points]
+        inside = self._points_in_polygon(xx.ravel() + 0.5, yy.ravel() + 0.5,
+                                         center_pts)
+
+        # 边界格：顶点 + 相邻顶点间的 Bresenham 线。
+        boundary: set[tuple[int, int]] = set(points)
+        for i in range(len(points)):
+            boundary.update(self._bresenham(points[i],
+                                            points[(i + 1) % len(points)]))
+        for gx0, gy0 in boundary:
+            if 0 <= gx0 < self.model.width and 0 <= gy0 < self.model.height:
+                inside[(xx.ravel() == gx0) & (yy.ravel() == gy0)] = True
+
+        if np.any(inside):
+            self._paint_cells(xx.ravel()[inside], yy.ravel()[inside])
 
     def _on_hover(self, event: tk.Event) -> None:
         cell = self._canvas_to_cell(event.x, event.y)
@@ -652,12 +899,18 @@ class EditorApp:
         if self.mode == "line":
             # 轴线工具默认配合隧道标签使用。
             self._pick_label(TERRAIN_TUNNEL)
+        # 切换工具时取消未完成的多边形，避免残留预览。
+        if self._poly_points:
+            self._poly_points.clear()
+            self.canvas.delete("poly")
 
     def _on_brush_change(self) -> None:
         self.brush = max(1, int(self._brush_var.get()))
 
     def _set_zoom(self, zoom: int) -> None:
-        self.zoom = max(1, min(20, zoom))
+        span = max(self.model.width, self.model.height)
+        max_by_photo = max(1, MAX_PHOTO_EDGE // max(1, span))
+        self.zoom = max(1, min(20, zoom, max_by_photo))
         self._render()
 
     # ---- 隧道面板 ----
@@ -739,7 +992,7 @@ class EditorApp:
                 "删除隧道", f"隧道 #{index + 1} 还有 {used} 个格子在用，删了会把它们"
                 "留成没有归属的隧道格（保存会被拒绝）。仍要删除？"):
             return
-        self._snapshot()
+        self._snapshot_full()
         del self.model.tunnels[index]
         # 重排后续 id：> index+1 的减一，== index+1 的清零。
         ids = self.model.tunnel_id
@@ -810,6 +1063,8 @@ class EditorApp:
             messagebox.showerror("打开失败", str(error))
             return
         self.undo_stack.clear()
+        self._op = None
+        self._poly_points.clear()
         self.pcd_overlay = None
         self.zoom = self._fit_zoom()
         self.root.title(self._title())

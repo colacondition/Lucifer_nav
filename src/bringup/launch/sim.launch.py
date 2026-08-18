@@ -8,9 +8,12 @@ from launch.actions import (
     DeclareLaunchArgument,
     GroupAction,
     IncludeLaunchDescription,
+    RegisterEventHandler,
     SetEnvironmentVariable,
+    TimerAction,
 )
 from launch.conditions import IfCondition, LaunchConfigurationEquals
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     Command,
@@ -18,7 +21,8 @@ from launch.substitutions import (
     PathJoinSubstitution,
     PythonExpression,
 )
-from launch_ros.actions import Node
+from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
+from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
 
 
@@ -39,6 +43,7 @@ def generate_launch_description():
     waypoint_file = LaunchConfiguration('waypoint_file')
     mode = LaunchConfiguration('mode')
     mapping_nav = LaunchConfiguration('mapping_nav')
+    perception_threads = LaunchConfiguration('perception_threads')
 
     # 建图模式下也跑导航（SLAM-navigation）：map 帧与 /map 由 slam_toolbox 边扫边
     # 发，语义地图缺席（还没有 .msgpack 可读），隧道相关逻辑全部退化失效，仅作普通
@@ -116,6 +121,9 @@ def generate_launch_description():
     declare_gazebo_gui = DeclareLaunchArgument('gazebo_gui', default_value='True')
     declare_log_level = DeclareLaunchArgument('log_level', default_value='warn')
     declare_node_output = DeclareLaunchArgument('node_output', default_value='log')
+    declare_perception_threads = DeclareLaunchArgument(
+        'perception_threads', default_value='2',
+        description='感知容器 executor 线程数（lidar_filter + ground_segmentation）')
     declare_waypoint_file = DeclareLaunchArgument(
         'waypoint_file', default_value='/tmp/navigation_waypoints.csv')
     declare_software_rendering = DeclareLaunchArgument(
@@ -186,32 +194,73 @@ def generate_launch_description():
         output='log',
         arguments=['--frame-id', 'odom', '--child-frame-id', 'world'])
 
-    # ===== 3. 感知链 =====
-    lidar_filter_node = Node(
-        respawn=True, respawn_delay=2.0,
+    # ===== 3. 感知链：lidar_filter + ground_segmentation 同容器 intra-process =====
+    # 与 real.launch.py 同一套：两节点合并进 component_container_mt，显式打开
+    # intra-process，/livox/lidar_filtered/pointcloud 整帧点云走进程内指针投递，
+    # 省掉 DDS 序列化 + 传输 + 反序列化。topic QoS 为 SensorDataQoS
+    # （volatile + best_effort + keep_last(5)），满足 Humble intra-process 的
+    # volatile 限制。
+    perception_container = ComposableNodeContainer(
+        name='perception_container',
+        namespace='',
+        respawn=True, respawn_delay=2.0,  # 容器崩溃自愈（两节点均可从参数重建）
         package='cpp_lidar_filter',
-        executable='lidar_filter_node',
-        name='lidar_filter',
+        # 固定线程数容器：不用 Humble 自带的 component_container_mt，后者线程数
+        # 恒为 hardware_concurrency()（本机 24），感知链只用 2 个 executor 线程
+        # 即可覆盖两个节点并保留相邻帧流水线重叠，线程数与 footprint 都可控。
+        executable='perception_container_mt',
+        arguments=[perception_threads] + common_log_arguments,
         output=node_output,
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            'input_topic': '/livox/lidar/pointcloud',
-            'output_topic': '/livox/lidar_filtered/pointcloud',
-            'navigation_frame': 'base_link',
-            'navigation_range': 10.0,
-            'leaf_size': 0.06,
-        }],
-        arguments=common_log_arguments)
+        additional_env=system_libusb_env)
 
-    ground_seg_node = Node(
-        respawn=True, respawn_delay=2.0,
-        package='linefit_ground_segmentation_ros',
-        executable='ground_segmentation_node',
-        name='ground_segmentation',
-        output=node_output,
-        additional_env=system_libusb_env,
-        parameters=[seg_params, {'use_sim_time': use_sim_time}],
-        arguments=common_log_arguments)
+    def perception_component(plugin, name, package, parameters):
+        return LoadComposableNodes(
+            target_container=perception_container,
+            composable_node_descriptions=[
+                ComposableNode(
+                    package=package,
+                    plugin=plugin,
+                    name=name,
+                    parameters=parameters,
+                    # Humble 的 component_container 默认不会给加载的组件打开
+                    # intra-process，必须逐个组件显式传入。
+                    extra_arguments=[{'use_intra_process_comms': True}],
+                )
+            ],
+        )
+
+    def make_perception_load_actions():
+        return [
+            perception_component(
+                'cpp_lidar_filter::LidarFilterNode',
+                'lidar_filter',
+                'cpp_lidar_filter',
+                [{
+                    'use_sim_time': use_sim_time,
+                    'input_topic': '/livox/lidar/pointcloud',
+                    'output_topic': '/livox/lidar_filtered/pointcloud',
+                    'navigation_frame': 'base_link',
+                    'navigation_range': 10.0,
+                    'leaf_size': 0.06,
+                }]),
+            perception_component(
+                'linefit_ground_segmentation::SegmentationNode',
+                'ground_segmentation',
+                'linefit_ground_segmentation_ros',
+                [seg_params, {'use_sim_time': use_sim_time}]),
+        ]
+
+    # 容器每次退出（崩溃被 respawn 或正常退出）都重新调度组件加载。Humble 的
+    # LoadComposableNodes 只执行一次，respawn 只会拉起空容器；与 navigation2
+    # 容器同一套补救逻辑：等 4s 让 rclpy 图缓存里的旧 load_node 服务过期。
+    def reload_perception_on_exit(event, context):
+        cmd = getattr(event, 'cmd', None)
+        if cmd and any('perception_container_mt' in str(part) for part in cmd):
+            return [TimerAction(period=4.0, actions=make_perception_load_actions())]
+        return None
+
+    reload_perception_components = RegisterEventHandler(
+        OnProcessExit(on_exit=reload_perception_on_exit))
 
     # ===== 3.5 建图链：点云转激光 + slam_toolbox（仅 mode:=mapping）=====
     # 与 real.launch.py 同一套（说明也见那边）：去地面障碍点云转 2D 扫描，
@@ -380,14 +429,16 @@ def generate_launch_description():
     for action in [
         declare_world, declare_mode, declare_mapping_nav, declare_use_sim_time,
         declare_nav_rviz, declare_gazebo_gui, declare_log_level, declare_node_output,
+        declare_perception_threads,
         declare_software_rendering, declare_waypoint_file, declare_map_save_dir,
         enable_software_gl,
         start_simulation,
         lio_node,
         tf_odom_to_lidar_odom,
         tf_odom_to_world,
-        lidar_filter_node,
-        ground_seg_node,
+        perception_container,
+        *make_perception_load_actions(),
+        reload_perception_components,
         cloud_to_scan_node,
         slam_mapping_node,
         fast_loc_node,

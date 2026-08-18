@@ -7,8 +7,11 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    RegisterEventHandler,
+    TimerAction,
 )
 from launch.conditions import IfCondition, LaunchConfigurationEquals
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (
     Command,
@@ -16,7 +19,8 @@ from launch.substitutions import (
     PathJoinSubstitution,
     PythonExpression,
 )
-from launch_ros.actions import Node
+from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
+from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
@@ -38,6 +42,7 @@ def generate_launch_description():
     use_serial_driver = LaunchConfiguration('use_serial_driver')
     use_decision = LaunchConfiguration('use_decision')
     mapping_nav = LaunchConfiguration('mapping_nav')
+    perception_threads = LaunchConfiguration('perception_threads')
 
     # 建图模式下也跑导航（SLAM-navigation）：map 帧与 /map 由 slam_toolbox 边扫边
     # 发，语义地图缺席（还没有 .msgpack 可读），隧道相关逻辑全部退化失效，仅作普通
@@ -112,6 +117,9 @@ def generate_launch_description():
     declare_nav_rviz = DeclareLaunchArgument('nav_rviz', default_value='False')
     declare_log_level = DeclareLaunchArgument('log_level', default_value='warn')
     declare_node_output = DeclareLaunchArgument('node_output', default_value='log')
+    declare_perception_threads = DeclareLaunchArgument(
+        'perception_threads', default_value='2',
+        description='感知容器 executor 线程数（lidar_filter + ground_segmentation）')
     declare_waypoint_file = DeclareLaunchArgument(
         'waypoint_file', default_value='/tmp/navigation_waypoints.csv')
     # 建图输出目录，默认就是 mode:=nav 下 fast_location 要读的地方，建完直接能用。
@@ -187,32 +195,75 @@ def generate_launch_description():
         output='log',
         arguments=['--frame-id', 'odom', '--child-frame-id', 'world'])
 
-    # ===== 4. 感知链 =====
-    lidar_filter_node = Node(
-        respawn=True, respawn_delay=2.0,
+    # ===== 4. 感知链：lidar_filter + ground_segmentation 同容器 intra-process =====
+    # 两节点原为独立进程，/livox/lidar_filtered/pointcloud 整帧点云每次都要走
+    # DDS 序列化 + 传输 + 反序列化。合并进同一个 component_container 并显式开启
+    # intra-process 后，该 topic 直接以 shared_ptr/unique_ptr 在进程内投递。
+    #
+    # Humble 的 intra-process 只接受 volatile + keep_last(depth>0) 的 QoS，
+    # 传感器点云 topic 用的正是 SensorDataQoS（volatile + best_effort），所以
+    # 可以安全打开；与导航容器不同，这里没有 transient_local 限制。
+    perception_container = ComposableNodeContainer(
+        name='perception_container',
+        namespace='',
+        respawn=True, respawn_delay=2.0,  # 容器崩溃自愈（两节点均可从参数重建）
         package='cpp_lidar_filter',
-        executable='lidar_filter_node',
-        name='lidar_filter',
+        # 固定线程数容器：不用 Humble 自带的 component_container_mt，后者线程数
+        # 恒为 hardware_concurrency()（本机 24），感知链只用 2 个 executor 线程
+        # 即可覆盖两个节点并保留相邻帧流水线重叠，线程数与 footprint 都可控。
+        executable='perception_container_mt',
+        arguments=[perception_threads] + common_log_arguments,
         output=node_output,
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            'input_topic': '/livox/lidar/pointcloud',
-            'output_topic': '/livox/lidar_filtered/pointcloud',
-            'navigation_frame': 'base_link',
-            'navigation_range': 10.0,
-            'leaf_size': 0.06,
-        }],
-        arguments=common_log_arguments)
+        additional_env=system_libusb_env)
 
-    ground_seg_node = Node(
-        respawn=True, respawn_delay=2.0,
-        package='linefit_ground_segmentation_ros',
-        executable='ground_segmentation_node',
-        name='ground_segmentation',
-        output=node_output,
-        additional_env=system_libusb_env,
-        parameters=[seg_params, {'use_sim_time': use_sim_time}],
-        arguments=common_log_arguments)
+    def perception_component(plugin, name, package, parameters):
+        return LoadComposableNodes(
+            target_container=perception_container,
+            composable_node_descriptions=[
+                ComposableNode(
+                    package=package,
+                    plugin=plugin,
+                    name=name,
+                    parameters=parameters,
+                    # Humble 的 component_container 默认不会给加载的组件打开
+                    # intra-process，必须逐个组件显式传入。
+                    extra_arguments=[{'use_intra_process_comms': True}],
+                )
+            ],
+        )
+
+    def make_perception_load_actions():
+        return [
+            perception_component(
+                'cpp_lidar_filter::LidarFilterNode',
+                'lidar_filter',
+                'cpp_lidar_filter',
+                [{
+                    'use_sim_time': use_sim_time,
+                    'input_topic': '/livox/lidar/pointcloud',
+                    'output_topic': '/livox/lidar_filtered/pointcloud',
+                    'navigation_frame': 'base_link',
+                    'navigation_range': 10.0,
+                    'leaf_size': 0.06,
+                }]),
+            perception_component(
+                'linefit_ground_segmentation::SegmentationNode',
+                'ground_segmentation',
+                'linefit_ground_segmentation_ros',
+                [seg_params, {'use_sim_time': use_sim_time}]),
+        ]
+
+    # 容器每次退出（崩溃被 respawn 或正常退出）都重新调度组件加载。Humble 的
+    # LoadComposableNodes 只执行一次，respawn 只会拉起空容器；与 navigation2
+    # 容器同一套补救逻辑：等 4s 让 rclpy 图缓存里的旧 load_node 服务过期。
+    def reload_perception_on_exit(event, context):
+        cmd = getattr(event, 'cmd', None)
+        if cmd and any('perception_container_mt' in str(part) for part in cmd):
+            return [TimerAction(period=4.0, actions=make_perception_load_actions())]
+        return None
+
+    reload_perception_components = RegisterEventHandler(
+        OnProcessExit(on_exit=reload_perception_on_exit))
 
     # ===== 4.5 建图链：点云转激光 + slam_toolbox（仅 mode:=mapping）=====
     # 为什么不用 PCD 直转的高度切片出图：实测 RMUL.pcd 地面起伏 ~0.4 m，
@@ -410,6 +461,7 @@ def generate_launch_description():
     for action in [
         declare_world, declare_mode, declare_mapping_nav, declare_use_sim_time,
         declare_nav_rviz, declare_log_level, declare_node_output,
+        declare_perception_threads,
         declare_waypoint_file, declare_map_save_dir,
         declare_use_serial_driver, declare_use_decision,
         robot_state_pub,
@@ -417,8 +469,9 @@ def generate_launch_description():
         lio_node,
         tf_odom_to_lidar_odom,
         tf_odom_to_world,
-        lidar_filter_node,
-        ground_seg_node,
+        perception_container,
+        *make_perception_load_actions(),
+        reload_perception_components,
         cloud_to_scan_node,
         slam_mapping_node,
         fast_loc_node,
