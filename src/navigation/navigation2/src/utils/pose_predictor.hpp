@@ -10,6 +10,26 @@
 
 namespace navigation2::utils {
 
+// 测量 odom 相对 now 的实际延迟，clamp 到 [0, max_dt]。状态外推与参考前移必须
+// 用同一个延迟量（sentry 的契约：延迟补偿同时前移状态和参考），所以把它抽出来
+// 供 predict_pose 与 MPC 参考构造共用，避免两处各自算、量还不一致。
+inline double odom_latency(
+  const nav_msgs::msg::Odometry & odom, const rclcpp::Time & now, double max_dt = 0.5)
+{
+  const rclcpp::Time stamp(odom.header.stamp, now.get_clock_type());
+  double dt = (now - stamp).seconds();
+  if (!std::isfinite(dt) || dt < 0.0) {
+    dt = 0.0;
+  }
+  if (max_dt < 0.0) {
+    max_dt = 0.0;
+  }
+  if (dt > max_dt) {
+    dt = max_dt;
+  }
+  return dt;
+}
+
 // 按时间差外推位姿，最长只补到 max_dt。
 inline geometry_msgs::msg::PoseStamped predict_pose(
   const nav_msgs::msg::Odometry & odom, const rclcpp::Time & now, double max_dt = 0.5)
@@ -30,17 +50,7 @@ inline geometry_msgs::msg::PoseStamped predict_pose(
   Eigen::Vector3d w(
     odom.twist.twist.angular.x, odom.twist.twist.angular.y, odom.twist.twist.angular.z);
 
-  const rclcpp::Time stamp(odom.header.stamp, now.get_clock_type());
-  double dt = (now - stamp).seconds();
-  if (!std::isfinite(dt) || dt < 0.0) {
-    dt = 0.0;
-  }
-  if (max_dt < 0.0) {
-    max_dt = 0.0;
-  }
-  if (dt > max_dt) {
-    dt = max_dt;
-  }
+  const double dt = odom_latency(odom, now, max_dt);
 
   const double wn = w.norm();
   Eigen::Quaterniond dq(Eigen::AngleAxisd(

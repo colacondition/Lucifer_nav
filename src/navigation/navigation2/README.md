@@ -62,7 +62,7 @@ ros2 launch bringup real.launch.py \
 规划器还有三层鲁棒性保障：
 
 - **规划失败冷却**：同一目标规划失败后进入冷却期，避免对不可达目标以 `planning_frequency` 空转重试、洪水刷日志。目标明显移动或收到明确重规划请求时忽略冷却。
-- **路径发布前验收**：沿规划结果逐姿态采样代价地图，拒绝穿越代价 ≥ `path_acceptance_max_cost` 的格子。
+- **路径发布前验收**：沿规划结果逐姿态用与 A* 相同的占用定义检查，拒绝 `isOccupied` 格（阈值取 `max(path_acceptance_max_cost, obstacle_threshold)`）。
 - **规划代次校验**：目标变化或明确重规划时递增代次，A* 完成发布前对比代次，旧地图快照的晚到结果直接丢弃，防止覆盖新目标。
 
 相关参数位于 `rm_global_planner`：
@@ -76,7 +76,7 @@ stitch_min_lookahead_distance: 0.8
 stitch_max_distance: 3.0
 plan_failure_cooldown: 2.0
 path_acceptance_enabled: true
-path_acceptance_max_cost: 85
+path_acceptance_max_cost: 100
 ```
 
 MPC 使用 `/local_costmap/costmap` 对求解后的预测运动逐段做碰撞检查。地图缺失、过期、越界或预测路径命中障碍时，控制器发布零线速度，并通过 `/navigation2/replan_request` 通知全局规划器立即重规划。相关参数位于 `rm_mpc_controller.local_safety.*`，求解和路径参考代码位于 `src/mpc`。

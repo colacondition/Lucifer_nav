@@ -14,6 +14,7 @@ struct MincoOptimizer::Impl
   lbfgs::lbfgs_parameter_t lbfgs_params_;
 
   std::function<bool(const Eigen::Vector2d &, Eigen::Vector2d &)> tunnel_axis_query_;
+  std::function<bool(const Eigen::Vector2d &, double &, Eigen::Vector2d &)> distance_query_;
 
   // 优化过程中的临时变量
   int piece_num_{0};
@@ -121,14 +122,14 @@ struct MincoOptimizer::Impl
   double attach_penalty_functional(const Eigen::Matrix2Xd & in_ps, Eigen::Matrix2Xd & gradp) const noexcept
   {
     const int N = in_ps.cols();
-    if (N < 2) {
+    if (N <= 0) {
       return 0.0;
     }
 
     double cost_val = 0.0;
     double c_cost = 0.0;
 
-    for (int i = 0; i < N - 1; i++) {
+    for (int i = 0; i < N; i++) {
       const Eigen::Vector2d & p0 = in_ps.col(i);
 
       // 数据项代价（保持接近原路径）
@@ -139,6 +140,54 @@ struct MincoOptimizer::Impl
       gradp.col(i).noalias() += 2.0 * params_.data_weight * deviation;
     }
 
+    return cost_val;
+  }
+
+  // 障碍 soft 代价：控制点处到最近障碍距离 d < safe_dist 时加
+  // w*(safe_dist-d)²，梯度沿距离场远离障碍方向。与 sentry 的 ESDF 位置代价一致，
+  // 但落在 Lucifer 已有的进程内距离场上（障碍外为正）。车本不该在障碍内；
+  // 恢复倒车方向可读同一份 DistanceFieldRegistry，HAZARD 安全点仍是环采样。
+  double attach_obstacle_functional(const Eigen::Matrix2Xd & in_ps, Eigen::Matrix2Xd & gradp) const noexcept
+  {
+    const double w = params_.obstacle_weight;
+    const double safe = params_.safe_dist;
+    if (w <= 0.0 || safe <= 0.0 || !distance_query_) {
+      return 0.0;
+    }
+    const int M = piece_num_ + 1;  // 总点数（含首尾）
+    double cost_val = 0.0;
+    double c_cost = 0.0;
+
+    for (int k = 0; k < M; ++k) {
+      Eigen::Vector2d p;
+      if (k == 0) {
+        p = waypoints_.front();
+      } else if (k == M - 1) {
+        p = waypoints_.back();
+      } else {
+        p = in_ps.col(k - 1);
+      }
+      double d = 0.0;
+      Eigen::Vector2d grad = Eigen::Vector2d::Zero();
+      if (!distance_query_(p, d, grad)) {
+        continue;
+      }
+      if (!std::isfinite(d) || d >= safe) {
+        continue;
+      }
+      const double margin = safe - d;
+      kahan_sum(cost_val, c_cost, w * margin * margin);
+      // dcost/dp = -2w(safe-d) * grad。grad 指向远离障碍，距离越近代价越高，
+      // 所以梯度沿 -grad 方向（把点往远离障碍推）。
+      const Eigen::Vector2d g = -2.0 * w * margin * grad;
+      if (!g.allFinite()) {
+        continue;
+      }
+      // 只有内部点进 gradp；边界点固定。
+      if (k >= 1 && k <= M - 2) {
+        gradp.col(k - 1).noalias() += g;
+      }
+    }
     return cost_val;
   }
 
@@ -194,6 +243,7 @@ struct MincoOptimizer::Impl
     cost_val += energy;
     cost_val += instance->attach_penalty_functional(in_ps, gradp);
     cost_val += instance->attach_axis_functional(in_ps, gradp);
+    cost_val += instance->attach_obstacle_functional(in_ps, gradp);
 
     Eigen::VectorXd g_full(2 * ctrl_num);
     g_full.setZero();
@@ -339,6 +389,12 @@ void MincoOptimizer::setTunnelAxisQuery(
   std::function<bool(const Eigen::Vector2d &, Eigen::Vector2d &)> query_fn)
 {
   impl_->tunnel_axis_query_ = query_fn;
+}
+
+void MincoOptimizer::setDistanceQuery(
+  std::function<bool(const Eigen::Vector2d &, double &, Eigen::Vector2d &)> query_fn)
+{
+  impl_->distance_query_ = query_fn;
 }
 
 std::vector<Piece<5, 2>> MincoOptimizer::optimize(

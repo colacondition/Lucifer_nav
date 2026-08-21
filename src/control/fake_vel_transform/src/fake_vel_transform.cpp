@@ -129,8 +129,9 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
     if (!std::isfinite(base_link_angle_)) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "Lookup returned a non-finite %s -> base_link yaw, skip cmd_vel transform.",
+        "Lookup returned a non-finite %s -> base_link yaw, publishing zero cmd_vel.",
         planner_frame.c_str());
+      cmd_vel_chassis_pub_->publish(geometry_msgs::msg::Twist{});
       return;
     }
 
@@ -138,7 +139,8 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
     if (!std::isfinite(angle_diff)) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "Current base_link_fake yaw offset is non-finite, skip cmd_vel transform.");
+        "Current base_link_fake yaw offset is non-finite, publishing zero cmd_vel.");
+      cmd_vel_chassis_pub_->publish(geometry_msgs::msg::Twist{});
       return;
     }
 
@@ -164,7 +166,9 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
   } catch (tf2::TransformException & ex) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "Could not transform planner frame to base_link, skip non-zero cmd_vel: %s", ex.what());
+      "Could not transform planner frame to base_link, publishing zero cmd_vel: %s",
+      ex.what());
+    cmd_vel_chassis_pub_->publish(geometry_msgs::msg::Twist{});
   }
 }
 

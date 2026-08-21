@@ -26,7 +26,9 @@
 #include <decision_interfaces/msg/semantic_map.hpp>
 
 #include "local_path_safety.hpp"
+#include "performance_monitor.hpp"
 #include "semantic_map_consumer.hpp"
+#include "shared_state.hpp"
 #include "mpc/mpc_solver.hpp"
 #include "mpc/path_reference.hpp"
 #include "mpc/progress_monitor.hpp"
@@ -127,11 +129,24 @@ public:
     direct_approach_kp_ = declare_parameter<double>("approach.direct_kp", 1.0);
     max_track_error_ = declare_parameter<double>("max_track_error", 0.5);
     blind_radius_ = declare_parameter<double>("blind_radius", 0.1);
-    delay_time_ = declare_parameter<double>("delay_time", 0.0);
     default_wz_ = declare_parameter<double>("default_wz", 0.0);
 
+    // 延迟补偿只有一套：delay_compensation。旧 delay_time（只前移参考、写死常量）
+    // 与它语义重叠，已删除 —— 状态外推与参考前移现在共用 odom_latency() 的同一
+    // 实测延迟，避免两处各自算、量还不一致（sentry 的延迟契约）。
     use_delay_comp_ = declare_parameter<bool>("delay_compensation.enable", false);
     delay_comp_max_dt_ = declare_parameter<double>("delay_compensation.max_dt", 0.5);
+
+    // 关断式性能观测：默认关。开 enable 后记录控制周期耗时 / MPC solve 失败原因。
+    {
+      navigation2::PerformanceMonitor::Config cfg;
+      cfg.enable = declare_parameter<bool>("performance.enable", false);
+      cfg.csv_enable = declare_parameter<bool>("performance.csv_enable", false);
+      cfg.csv_path = declare_parameter<std::string>(
+        "performance.csv_path", "/tmp/mpc_perf.csv");
+      cfg.print_enable = declare_parameter<bool>("performance.print_enable", false);
+      perf_monitor_.configure(cfg, get_logger());
+    }
 
     local_costmap_topic_ = declare_parameter<std::string>(
       "local_safety.costmap_topic", "/local_costmap/costmap");
@@ -471,6 +486,7 @@ private:
 
   void control()
   {
+    const auto perf_start = perf_monitor_.tick();
     nav_msgs::msg::Odometry odom;
     mpc::PathReference ref;
     nav_msgs::msg::OccupancyGrid::ConstSharedPtr local_costmap;
@@ -716,20 +732,55 @@ private:
       handleVeto(local_costmap, pos, dt, "invalid reference step");
       return;
     }
-    double s = route_tracker_.arc_length() + ds + speed_nominal * delay_time_;
+    // 参考前移用与状态外推同一个实测延迟：delay_compensation 开启时，状态在
+    // currentState() 里外推了 odom_latency()，参考也必须同步前移同样时长，否则
+    // 高速时 MPC 会盯着滞后一拍的参考（sentry 的延迟契约）。
+    double delay_dt = 0.0;
+    if (use_delay_comp_) {
+      delay_dt = navigation2::utils::odom_latency(odom, now(), delay_comp_max_dt_);
+    }
+    // 轨迹快照（进程内，smoother 同容器写入）：MINCO 优化后的 P/V 真值。用它替代
+    // Path 弧长重采样 —— 位置参考从折线量化变成解析轨迹，速度方向取 MINCO 解析切向；
+    // 模长仍走 speed_profile 曲率限速（MINCO 时间分配目前是 dist/v 常数、未做曲率
+    // 限速，直接取快照 v 的模长会在弯道给过高参考，不能倒退现有限速）。
+    // 快照无效（smoother 未写/轨迹太短）或弧长与当前路径明显不符时回退旧逻辑。
+    auto traj_snapshot = navigation2::TrajectoryCache::instance().latest();
+    const bool use_traj = traj_snapshot && traj_snapshot->valid &&
+      traj_snapshot->samples.size() >= 2 &&
+      std::abs(traj_snapshot->total_length - total_s) <= std::max(0.05 * total_s, 0.05);
+
+    double s = route_tracker_.arc_length() + ds + speed_nominal * delay_dt;
     for (int i = 0; i < steps_; ++i) {
       const double s_clamped = std::min(s, total_s);
-      Eigen::Vector2d rp = ref.pos_by_arc(s_clamped);
+      Eigen::Vector2d rp;
+      Eigen::Vector2d rv;
       // 速度前馈：优先用速度剖面值，不可用时退回常数。
       // 速度剖面按曲率限速，让 MPC 的参考在弯道处不超出可跟踪范围。
       const double v_ref =
         (speed_profile_enabled_ && speed_profile_.valid())
         ? speed_profile_.speed_at(s_clamped)
         : speed_nominal;
-      Eigen::Vector2d rv =
-        (s <= total_s)
-        ? Eigen::Vector2d(ref.tangent_by_arc(s_clamped) * v_ref)
-        : Eigen::Vector2d::Zero();
+      if (use_traj) {
+        navigation2::TrajectorySample smp;
+        if (traj_snapshot->queryAtArc(s_clamped, smp)) {
+          rp = Eigen::Vector2d(smp.x, smp.y);
+          const Eigen::Vector2d vdir(smp.vx, smp.vy);
+          const double vn = vdir.norm();
+          rv = (s <= total_s && vn > 1e-3)
+            ? Eigen::Vector2d(vdir / vn * v_ref)
+            : Eigen::Vector2d::Zero();
+        } else {
+          rp = ref.pos_by_arc(s_clamped);
+          rv = (s <= total_s)
+            ? Eigen::Vector2d(ref.tangent_by_arc(s_clamped) * v_ref)
+            : Eigen::Vector2d::Zero();
+        }
+      } else {
+        rp = ref.pos_by_arc(s_clamped);
+        rv = (s <= total_s)
+          ? Eigen::Vector2d(ref.tangent_by_arc(s_clamped) * v_ref)
+          : Eigen::Vector2d::Zero();
+      }
       if (s <= total_s && (rp - pos).norm() < blind_radius_) {
         // s 单调递增（ds > 0 已在循环前保证），越过 total_s 后本分支不再成立，
         // 因此不会死循环。这里不能 break：那样会留下未初始化的 xref/uref 列。
@@ -747,6 +798,12 @@ private:
     auto vseq = solver_.solve(xref, uref, pos, /*turtle=*/false);
     if (vseq.empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "MPC solve failed");
+      {
+        navigation2::PerformanceMonitor::Sample sample;
+        sample.success = false;
+        sample.failure_reason = "mpc_solve_failed";
+        perf_monitor_.stop(perf_start, sample);
+      }
       handleVeto(local_costmap, pos, dt, "MPC solve failed");
       return;
     }
@@ -790,6 +847,11 @@ private:
 
     publishMarkers(pos, vx_w, vy_w);
     publishPredict(vseq, pos);
+    {
+      navigation2::PerformanceMonitor::Sample sample;
+      sample.success = true;
+      perf_monitor_.stop(perf_start, sample);
+    }
   }
 
   void publishStop()
@@ -874,13 +936,26 @@ private:
     veto_streak_ = 0.0;
 
     if (state == NavState::StuckReverse) {
-      // 沿路径切向的反方向倒退；速度太小时退回车头反方向。
+      // 沿路径切向的反方向倒退；速度太小时退回世界 -X。
       const Eigen::Vector2d velocity = route_tracker_.velocity();
       const double vel_norm = velocity.norm();
       if (vel_norm > 0.05) {
         reverse_direction_ = -velocity / vel_norm;
       } else {
         reverse_direction_ = Eigen::Vector2d(-1.0, 0.0);
+      }
+      // 距离场就绪时沿障碍外法向倒退（latest() 只拷 shared_ptr，查询双线性，
+      // 不订 OccupancyGrid、不新起线程）。未就绪仍走上面的切向反方向。
+      // HAZARD 安全点仍是 occupancy 环采样，不把恢复链改成纯梯度跟随。
+      if (const auto field = DistanceFieldRegistry::instance().latest()) {
+        double signed_dist = 0.0;
+        Eigen::Vector2d grad = Eigen::Vector2d::Zero();
+        if (DistanceFieldRegistry::query(*field, pos, signed_dist, grad) &&
+            std::isfinite(grad.x()) && std::isfinite(grad.y()) &&
+            grad.squaredNorm() > 1e-8)
+        {
+          reverse_direction_ = grad.normalized();
+        }
       }
       reverse_travelled_ = 0.0;
       reverse_last_pos_ = pos;
@@ -1159,7 +1234,7 @@ private:
   std::string path_topic_, odom_topic_, cmd_vel_topic_, target_frame_;
   std::string local_costmap_topic_, replan_topic_, robot_base_frame_;
   double control_fps_, expected_speed_, goal_tolerance_, max_track_error_;
-  double blind_radius_, delay_time_, default_wz_, predict_dt_;
+  double blind_radius_, default_wz_, predict_dt_;
   bool approach_enable_{true};
   double approach_distance_{1.5};
   double approach_velocity_{0.5};
@@ -1174,6 +1249,10 @@ private:
   double delay_comp_max_dt_;
   double local_costmap_timeout_, replan_cooldown_;
   LocalPathSafetyPolicy safety_policy_;
+
+  // 关断式性能观测。control() 在定时器回调里跑（单一回调组），无需加锁；tick/stop
+  // 在 enable=false 时都是空操作，不碰热路径。
+  navigation2::PerformanceMonitor perf_monitor_;
 
   // 隧道限速窗口。语义地图在订阅回调里写、在 rebuildSpeedProfile 的窗口查询里读，
   // 两者可能不同线程（单容器多线程执行器），用独立的 map_mutex_ 护住 receiver_ ——

@@ -215,7 +215,7 @@ private:
     // path_smoother 已有代价约束，这里主要防止极端情况下 A* 拼接尾段时引入
     // 已变成障碍的段落。
     path_acceptance_enabled_ = declare_parameter<bool>("path_acceptance_enabled", true);
-    path_acceptance_max_cost_ = declare_parameter<int>("path_acceptance_max_cost", 85);
+    path_acceptance_max_cost_ = declare_parameter<int>("path_acceptance_max_cost", 100);
 
     semantic_map_topic_ =
       declare_parameter<std::string>("semantic_map_topic", "/map_server/semantic_map");
@@ -912,6 +912,8 @@ private:
     // 路径验收：沿路径采样检查每个姿态是否落在障碍上。
     if (path_acceptance_enabled_) {
       bool path_ok = true;
+      // 验收占用定义不得严于 A*：更低阈值会把 A* 走过的膨胀格整条丢掉并冷却 2s。
+      const int occupied_at = std::max(path_acceptance_max_cost_, obstacle_threshold_);
       for (const auto & ps : path->poses) {
         int mx = 0;
         int my = 0;
@@ -919,8 +921,8 @@ private:
           path_ok = false;
           break;
         }
-        const auto cost = static_cast<int>(map_->data[gridIndex(*map_, mx, my)]);
-        if (cost >= path_acceptance_max_cost_) {
+        const auto cell = map_->data[gridIndex(*map_, mx, my)];
+        if (isOccupied(cell, occupied_at, !allow_unknown_)) {
           path_ok = false;
           break;
         }
@@ -928,8 +930,8 @@ private:
       if (!path_ok) {
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 1000,
-          "Planned path rejected: passes through obstacle cost >= %d",
-          path_acceptance_max_cost_);
+          "Planned path rejected: passes through A* occupied cell (threshold %d)",
+          occupied_at);
         if (plan_failure_cooldown_ > 0.0) {
           last_fail_time_ = now();
           last_fail_goal_ = goal;
@@ -1024,7 +1026,7 @@ private:
   double plan_failure_cooldown_{2.0};
   // 路径发布前验收：拦截穿越障碍的路径（极端情况下拼接段可能走入新障碍）。
   bool path_acceptance_enabled_{true};
-  int path_acceptance_max_cost_{85};
+  int path_acceptance_max_cost_{100};
 
   // 语义地图与派生的轴线表。收不到语义地图时表是空的，A* 退回纯几何行为。
   std::string semantic_map_topic_;

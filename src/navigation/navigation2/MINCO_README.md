@@ -1,7 +1,7 @@
 # MINCO Path Smoother
 
 基于 ROSE 方案的 MINCO（Minimum Control Effort）轨迹优化器，用于平滑 A* 规划的路径。
-优化默认开启（`enable_optimization: true`），障碍项已删除，只做几何平滑 + 数据保持 + 隧道轴向对齐。
+优化默认开启（`enable_optimization: true`），几何平滑 + 数据保持 + 隧道轴向对齐 + 进程内距离场障碍 soft 代价。
 
 ## 功能特性
 

@@ -23,6 +23,12 @@ public:
     // 是防止平滑阶段在洞口切角、把本来对着洞的走向拧歪成斜切。软代价而非硬约束：
     // 车是圆柱，朝向不影响能不能过，偏轴只是该少走。
     double tunnel_axis_weight{0.0};
+    // 障碍 soft 代价：控制点处到最近障碍距离 d < safe_dist 时加
+    // obstacle_weight*(safe_dist-d)²，梯度沿距离场远离障碍方向。设 0 关闭。
+    // 距离场由 setDistanceQuery 注入（进程内 DistanceFieldRegistry 的查询），
+    // 为空时障碍项自动失效（等价于关闭），退回纯几何平滑。
+    double obstacle_weight{0.0};
+    double safe_dist{0.2};
     bool enable{true};
   };
 
@@ -35,6 +41,12 @@ public:
   // 否则返回 false。为空或恒返回 false 时对齐项自动失效（等价于关闭）。
   void setTunnelAxisQuery(
     std::function<bool(const Eigen::Vector2d &, Eigen::Vector2d &)> query_fn);
+
+  // 设置距离场查询：给世界坐标，写出该点到最近障碍的有符号距离（米，正=障碍外）
+  // 与梯度（单位向量，指向远离障碍）。返回 false 表示查询失败（地图外/未就绪）。
+  // 为空时障碍项自动失效。
+  void setDistanceQuery(
+    std::function<bool(const Eigen::Vector2d &, double &, Eigen::Vector2d &)> query_fn);
 
   // 优化轨迹
   std::vector<Piece<5, 2>> optimize(

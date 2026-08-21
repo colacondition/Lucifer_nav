@@ -1,5 +1,7 @@
+#include "distance_transform.hpp"
 #include "grid_utils.hpp"
 #include "semantic_map_consumer.hpp"
+#include "shared_state.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -43,6 +45,66 @@ struct InflationLimitCache
   // 有隧道时直接作为返回值；无隧道时返回空向量（与 makeInflationRadiusLimit 一致）。
   std::vector<float> limit;
   bool has_tunnel{false};
+};
+
+// 每格「距上次命中的帧数」缓存，给 hit/miss 概率占据的 keep_time→clear_time 时间
+// 衰减用（sentry 的 decay 语义，替代 previous_obstacle_decay 的固定整数衰减）。
+//
+// age=0 表示本帧刚命中；每过一帧 seed 时递增 1。命中（accumulateHit）时清零。
+// 随栅格 origin 按整数格平移，方向与 seedFromPreviousGrid / shiftInflationLimitCache
+// 一致：新格 (x,y) 复用旧格 (x+shift_x, y+shift_y)。
+//
+// 为什么用帧数而不是时间戳：update_frequency 固定（10Hz），帧数×周期即时间，省掉
+// 每格存 rclcpp::Time（16 字节）——uint16 每格 2 字节，且衰减只在 seed 时算一次。
+struct HitAgeCache
+{
+  int width{0};
+  int height{0};
+  double origin_x{0.0};
+  double origin_y{0.0};
+  std::vector<std::uint16_t> age;
+
+  void reset(const nav_msgs::msg::OccupancyGrid & grid)
+  {
+    width = static_cast<int>(grid.info.width);
+    height = static_cast<int>(grid.info.height);
+    origin_x = grid.info.origin.position.x;
+    origin_y = grid.info.origin.position.y;
+    age.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0);
+  }
+
+  // 平移 + 全量递增。返回平移递增后的新数组（新露出的边为 0）。不直接改写自身，
+  // 由调用方 swap，避免 seed 过程中新旧数组混用。
+  std::vector<std::uint16_t> shiftAndIncrement(int shift_x, int shift_y) const
+  {
+    const std::size_t n = age.size();
+    std::vector<std::uint16_t> next(n, 0);
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        const int old_x = x + shift_x;
+        const int old_y = y + shift_y;
+        if (old_x < 0 || old_x >= width || old_y < 0 || old_y >= height) {
+          continue;  // 新露出的边，age=0
+        }
+        const std::size_t old_idx =
+          static_cast<std::size_t>(old_y) * static_cast<std::size_t>(width) +
+          static_cast<std::size_t>(old_x);
+        const std::uint16_t a = age[old_idx];
+        // 封顶防溢出：超过 clear_frames 后不再有意义，停在一个足够大的值即可。
+        next[static_cast<std::size_t>(y) * width + x] =
+          (a < 65535) ? static_cast<std::uint16_t>(a + 1) : a;
+      }
+    }
+    return next;
+  }
+
+  void hit(int x, int y)
+  {
+    if (x < 0 || x >= width || y < 0 || y >= height) {
+      return;
+    }
+    age[static_cast<std::size_t>(y) * width + x] = 0;
+  }
 };
 
 class RmLocalCostmap : public rclcpp::Node
@@ -189,6 +251,24 @@ private:
       declare_parameter<bool>("update_on_new_observation_only", false);
     reuse_previous_grid_ = declare_parameter<bool>("reuse_previous_grid", true);
     previous_obstacle_decay_ = declare_parameter<int>("previous_obstacle_decay", 0);
+    // 命中增量：点云/扫描命中某格时，代价累加 hit_inc 而不是直接置 100（sentry 的
+    // hit/miss 概率占据在 Lucifer 2D 栅格上的简化等价物）。默认 100 = 单帧即致命
+    // （保持历史行为）；调小（如 50）需要多帧确认才达到 obstacle_threshold，抑制
+    // 瞬时噪声/孤立误检。与 previous_obstacle_decay 的「每帧衰减」构成 hit/miss 闭环。
+    hit_inc_ = declare_parameter<int>("hit_inc", 100);
+    // 动态残影时间衰减（sentry 的 keep_time→clear_time 语义，替代整数衰减）：
+    // 命中后 age < keep_time 保持致命；keep_time≤age<clear_time 线性衰减到 free；
+    // age≥clear_time 清除。enable=false 时退回 previous_obstacle_decay 整数衰减。
+    dynamic_decay_enable_ = declare_parameter<bool>("dynamic_decay.enable", false);
+    dynamic_decay_keep_time_ = declare_parameter<double>("dynamic_decay.keep_time", 0.8);
+    dynamic_decay_clear_time_ = declare_parameter<double>("dynamic_decay.clear_time", 1.2);
+    // 保守先验合并（sentry 的「先验 occupied 强制并入、先验 free 不抹在线障碍」）：
+    // 语义地图的 OBSTACLE 格强制标进局部代价地图。收不到语义地图时静默失效。
+    prior_merge_enable_ = declare_parameter<bool>("prior_merge.enable", false);
+    // 进程内距离场开关：给 MINCO 障碍代价与 ESDF 梯度脱困共用（sentry 的
+    // Signed ESDF 在 Lucifer 2D 栅格上的落地）。默认关 —— 只有真正需要 soft 障碍
+    // 代价 / 梯度脱困时才开，避免每次发布多一次 O(n) 距离变换。
+    distance_field_enable_ = declare_parameter<bool>("distance_field_enable", false);
   }
 
   bool stampIsZero(const builtin_interfaces::msg::Time & stamp) const
@@ -536,6 +616,8 @@ private:
     if (!reuse_previous_grid_ || !previous_raw_grid_ ||
       !gridCompatible(*previous_raw_grid_, grid))
     {
+      // 无上一帧可复用：帧龄缓存整拍重建（新露出的所有格 age=0）。
+      hit_age_.reset(grid);
       return;
     }
 
@@ -549,37 +631,104 @@ private:
     if (std::abs(dx - static_cast<double>(offset_x)) > 1e-3 ||
       std::abs(dy - static_cast<double>(offset_y)) > 1e-3)
     {
+      hit_age_.reset(grid);
       return;
     }
 
-    for (unsigned int y = 0; y < grid.info.height; ++y) {
-      const int previous_y = static_cast<int>(y) + offset_y;
-      if (previous_y < 0 || previous_y >= static_cast<int>(previous.info.height)) {
-        continue;
+    // 帧龄先平移 + 递增：上一帧命中过的格 age 前进一格，供下面按 keep/clear 衰减。
+    // 用「上一帧的 age」而不是「本帧」是因为本帧的命中要等 processPointCloud 才发生。
+    auto next_age = hit_age_.shiftAndIncrement(offset_x, offset_y);
+
+    if (dynamic_decay_enable_) {
+      // sentry 的 keep_time→clear_time 时间衰减：age<keep 保持致命；
+      // keep≤age<clear 线性衰减到 free；age≥clear 清除。
+      const double period = 1.0 / std::max(1e-3, update_frequency_);
+      const int keep_frames = std::max(1, static_cast<int>(std::ceil(
+        std::max(0.0, dynamic_decay_keep_time_) / period)));
+      const int clear_frames = std::max(keep_frames + 1, static_cast<int>(std::ceil(
+        std::max(0.0, dynamic_decay_clear_time_) / period)));
+      for (unsigned int y = 0; y < grid.info.height; ++y) {
+        const int previous_y = static_cast<int>(y) + offset_y;
+        if (previous_y < 0 || previous_y >= static_cast<int>(previous.info.height)) {
+          continue;
+        }
+        for (unsigned int x = 0; x < grid.info.width; ++x) {
+          const int previous_x = static_cast<int>(x) + offset_x;
+          if (previous_x < 0 || previous_x >= static_cast<int>(previous.info.width)) {
+            continue;
+          }
+          const auto previous_index = gridIndex(previous, previous_x, previous_y);
+          if (previous.data[previous_index] <= 0) {
+            continue;
+          }
+          const std::size_t idx =
+            static_cast<std::size_t>(y) * grid.info.width + static_cast<std::size_t>(x);
+          const int age = next_age[idx];
+          int cost = 0;
+          if (age < keep_frames) {
+            cost = 100;
+          } else if (age < clear_frames) {
+            cost = static_cast<int>(std::lround(
+              100.0 * static_cast<double>(clear_frames - age) /
+              static_cast<double>(clear_frames - keep_frames)));
+          }
+          if (cost > 0) {
+            const auto current_index = gridIndex(grid, static_cast<int>(x), static_cast<int>(y));
+            grid.data[current_index] = std::max(
+              grid.data[current_index], static_cast<int8_t>(cost));
+          }
+        }
       }
-
-      for (unsigned int x = 0; x < grid.info.width; ++x) {
-        const int previous_x = static_cast<int>(x) + offset_x;
-        if (previous_x < 0 || previous_x >= static_cast<int>(previous.info.width)) {
+    } else {
+      // 历史行为：固定整数衰减，与帧龄无关。
+      for (unsigned int y = 0; y < grid.info.height; ++y) {
+        const int previous_y = static_cast<int>(y) + offset_y;
+        if (previous_y < 0 || previous_y >= static_cast<int>(previous.info.height)) {
           continue;
         }
-
-        const auto previous_index = gridIndex(previous, previous_x, previous_y);
-        int persisted_cost = static_cast<int>(previous.data[previous_index]);
-        if (persisted_cost <= 0) {
-          continue;
+        for (unsigned int x = 0; x < grid.info.width; ++x) {
+          const int previous_x = static_cast<int>(x) + offset_x;
+          if (previous_x < 0 || previous_x >= static_cast<int>(previous.info.width)) {
+            continue;
+          }
+          const auto previous_index = gridIndex(previous, previous_x, previous_y);
+          int persisted_cost = static_cast<int>(previous.data[previous_index]);
+          if (persisted_cost <= 0) {
+            continue;
+          }
+          persisted_cost = std::max(0, persisted_cost - previous_obstacle_decay_);
+          if (persisted_cost <= 0) {
+            continue;
+          }
+          const auto current_index = gridIndex(grid, static_cast<int>(x), static_cast<int>(y));
+          grid.data[current_index] = std::max(
+            grid.data[current_index], static_cast<int8_t>(persisted_cost));
         }
-
-        persisted_cost = std::max(0, persisted_cost - previous_obstacle_decay_);
-        if (persisted_cost <= 0) {
-          continue;
-        }
-
-        const auto current_index = gridIndex(grid, static_cast<int>(x), static_cast<int>(y));
-        grid.data[current_index] = std::max(
-          grid.data[current_index], static_cast<int8_t>(persisted_cost));
       }
     }
+
+    hit_age_.age.swap(next_age);
+    hit_age_.origin_x = grid.info.origin.position.x;
+    hit_age_.origin_y = grid.info.origin.position.y;
+  }
+
+  // 命中累积：代价累加 hit_inc 而不是直接置 100。默认 hit_inc=100 时等价于历史
+  // 二值行为（单帧即致命）；调小后需要多帧确认才达到 obstacle_threshold，配合
+  // 时间衰减（dynamic_decay）或整数衰减（previous_obstacle_decay）构成 hit/miss
+  // 概率闭环（sentry 概率占据的 2D 简化）。命中同时把帧龄清零。int8 数据区天然夹
+  // 在 [0,100]，min/max 防溢出。
+  void accumulateHit(nav_msgs::msg::OccupancyGrid & grid, int x, int y)
+  {
+    if (!inBounds(grid, x, y)) {
+      return;
+    }
+    const std::size_t idx = gridIndex(grid, x, y);
+    // unknown(-1) 格归零再累加，保证 hit_inc=100 时与历史「直接置 100」完全等价
+    // （unknown 命中后仍是 100，而不是 -1+100=99）。
+    const int cur = std::max(0, static_cast<int>(grid.data[idx]));
+    const int next = cur + hit_inc_;
+    grid.data[idx] = static_cast<int8_t>(std::clamp(next, 0, 100));
+    hit_age_.hit(x, y);
   }
 
   void markRobotFootprintFree(
@@ -604,6 +753,41 @@ private:
         const int y = center_my + dy;
         if (inBounds(grid, x, y)) {
           grid.data[gridIndex(grid, x, y)] = 0;
+          hit_age_.hit(x, y);  // 脚下清空的同时帧龄归零，不再参与时间衰减
+        }
+      }
+    }
+  }
+
+  // 保守先验合并：语义地图的 OBSTACLE 格强制标进局部代价地图（先验障碍只加不减）。
+  // sentry 的契约「先验 occupied 强制并入、先验 free 绝不抹掉在线障碍」在 Lucifer 的
+  // 落地：只把先验 OBSTACLE 标成致命（=100），先验 free/隧道/未知格不做任何操作，
+  // 因此不会清掉 processPointCloud 已经标上的在线障碍。
+  //
+  // 为什么局部图需要先验障碍：它现在只吃 /segmentation/obstacle（在线点云）。先验
+  // 地图里标注的静态障碍若被点云漏扫（遮挡、反射差、车体自挡），局部层就看不见，
+  // MPC 会贴着它走。合并后与全局图/语义一致。
+  void mergePriorObstacles(nav_msgs::msg::OccupancyGrid & grid)
+  {
+    if (!prior_merge_enable_ || !receiver_.map().valid()) {
+      return;
+    }
+    const auto & map = receiver_.map();
+    const int width = static_cast<int>(grid.info.width);
+    const int height = static_cast<int>(grid.info.height);
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        double world_x = 0.0;
+        double world_y = 0.0;
+        mapToWorld(grid, x, y, world_x, world_y);
+        const auto cell = map.geometry().containingCell(Eigen::Vector2d(world_x, world_y));
+        if (!cell) {
+          continue;
+        }
+        if (map.terrainAtCell(cell->x(), cell->y()) ==
+          static_cast<std::uint8_t>(TerrainType::OBSTACLE))
+        {
+          grid.data[gridIndex(grid, x, y)] = 100;
         }
       }
     }
@@ -685,7 +869,7 @@ private:
 
     for (const auto & endpoint : endpoints_to_mark) {
       if (inBounds(grid, endpoint.x, endpoint.y)) {
-        grid.data[gridIndex(grid, endpoint.x, endpoint.y)] = 100;
+        accumulateHit(grid, endpoint.x, endpoint.y);
       }
     }
   }
@@ -763,7 +947,7 @@ private:
         int map_x = 0;
         int map_y = 0;
         if (worldToMap(grid, point.x, point.y, map_x, map_y)) {
-          grid.data[gridIndex(grid, map_x, map_y)] = 100;
+          accumulateHit(grid, map_x, map_y);
           if (collect_marked_points) {
             marked_points.push_back(point);
           }
@@ -958,6 +1142,56 @@ private:
     return infl_limit_cache_.limit;
   }
 
+  // 构建并发布进程内 Signed ESDF（有符号欧氏距离，米）：障碍外正、障碍内负、障碍
+  // 表面 0。供 MINCO 障碍代价与恢复链梯度脱困查询，与 MPC 订阅的 inflated_grid
+  // 同源同帧。只取 lethal(=100) 格当障碍表面：膨胀值（0-99）是衰减区，不算障碍，
+  // soft 代价的 safe_dist 余量在查询方再叠加。
+  //
+  // 两次距离变换：第一次「障碍格为种子」得非障碍格的正距离；第二次「非障碍格为
+  // 种子」得障碍格的负距离。障碍内负距离给恢复链判断「卡在多深」留了口子，即使
+  // 当前只消费正距离，也把字段按 signed 语义填好，避免以后补负距离消费时再改格式。
+  void publishDistanceField(
+    const nav_msgs::msg::OccupancyGrid & inflated_grid, const rclcpp::Time & stamp)
+  {
+    if (!distance_field_enable_) {
+      return;
+    }
+    const int w = static_cast<int>(inflated_grid.info.width);
+    const int h = static_cast<int>(inflated_grid.info.height);
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+    const std::size_t cell_count = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+    if (inflated_grid.data.size() != cell_count) {
+      return;
+    }
+    std::vector<std::uint8_t> seeds_obs(cell_count, 0);
+    std::vector<std::uint8_t> seeds_free(cell_count, 0);
+    for (std::size_t i = 0; i < cell_count; ++i) {
+      const bool obs = inflated_grid.data[i] >= 100;
+      seeds_obs[i] = obs ? 1 : 0;
+      seeds_free[i] = obs ? 0 : 1;
+    }
+    // O(n) 精确欧氏距离变换（Felzenszwalb & Huttenlocher），100×100 格 <1ms，
+    // 两次变换仍 <2ms，不阻塞 10Hz 发布路径。结果单位是格，乘 resolution 转米。
+    auto dist_to_obs = exactSquaredDistanceTransform(seeds_obs, w, h);
+    auto dist_to_free = exactSquaredDistanceTransform(seeds_free, w, h);
+    navigation2::DistanceFieldSnapshot snapshot;
+    snapshot.resolution = static_cast<double>(inflated_grid.info.resolution);
+    snapshot.origin_x = inflated_grid.info.origin.position.x;
+    snapshot.origin_y = inflated_grid.info.origin.position.y;
+    snapshot.width = w;
+    snapshot.height = h;
+    snapshot.stamp = stamp;
+    snapshot.valid = true;
+    snapshot.distance.resize(cell_count);
+    for (std::size_t i = 0; i < cell_count; ++i) {
+      const double signed_cells = seeds_obs[i] ? -dist_to_free[i] : dist_to_obs[i];
+      snapshot.distance[i] = static_cast<float>(signed_cells * snapshot.resolution);
+    }
+    navigation2::DistanceFieldRegistry::instance().publish(std::move(snapshot));
+  }
+
   void updateAndPublish()
   {
     publishCurrentFootprint();
@@ -1001,6 +1235,9 @@ private:
         raw_grid, marked_points, reference_time, collect_marked_points,
         robot_transform.transform.translation.z);
     }
+    // 先验障碍合并在脚下清空之前：先验 OBSTACLE 若落在脚下，随后 markRobotFootprintFree
+    // 会一并清掉，保证车体当前位置始终 free（无论障碍来自在线还是先验）。
+    mergePriorObstacles(raw_grid);
     markRobotFootprintFree(raw_grid, robot_transform);
 
     previous_raw_grid_ = raw_grid;
@@ -1030,6 +1267,7 @@ private:
 
     inflated_grid.header.stamp = publish_time;
     costmap_pub_->publish(inflated_grid);
+    publishDistanceField(inflated_grid, publish_time);
     last_publish_time_ = publish_time;
   }
 
@@ -1068,6 +1306,13 @@ private:
   bool update_on_new_observation_only_{false};
   bool reuse_previous_grid_{true};
   int previous_obstacle_decay_{0};
+  int hit_inc_{100};
+  bool distance_field_enable_{false};
+  bool dynamic_decay_enable_{false};
+  double dynamic_decay_keep_time_{0.8};
+  double dynamic_decay_clear_time_{1.2};
+  bool prior_merge_enable_{false};
+  HitAgeCache hit_age_;
 
   sensor_msgs::msg::LaserScan::ConstSharedPtr latest_scan_;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_pointcloud_;

@@ -64,9 +64,10 @@ rm_global_planner:
     # 防止对不可达目标以 planning_frequency 空转刷日志。
     # 目标明显移动（> planner_tolerance）或收到明确重规划请求时忽略冷却。
     plan_failure_cooldown: 2.0
-    # 路径发布前验收：拒绝穿越代价 >= 此阈值格子的路径。
+    # 路径发布前验收：与 A* obstacle_threshold 对齐。更小会把 A* 走过的膨胀格
+    # 整条拒绝并进入 plan_failure_cooldown。代码取 max(本值, obstacle_threshold)。
     path_acceptance_enabled: true
-    path_acceptance_max_cost: 85
+    path_acceptance_max_cost: 100
     # 语义地图：隧道格的轴线用来在洞内给「偏离轴线」加代价。收不到这个话题时 A*
     # 退回纯几何行为（隧道被当普通空地），不报错。
     semantic_map_topic: /map_server/semantic_map
@@ -127,9 +128,8 @@ rm_global_costmap:
     previous_obstacle_decay: 12
 
 # 平滑器是 MINCO（rm_minco_path_smoother），节点名必须对上，否则整段参数不生效。
-# 平滑器只做几何平滑 + 数据保持 + 隧道轴向对齐；避障由全局规划器 clearance 代价
-# 与 MPC 局部代价地图负责（曾经的 obstacle_weight/robot_footprint 项误把机器人
-# 多边形 SDF 当障碍距离场，路径点几乎总在界外，代价恒 0，已删除）。
+# 平滑器做几何平滑 + 数据保持 + 隧道轴向对齐；障碍 soft 代价从进程内距离场注入
+# （rm_local_costmap 维护，distance_field_enable 开启后可用），未就绪时静默失效。
 rm_minco_path_smoother:
   ros__parameters:
     use_sim_time: true
@@ -140,6 +140,19 @@ rm_minco_path_smoother:
     smooth_weight: 0.1        # 平滑项权重（降低以保持原路径形状）
     data_weight: 10.0         # 数据项权重（保持接近原路径）
     enable_optimization: true  # MINCO L-BFGS 优化
+
+    # 障碍 soft 代价：控制点离障碍 < safe_dist 时加 obstacle_weight*(safe_dist-d)²。
+    # 距离场未就绪时静默失效。设 0 关闭。开启后同时启用发布前硬校验（任何采样点
+    # < safe_dist 即拒绝该轨迹，回退原始路径）。起始值 2.0 为未实测标定，上车前在
+    # 仿真里核对：窄通道不贴对侧墙、动态障碍让行、safety_reject 拒绝率不异常。
+    obstacle_weight: 2.0
+    safe_dist: 0.2
+
+    # 关断式性能观测：默认关。开 enable 后记录优化耗时 / 成功 / 失败原因。
+    performance.enable: false
+    performance.csv_enable: false
+    performance.csv_path: /tmp/minco_perf.csv
+    performance.print_enable: false
 
     # 时间分配参数
     default_velocity: 1.5     # 默认速度（用于计算段时间）
@@ -201,6 +214,23 @@ rm_local_costmap:
     update_on_new_observation_only: true
     reuse_previous_grid: true
     previous_obstacle_decay: 8
+    # 命中增量：点云/扫描命中格时代价累加 hit_inc（而非直接置 100）。100=单帧致命
+    # （历史行为）；调小（如 50）需多帧确认才到 obstacle_threshold，抑制瞬时噪声。
+    hit_inc: 100
+    # 动态残影时间衰减（sentry 的 keep_time→clear_time 语义）：命中后 age<keep_time
+    # 保持致命、keep_time≤age<clear_time 线性衰减、age≥clear_time 清除。
+    # enable=true 时替代 previous_obstacle_decay 的固定整数衰减；false 退回整数衰减。
+    dynamic_decay.enable: true
+    dynamic_decay.keep_time: 0.8
+    dynamic_decay.clear_time: 1.2
+    # 保守先验合并（sentry「先验 occupied 强制并入、先验 free 不抹在线障碍」）：
+    # 语义地图 OBSTACLE 格强制标进局部图，先验只加不减。收不到语义地图时静默失效。
+    prior_merge.enable: true
+    # 进程内距离场（Signed ESDF：障碍外正、障碍内负），给 MINCO 障碍 soft 代价与
+    # MPC 倒车脱困方向（+grad）共用。HAZARD 安全点仍是 occupancy 环采样 + 射线，
+    # 不另起地图节点、不拷 OccupancyGrid。开启后每次发布多两次 O(n) 距离变换
+    # （5m×5m@0.05 约 1 万格，仍 <2ms）。未开启时 MINCO 障碍项与梯度倒车静默失效。
+    distance_field_enable: true
 
 # 速度平滑器：对上游指令做限幅 + 平滑，输出最终 /cmd_vel。车「一顿一顿」或
 # 「起步/刹车太猛」优先查这里。
@@ -249,8 +279,6 @@ rm_mpc_controller:
     max_track_error: 0.5
     # 终点盲区（m）：路径终点附近此半径内跳过参考点（避免终点数值抖动）。
     blind_radius: 0.1
-    # 指令延迟补偿（s）：odom 相对当前时刻的延迟，>0 时外推位姿。默认关。
-    delay_time: 0.0
     # 无参考航向时的默认角速度（rad/s）。一般保持 0。
     default_wz: 0.0
     # Prediction horizon (MPC): steps * predict_dt seconds ahead.
@@ -269,6 +297,11 @@ rm_mpc_controller:
     # Odometry delay compensation (off by default; extrapolates pose over odom->now latency).
     delay_compensation.enable: false
     delay_compensation.max_dt: 0.5
+    # 关断式性能观测：默认关。开 enable 后记录控制周期耗时 / MPC solve 失败原因。
+    performance.enable: false
+    performance.csv_enable: false
+    performance.csv_path: /tmp/mpc_perf.csv
+    performance.print_enable: false
     local_safety.costmap_topic: /local_costmap/costmap
     local_safety.obstacle_threshold: 90
     local_safety.unknown_is_obstacle: true
