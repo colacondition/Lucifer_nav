@@ -74,7 +74,7 @@
     publish_map_to_odometry: false  # 是否发布 map_to_odometry 里程计话题
 
     # ========== ICP 参数 ==========
-    gicp_num_threads: 4              # CPU模式线程数（0=自动，建议4-8）
+    gicp_num_threads: 2              # 8-core budget; real launch already pins 2
     gicp_max_iterations_first: 100   # 首次定位 GICP 最大迭代次数
     gicp_max_iterations_track: 70   # 跟踪阶段 GICP 最大迭代次数
 

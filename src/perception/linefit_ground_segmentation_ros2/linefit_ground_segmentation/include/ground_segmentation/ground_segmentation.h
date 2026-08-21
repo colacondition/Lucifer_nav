@@ -18,7 +18,7 @@ struct GroundSegmentationParams {
       max_dist_to_line(0.15),
       min_slope(0),
       max_slope(1),
-      n_threads(4),
+      n_threads(2),
       max_error_square(0.01),
       long_threshold(2.0),
       max_long_height(0.1),
@@ -54,7 +54,7 @@ struct GroundSegmentationParams {
   double sensor_height;
   // How far to search for a line in angular direction [rad].
   double line_search_angle;
-  // Number of threads.
+  // Number of OpenMP threads for fork-join segmentation stages.
   int n_threads;
 };
 
@@ -80,11 +80,11 @@ class GroundSegmentation {
 
   // 并行分片执行 [0, count) 上的任务，调用线程也参与，全部完成后返回。
   //
-  // 实现采用「每轮直接起 std::thread + join」的上游方案。此前这里用过一个自定义
-  // 持久线程池（代次号 + arrived_ barrier），上线后先后死锁两次（一次 arrived_
-  // 下溢，一次主线程永久等在 cv_done_ 上、全部 worker 睡在 cv_work_ 上 ——
-  // 2026-08 看门狗 backtrace 实锤）。线程池省下的只是每帧 ~100 次线程创建/销毁
-  // 的几十微秒；而每轮新建线程没有任何跨轮共享状态，结构上不可能死锁。
+  // fork-join 用 OpenMP 运行时线程池（#pragma omp parallel num_threads）。
+  // 不要再写自定义持久池：2026-08 用代次号 + arrived_ 屏障上线后死锁两次
+  // （arrived_ 下溢；主线程永久等 cv_done_、worker 全睡在 cv_work_）。
+  // 也不要退回每帧 std::thread spawn/join：点云滤完并不大，OpenMP 静态
+  // 划分更稳，且和 small_glim 的预处理同一套模型。
   void runParallel(std::size_t count, const std::function<void(std::size_t, std::size_t)> & task);
 
   void assignCluster(std::vector<int>* segmentation);

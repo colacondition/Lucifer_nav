@@ -1,7 +1,7 @@
 # Integration test: downstream override detection.
 #
 # The node publishes commands on /cmd_vel_nav_raw, but downstream nodes
-# (goal_approach_controller, rm_velocity_smoother) can zero them out.
+# (rm_velocity_smoother) can zero them out.
 # After override_detect_time the node should log a warning.
 # This test is what caught the creep-at-goal bug root cause.
 import os

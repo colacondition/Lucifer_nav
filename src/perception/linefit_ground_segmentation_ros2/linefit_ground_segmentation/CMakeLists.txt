@@ -7,11 +7,12 @@ add_definitions(-std=c++17 -O3)
 
 find_package(ament_cmake_auto REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common visualization)
+find_package(OpenMP REQUIRED)
 
 ament_auto_find_build_dependencies()
 ament_auto_add_library(${PROJECT_NAME} SHARED DIRECTORY src)
 target_include_directories(${PROJECT_NAME} PUBLIC ${PCL_INCLUDE_DIRS})
-target_link_libraries(${PROJECT_NAME} ${PCL_LIBRARIES})
+target_link_libraries(${PROJECT_NAME} ${PCL_LIBRARIES} OpenMP::OpenMP_CXX)
 
 if(BUILD_TESTING)
   # 台阶识别的回归测试。链接真实算法跑合成点云，锁住 max_start_height 的取值 ——

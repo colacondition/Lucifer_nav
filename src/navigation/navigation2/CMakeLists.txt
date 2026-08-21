@@ -71,7 +71,7 @@ rclcpp_components_register_node(${PROJECT_NAME}
 
 # 固定线程数组件容器：Humble 的 component_container_mt 无法配置 executor
 # 线程数（恒为 hardware_concurrency），核多的机器会起一大把空转线程。
-# 第一个位置参数指定线程数（默认 6），launch 里 arguments=['6']。
+# 第一个位置参数指定线程数（默认 2），launch 里 arguments=['2']。
 add_executable(nav_container_mt executable/container_fixed_main.cpp)
 target_link_libraries(nav_container_mt
   rclcpp::rclcpp
@@ -141,7 +141,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_speed_profile ${PROJECT_NAME})
 
   # ROS 级集成测试：启真节点、喂合成话题、断言 FSM 行为。
-  # gtest 只能覆盖纯函数；FSM 状态转移、goal_approach_controller 开关时序、
+  # gtest 只能覆盖纯函数；FSM 状态转移、接近段开关时序、
   # executed_speed 是否真的驱动 ProgressMonitor 这些必须在节点层验证 ——
   # 「到点蠕动」那个 bug 正是 gtest 全过、只在节点跑起来才暴露的一类。
   # 必须用 add_launch_test 而不是 ament_add_pytest_test：这两个文件是 launch
@@ -175,14 +175,6 @@ if(BUILD_TESTING)
   # 「一条回传都没收到过」必须单独一个进程：/gimbal_posture_state 是 transient_local，
   # 跟别的用例共进程的话会被前面发过的姿态污染，这个分支根本进不去。
   add_launch_test(test/test_gimbal_gate_no_feedback.py TIMEOUT 90)
-  # 锁住 RC-ESDF 是真的在跑。障碍点云喂一个挡路的点，esdfPathSafe 返回 false，
-  # MPC 进恢复。反向测试：注掉 esdf_map_.query 那行，测试必须失败。
-  add_launch_test(test/test_esdf_obstacle_cloud.py TIMEOUT 90)
-  # 锁住 RC-ESDF 的隧道顶板豁免：影响区内的顶板/门楣点云不得触发整车碰撞，区外的
-  # 同高度点必须照常拦车。ESDF 直接吃原始障碍点云、只查 xy，不补这层豁免会把顶板
-  # （z≈clear_height 但 xy 在车体正上方）投影成 xy 障碍，洞口和洞内被误判碰撞 ——
-  # 正是「云台已绿却停在洞口 / 蹭进去后动不了」。必须跟代价地图用同一张影响区。
-  add_launch_test(test/test_esdf_tunnel_ceiling.py TIMEOUT 90)
 endif()
 
 ament_auto_package(

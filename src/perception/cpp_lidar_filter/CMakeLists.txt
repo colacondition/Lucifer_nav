@@ -29,7 +29,7 @@ rclcpp_components_register_node(${PROJECT_NAME}
 
 # 固定线程数感知容器：替代 rclcpp_components 的 component_container_mt。
 # Humble 的 component_container_mt 线程数恒为 hardware_concurrency()（本机 24），
-# 感知链只需 2 个 executor 线程即可保留相邻帧的流水线重叠，其余线程都是空转。
+# 感知链默认 1 个 executor 线程；linefit 内部用 OpenMP 做分片。
 # 用法：perception_container_mt [线程数] [--ros-args ...]
 add_executable(perception_container_mt executable/container_fixed_main.cpp)
 target_link_libraries(perception_container_mt

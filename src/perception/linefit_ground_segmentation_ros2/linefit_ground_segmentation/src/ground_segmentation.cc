@@ -5,8 +5,11 @@
 #include <functional>
 #include <list>
 #include <memory>
-#include <thread>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 
 GroundSegmentation::GroundSegmentation(const GroundSegmentationParams& params) :
@@ -67,28 +70,32 @@ void GroundSegmentation::runParallel(
   if (count == 0) {
     return;
   }
-  const std::size_t participants =
-      std::max<std::size_t>(1, static_cast<std::size_t>(params_.n_threads));
+  const int participants = std::max(1, params_.n_threads);
   if (participants == 1) {
     task(0, count);
     return;
   }
   // 分片与旧实现完全一致：第 i 份是 [count*i/P, count*(i+1)/P)。
-  std::vector<std::thread> threads;
-  threads.reserve(participants - 1);
-  for (std::size_t i = 0; i + 1 < participants; ++i) {
-    const std::size_t start = count * i / participants;
-    const std::size_t end = count * (i + 1) / participants;
-    threads.emplace_back([&task, start, end] { task(start, end); });
+  // OpenMP 运行时线程池做 fork-join；不再每帧 spawn/join，也不再自建池
+  // （自定义池 2026-08 死锁过两次）。
+#ifdef _OPENMP
+#pragma omp parallel num_threads(participants)
+  {
+    const int tid = omp_get_thread_num();
+    const int nthreads = omp_get_num_threads();
+    const std::size_t start =
+      count * static_cast<std::size_t>(tid) / static_cast<std::size_t>(nthreads);
+    const std::size_t end =
+      count * static_cast<std::size_t>(tid + 1) / static_cast<std::size_t>(nthreads);
+    task(start, end);
   }
-  task(count * (participants - 1) / participants, count);
-  for (auto & thread : threads) {
-    thread.join();
-  }
+#else
+  task(0, count);
+#endif
 }
 
 void GroundSegmentation::getLines(std::list<PointLine> *lines) {
-  // 每轮线程执行；分片互不重叠，但主线程与工作线程并发写同一个 lines 列表，
+  // 分片互不重叠；visualize 时主线程与工作线程并发写同一个 lines 列表，
   // 保留互斥锁。
   std::mutex line_mutex;
   runParallel(

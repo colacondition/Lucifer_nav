@@ -1,14 +1,13 @@
 # MINCO Path Smoother
 
 基于 ROSE 方案的 MINCO（Minimum Control Effort）轨迹优化器，用于平滑 A* 规划的路径。
+优化默认开启（`enable_optimization: true`），障碍项已删除，只做几何平滑 + 数据保持 + 隧道轴向对齐。
 
 ## 功能特性
 
 - **时空耦合优化**：同时优化路径和时间分配
 - **动力学约束**：最小化 jerk（加加速度），保证轨迹平滑
-- **障碍物避让**：使用 RC-ESDF 进行碰撞检测和梯度计算
 - **L-BFGS 优化**：高效的非线性优化求解器
-- **Smoothed L1 惩罚**：对障碍物穿透使用平滑惩罚函数
 
 ## 架构说明
 
@@ -22,8 +21,7 @@
 2. **RmMincoPathSmoother** (`minco_path_smoother_node.cpp`)
    - ROS 2 节点封装
    - 订阅原始路径 `/plan_raw`
-   - 发布优化后路径 `/plan_minco`
-   - 使用 RC-ESDF 进行障碍物查询
+   - 发布优化后路径 `/plan`
 
 3. **MINCO 库** (`minco/minco.hpp`)
    - 来自 ROSE 的 MINCO 实现
@@ -59,8 +57,7 @@ ros2 launch bringup real.launch.py
 
 ```yaml
 smooth_weight: 1.0        # 增大 → 轨迹更平滑，但可能偏离原路径
-obstacle_weight: 10.0     # 增大 → 更严格避障，但可能求解失败
-robot_radius: 1.0         # 机器人半径 + 安全裕度
+data_weight: 10.0         # 数据保持项，拉回原始路径
 default_velocity: 1.0     # 影响时间分配（段距离 / 速度）
 ```
 
@@ -98,16 +95,15 @@ ros2 run navigation2 rm_minco_path_smoother_node --ros-args --log-level debug
 
 **问题：优化失败，输出原始路径**
 
-- 原因：L-BFGS 求解器收敛失败（障碍物密集，无解）
+- 原因：L-BFGS 求解器收敛失败
 - 解决：
-  1. 降低 `obstacle_weight`
-  2. 增大 `robot_radius`（给更多避障空间）
-  3. 检查原始路径是否已经穿墙
+  1. 检查原始路径是否合理
+  2. 增大 `data_weight` 让优化更贴近原路径
 
 **问题：轨迹抖动**
 
-- 原因：`smooth_weight` 太小，障碍物项主导
-- 解决：增大 `smooth_weight` 到 2.0 或更高
+- 原因：`smooth_weight` 太大，平滑项主导
+- 解决：减小 `smooth_weight` 到 0.5 或更低
 
 **问题：轨迹偏离原路径太多**
 
@@ -115,19 +111,6 @@ ros2 run navigation2 rm_minco_path_smoother_node --ros-args --log-level debug
 - 解决：减小 `smooth_weight` 到 0.5
 
 ## 实现细节
-
-### ESDF 适配
-
-MINCO 优化器通过回调函数查询 ESDF：
-
-```cpp
-minco_optimizer_->setEsdfQuery(
-  [this](const Eigen::Vector2d & pos, double & dist, Eigen::Vector2d & grad) {
-    return esdf_map_.query(pos, dist, grad);
-  });
-```
-
-这样可以复用 Lucifer_nav 现有的 `RcEsdfMap`，无需重新实现 ESDF。
 
 ### 时间分配策略
 

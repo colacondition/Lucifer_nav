@@ -4,8 +4,8 @@
 #   1. executed_speed_ 确实驱动 ProgressMonitor（喂非零的 /cmd_vel + 位置不动
 #      → stuck）。这是指令链路闭环改动的核心断言。
 #   2. FSM 确实从 FOLLOW 转到恢复态。
-#   3. 进入恢复时确实把 goal_approach_controller 关掉（否则倒车指令会被它
-#      吃掉 —— 距目标 0.25 m 内它无条件发零 Twist）。
+#   3. 进入恢复时确实把接近段关掉（否则倒车指令会被它
+#      吃掉 —— 距目标 0.25 m 内无条件发零 Twist）。
 #
 # 车放在距目标 4 m 处，远离 suppress_near_goal(0.35) 抑制带。
 import os
@@ -84,7 +84,7 @@ class TestStuckEntersRecovery(unittest.TestCase):
         self.assertIn(
             False, self.harness.approach_enabled,
             'stuck was not detected, or recovery did not disable '
-            'goal_approach_controller. Without that, reverse commands get '
+            'the approach gate. Without that, reverse commands get '
             'zeroed by the downstream controller.')
 
 

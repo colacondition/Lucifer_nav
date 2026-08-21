@@ -3,7 +3,7 @@
 // Humble 自带的 component_container_mt 不接受任何线程数参数（位置参数与
 // --thread-count 均被忽略），executor 线程数恒为 hardware_concurrency()。
 // 在核数很多的机器（本机 24 核）上会白白起 24 个 executor 线程。本可执行文件
-// 的第一个位置参数指定线程数（默认 6），其余参数照常是 ros args。
+// 的第一个位置参数指定线程数（默认 2），其余参数照常是 ros args。
 //
 // 用法：nav_container_mt [线程数] [--ros-args ...]
 // 与 component_container_mt 的差异只有线程数可配，加载/卸载组件的服务
@@ -21,7 +21,7 @@ int main(int argc, char * argv[])
 
   const std::vector<std::string> non_ros_args =
     rclcpp::remove_ros_arguments(argc, argv);
-  std::size_t num_threads = 6;
+  std::size_t num_threads = 2;
   if (non_ros_args.size() > 1) {
     try {
       num_threads = std::stoul(non_ros_args[1]);

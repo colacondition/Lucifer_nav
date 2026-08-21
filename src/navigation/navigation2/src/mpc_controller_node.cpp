@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <mutex>
@@ -18,8 +19,6 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 
 #include <decision_interfaces/msg/gimbal_posture.hpp>
@@ -27,7 +26,6 @@
 #include <decision_interfaces/msg/semantic_map.hpp>
 
 #include "local_path_safety.hpp"
-#include "rc_esdf.h"
 #include "semantic_map_consumer.hpp"
 #include "mpc/mpc_solver.hpp"
 #include "mpc/path_reference.hpp"
@@ -76,6 +74,17 @@ std::vector<Eigen::Vector2d> pathPoints(const nav_msgs::msg::Path & path)
   return points;
 }
 
+double normalizeAngle(double angle)
+{
+  while (angle > M_PI) {
+    angle -= 2.0 * M_PI;
+  }
+  while (angle < -M_PI) {
+    angle += 2.0 * M_PI;
+  }
+  return angle;
+}
+
 // 执行层状态。原来的 control() 是无状态的：每拍要么跟踪要么停车，异常一律
 // 「停车 + 请求重规划」。车贴到障碍上时规划器的起点检查过不了，于是停车 →
 // 重规划失败 → 继续停车，死循环。恢复链的作用是先物理脱困再谈规划。
@@ -108,6 +117,14 @@ public:
     control_fps_ = declare_parameter<double>("control_fps", 30.0);
     expected_speed_ = declare_parameter<double>("expected_speed", 1.5);
     goal_tolerance_ = declare_parameter<double>("goal_tolerance", 0.2);
+    // 接近段（原 goal_approach_controller）：到点减速/对准/置零并进本节点，
+    // 避免 30 Hz QP 与下游覆写之间的容差死区。恢复期和航点中间点仍可通过
+    // approach_enabled_topic 关掉。approach.enable=false 时整段不生效（测试用）。
+    approach_enable_ = declare_parameter<bool>("approach.enable", true);
+    approach_distance_ = declare_parameter<double>("approach.distance", 1.5);
+    approach_velocity_ = declare_parameter<double>("approach.velocity", 0.5);
+    direct_approach_distance_ = declare_parameter<double>("approach.direct_distance", 0.5);
+    direct_approach_kp_ = declare_parameter<double>("approach.direct_kp", 1.0);
     max_track_error_ = declare_parameter<double>("max_track_error", 0.5);
     blind_radius_ = declare_parameter<double>("blind_radius", 0.1);
     delay_time_ = declare_parameter<double>("delay_time", 0.0);
@@ -128,12 +145,11 @@ public:
       "local_safety.replan_topic", "/navigation2/replan_request");
     replan_cooldown_ = declare_parameter<double>("local_safety.replan_cooldown", 0.5);
 
-    // 指令反馈。本节点发布的指令会被下游依次改写：
-    //   MPC -> /cmd_vel_nav_raw -> goal_approach_controller -> /cmd_vel_nav
-    //       -> rm_velocity_smoother -> /cmd_vel -> fake_vel_transform -> 底盘
-    // goal_approach_controller 会在近目标时置零或覆写，velocity_smoother 会限幅
-    // 并在输入超时后归零。所以「本节点发了多少」不能当作「车被驱动了多少」的
-    // 证据 —— 用它做卡住判据会被喂假数据（这正是到点前后反复蠕动的成因）。
+    // 指令反馈。本节点发布的指令仍会被下游改写：
+    //   MPC -> /cmd_vel_nav -> rm_velocity_smoother -> /cmd_vel
+    //       -> fake_vel_transform -> 底盘
+    // 接近段已并进本节点；velocity_smoother 仍会限幅并在输入超时后归零。
+    // 「本节点发了多少」不能当作「车被驱动了多少」—— 用它做卡住判据会被喂假数据。
     // 这里订阅链路末端，用真实执行值喂失效检测。
     executed_cmd_topic_ = declare_parameter<std::string>("feedback.executed_cmd_topic", "/cmd_vel");
     // rm_velocity_smoother 以 smoothing_frequency 无条件定频发布，所以这条流
@@ -221,12 +237,6 @@ public:
     // 隧道限速窗口：速度剖面在洞内的样本按 TunnelSpec 的 [vmin, vmax] 夹。收不到
     // 语义地图或图里没隧道时 tunnelSpecAtPoint 返回 nullptr，窗口不生效。
     tunnel_speed_window_enabled_ = declare_parameter<bool>("tunnel_speed_window.enable", true);
-    // 隧道影响区边距，用于 ESDF 整车碰撞检查里跳过顶板/门楣点云。语义与
-    // global/local_costmap_node 的同名参数一致 —— 代价地图在 processPointCloud 里
-    // 按影响区把顶板点滤掉，但 MPC 的 RC-ESDF 直接吃 /segmentation/obstacle 原始点云，
-    // 不滤的话顶板（z≈0.3，投影到 xy 平面）会落在车体足迹正上方被判成碰撞，车停在
-    // 洞口或蹭进洞后动不了。
-    tunnel_margin_m_ = declare_parameter<double>("tunnel_margin_m", 0.20);
     semantic_map_topic_ = declare_parameter<std::string>(
       "semantic_map_topic", "/map_server/semantic_map");
     if (tunnel_speed_window_enabled_) {
@@ -259,12 +269,8 @@ public:
     // 单帧尖峰（一帧坏点云、一次 QP 抖动）由重规划快路径处理，不该进恢复；
     // 只有持续否决才说明重规划解决不了问题。
     veto_recovery_time_ = declare_parameter<double>("recovery.veto_recovery_time", 1.5);
-    // 目标附近抑制失效检测。下游 goal_approach_controller 在它自己的
-    // goal_tolerance 内会无条件发零 Twist；若它的容差比本节点的
-    // goal_tolerance 大，中间就形成一条死区：本节点认为「还没到」继续发速度，
-    // 下游把速度置零，车不动 —— stuck 判据被喂了「有指令 + 无位移」的假数据，
-    // 于是倒车、重规划、再开到同一位置，无限往复。
-    // 这个带必须 >= 下游的 goal_tolerance。目标附近静止是期望行为，不是失效。
+    // 目标附近抑制失效检测。接近段已并进本节点，goal_tolerance 是唯一到点半径；
+    // 这条带仍要比它宽一圈，避免到点蠕动被 stuck 判据接走。
     recovery_suppress_near_goal_ =
       declare_parameter<double>("recovery.suppress_near_goal", 0.35);
     if (recovery_suppress_near_goal_ < goal_tolerance_) {
@@ -292,42 +298,6 @@ public:
       declare_parameter<int>("recovery.samples_per_ring", 12);
     safe_point_params_.distance_penalty =
       declare_parameter<double>("recovery.distance_penalty", 20.0);
-
-    // 整车碰撞检查参数。
-    esdf_enabled_       = declare_parameter<bool>("esdf.enable", false);
-    esdf_safety_margin_ = declare_parameter<double>("esdf.safety_margin", 0.04);
-    esdf_check_steps_   = declare_parameter<int>("esdf.check_steps", 5);
-    // 车体是圆柱（半径见 bringup/urdf/*.xacro 的 radius_base）。原来这里是
-    // 0.60×0.45 的矩形，那是旧的方形车。隧道只比车稍宽，圆柱在洞里转任何角度都
-    // 能过，可矩形一转就会把 0.3 m 长的车头戳进侧壁 —— 而侧壁在 /segmentation/
-    // obstacle 里照常有点（那条点云不按隧道净高滤顶板/侧壁），于是 esdfPathSafe
-    // 会在唯一的通路里误判碰撞、把车打进恢复。用圆柱足迹这个误判才不会发生。
-    const double esdf_radius = declare_parameter<double>("esdf.robot_radius", 0.25);
-    esdf_obstacle_topic_ = declare_parameter<std::string>(
-      "esdf.obstacle_topic", "/segmentation/obstacle");
-
-    if (esdf_enabled_) {
-      // 地图留足车身周围空间。
-      const double map_half = esdf_radius + 0.5;
-      esdf_map_.initialize(map_half * 2.0, map_half * 2.0, 0.02);
-      // 用正八边形外接圆逼近圆柱：RC-ESDF 要多边形。边中点在半径上、顶点在
-      // r/cos(π/8) 上，即外接八边形 —— 宁可略微高估车体，也不要在洞里低估。
-      // 与 MINCO 的 robot_footprint 用同一套逼近（params/navigation2.yaml）。
-      const double t = esdf_radius * std::tan(M_PI / 8.0);
-      const double r = esdf_radius;
-      esdf_map_.generateFromPolygon({
-        { r,  t}, { t,  r}, {-t,  r}, {-r,  t},
-        {-r, -t}, {-t, -r}, { t, -r}, { r, -t}});
-      esdf_obstacle_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        esdf_obstacle_topic_, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
-          std::lock_guard<std::mutex> lk(mtx_);
-          latest_esdf_obstacle_ = std::move(msg);
-        });
-      RCLCPP_INFO(get_logger(),
-        "RC-ESDF enabled: cylinder r=%.2f m  margin=%.3f m  steps=%d  obstacle=%s",
-        esdf_radius, esdf_safety_margin_, esdf_check_steps_, esdf_obstacle_topic_.c_str());
-    }
 
     mpc::MpcParams mp;
     mp.steps = declare_parameter<int>("predict_steps", 30);
@@ -394,9 +364,8 @@ public:
         local_costmap_ = std::move(msg);
       });
 
-    // 指令链路末端反馈。本节点的输出要经过 goal_approach_controller（可覆写、
-    // 可置零）和 rm_velocity_smoother（限加速度、超时归零）才到底盘，中间每一
-    // 级都能改动而本节点无从知晓。订阅链路末端把开环变成闭环：失效判据必须用
+    // 指令链路末端反馈。本节点的输出要经过 rm_velocity_smoother（限加速度、
+    // 超时归零）才到底盘。订阅链路末端把开环变成闭环：失效判据必须用
     // 「底盘实际收到什么」而不是「本节点想发什么」。
     executed_cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       executed_cmd_topic_, rclcpp::QoS(10),
@@ -423,19 +392,15 @@ public:
         has_gimbal_state_ = true;
       });
 
-    // 语义地图两处用：隧道限速窗口 + ESDF 的顶板点云豁免。同源同 QoS
-    // （transient_local），收不到时两者都静默失效。整帧不自洽时保留上一张好图。
-    if (tunnel_speed_window_enabled_ || esdf_enabled_) {
+    // 语义地图只给隧道限速窗口用。同源同 QoS（transient_local），收不到时静默失效。
+    if (tunnel_speed_window_enabled_) {
       const auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
       semantic_map_sub_ = create_subscription<decision_interfaces::msg::SemanticMap>(
         semantic_map_topic_, map_qos,
         [this](decision_interfaces::msg::SemanticMap::ConstSharedPtr msg) {
           std::lock_guard<std::mutex> lk(map_mutex_);
           try {
-            if (receiver_.update(*msg)) {
-              // 内容真变了才重建影响区，供 ESDF 逐点查表跳过顶板/门楣。
-              tunnel_region_ = TunnelRegionGrid::build(receiver_.map(), tunnel_margin_m_);
-            }
+            receiver_.update(*msg);
           } catch (const std::exception & ex) {
             RCLCPP_ERROR(get_logger(), "Rejected semantic map: %s", ex.what());
           }
@@ -448,11 +413,16 @@ public:
     vel_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("/vel_marker", rclcpp::QoS(1));
     state_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("/now_state_marker", rclcpp::QoS(1));
     replan_pub_ = create_publisher<std_msgs::msg::Empty>(replan_topic_, rclcpp::QoS(1));
-    // transient_local：goal_approach_controller 若比本节点后启动，也能拿到
-    // 最近一次的开关状态，不会在恢复期错过「关掉」这条消息。
+    // transient_local：航点执行器与本节点都写这个开关。恢复期关掉接近段，
+    // 否则 0.5 m 内的对准会把倒车指令吃掉；follow 中间点也会临时关掉。
     approach_enabled_pub_ = create_publisher<std_msgs::msg::Bool>(
       approach_enabled_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
-    // 初始状态：FOLLOW 态下 goal_approach_controller 启用。
+    approach_enabled_sub_ = create_subscription<std_msgs::msg::Bool>(
+      approach_enabled_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
+      [this](std_msgs::msg::Bool::ConstSharedPtr msg) {
+        approach_enabled_.store(msg->data, std::memory_order_relaxed);
+      });
+    // 初始状态：FOLLOW 态下接近段启用。
     // transient_local 只在有消息时 latch；不先发一条，后启动的订阅方永远不会
     // 收到任何值，集成测试里 approach_enabled 列表始终为空。
     setApproachEnabled(true);
@@ -567,8 +537,7 @@ private:
     }
 
     // 越权检测（可观测，不改变行为）。下游把本节点的非零指令压成零并持续
-    // 一段时间，就是「有指令但车不动」这类故障的真正来源 —— 到点蠕动那次
-    // 就是 goal_approach_controller 在死区里无条件发零 Twist 造成的。
+    // 一段时间，就是「有指令但车不动」这类故障的真正来源。
     // 平滑器的加减速斜坡是合法的短暂偏离（max_accel 4.0 × 0.05 s = 0.2 m/s
     // 每拍），所以用持续时间而不是单帧幅值差来判定。
     const double cmd_epsilon = progress_monitor_.params().cmd_epsilon;
@@ -578,7 +547,7 @@ private:
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 3000,
           "Downstream is zeroing our command: published %.2f m/s but %s reports %.2f m/s "
-          "for %.1f s (check goal_approach_controller / rm_velocity_smoother)",
+          "for %.1f s (check rm_velocity_smoother)",
           last_published_speed_, executed_cmd_topic_.c_str(), executed_speed, override_time_);
       }
     } else {
@@ -684,18 +653,13 @@ private:
     // 且进度可回退）。
     route_tracker_.update(ref, pos, dt);
 
-    // 目标附近关掉失效检测，作为容差错配的兜底。本节点的 goal_tolerance 已经
-    // 对齐到下游 goal_approach_controller 的 0.25，正常配置下不会再形成死区；
-    // 但只要两者被改回不一致，中间那段就会重现「本节点还在发速度、下游已把车
-    // 按住不动」的假象。目标附近静止本身就是期望行为，不该由恢复链接管。
+    // 目标附近关掉失效检测。接近段已并进本节点，到点静止是期望行为。
     const bool near_goal = goal_distance < recovery_suppress_near_goal_;
     if (near_goal) {
       progress_monitor_.reset();
     } else {
       // 失效检测喂的是**链路末端实际下发的**速率，不是本节点发布的指令。
-      // 这一点是这轮踩坑的核心：下游 goal_approach_controller 会覆写、
-      // rm_velocity_smoother 会限幅或超时归零，用自己发布的值判定「车确实
-      // 在被驱动」会得到假数据，从而误触发倒车。
+      // 下游 rm_velocity_smoother 仍会限幅或超时归零。
       progress_monitor_.update(pos, executed_speed, dt);
 
       // 这是打断「停车 → 重规划 → 起点不可行 → 继续停车」死循环的关键：
@@ -796,8 +760,7 @@ private:
     }
 
     if (!costmapFresh(local_costmap) ||
-      !isPathSafe(*local_costmap, predicted_positions_buffer_, safety_policy_) ||
-      !esdfPathSafe(predicted_positions_buffer_, vseq, pos, yaw))
+      !isPathSafe(*local_costmap, predicted_positions_buffer_, safety_policy_))
     {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
@@ -809,17 +772,18 @@ private:
     // 走到这里说明本拍产出了可执行指令，否决连击清零。
     veto_streak_ = 0.0;
 
-    // 世界系速度转到底盘系。
+    // 世界系速度转到底盘系，再套接近段（恢复指令走 publishWorldVelocity，不经过这里）。
     const double vx_w = vseq[0].x();
     const double vy_w = vseq[0].y();
     geometry_msgs::msg::Twist cmd;
     cmd.linear.x = std::cos(yaw) * vx_w + std::sin(yaw) * vy_w;
     cmd.linear.y = -std::sin(yaw) * vx_w + std::cos(yaw) * vy_w;
     cmd.angular.z = default_wz_;
+    applyApproach(cmd, pos, yaw, ref.goal());
     cmd_pub_->publish(cmd);
 
     std_msgs::msg::Float64 norm;
-    norm.data = std::hypot(vx_w, vy_w);
+    norm.data = std::hypot(cmd.linear.x, cmd.linear.y);
     cmd_norm_pub_->publish(norm);
     // 记下本拍实际下发的速率，下一拍喂给 ProgressMonitor 判定卡住。
     last_published_speed_ = norm.data;
@@ -853,13 +817,48 @@ private:
 
   void setApproachEnabled(bool enabled)
   {
+    approach_enabled_.store(enabled, std::memory_order_relaxed);
     std_msgs::msg::Bool msg;
     msg.data = enabled;
     approach_enabled_pub_->publish(msg);
   }
 
-  // 进入恢复态。必须关掉 goal_approach_controller：它在距目标 0.25 m 内
-  // 无条件发零 Twist、0.5 m 内覆写 linear.x/y，会把倒车指令吃掉。
+  // 接近减速/对准。只改 FOLLOW 指令；恢复期通过 setApproachEnabled(false) 跳过。
+  void applyApproach(
+    geometry_msgs::msg::Twist & cmd,
+    const Eigen::Vector2d & pos,
+    double yaw,
+    const Eigen::Vector2d & goal)
+  {
+    if (!approach_enable_ || !approach_enabled_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    const double dx = goal.x() - pos.x();
+    const double dy = goal.y() - pos.y();
+    const double dist = std::hypot(dx, dy);
+    if (dist <= goal_tolerance_) {
+      cmd = geometry_msgs::msg::Twist{};
+      return;
+    }
+    const double local_heading = normalizeAngle(std::atan2(dy, dx) - yaw);
+    const double target_speed = std::min(approach_velocity_, dist * direct_approach_kp_);
+    if (dist < direct_approach_distance_) {
+      cmd.linear.x = target_speed * std::cos(local_heading);
+      cmd.linear.y = target_speed * std::sin(local_heading);
+      cmd.angular.z = 0.0;
+    } else if (dist < approach_distance_) {
+      const double speed = std::hypot(cmd.linear.x, cmd.linear.y);
+      if (speed > approach_velocity_ && speed > 1e-6) {
+        const double scale = approach_velocity_ / speed;
+        cmd.linear.x *= scale;
+        cmd.linear.y *= scale;
+        cmd.angular.z *= scale;
+      }
+    }
+  }
+
+  // 进入恢复态。必须关掉接近段：它在距目标 0.5 m 内覆写 linear、容差内置零，
+  // 会把倒车指令吃掉。
   void enterRecovery(NavState state, const Eigen::Vector2d & pos, const char * reason)
   {
     nav_state_ = state;
@@ -1081,100 +1080,6 @@ private:
     last_replan_request_ = now();
   }
 
-  // 用 RC-ESDF 检查预测轨迹。PointCloud2 版本：直接吃 /segmentation/obstacle，
-  // 点云已经在 base_link 系（cpp_lidar_filter 的 navigation_frame 参数），
-  // 省掉了 LaserScan 那套极坐标反投影。
-  bool esdfPathSafe(
-    const std::vector<Eigen::Vector2d> & predicted_positions,
-    const std::vector<Eigen::Vector2d> & vseq,
-    const Eigen::Vector2d & robot_pos,
-    double robot_yaw)
-  {
-    if (!esdf_enabled_ || !latest_esdf_obstacle_) {
-      return true;
-    }
-    const auto & cloud = *latest_esdf_obstacle_;
-    const int steps = std::min(
-      esdf_check_steps_, static_cast<int>(predicted_positions.size()));
-
-    // 障碍点已经在 base_link 系，转到世界系。
-    std::vector<Eigen::Vector2d> obs_world;
-    obs_world.reserve(cloud.width * cloud.height);
-    const double cos_yaw = std::cos(robot_yaw);
-    const double sin_yaw = std::sin(robot_yaw);
-
-    // 顶板/门楣点云落在隧道影响区内。RC-ESDF 只查 xy 平面，不滤的话这些点
-    // （z≈clear_height 但 xy 在车体正上方）会被投影成 xy 障碍，把洞口和洞内都判成
-    // 碰撞 —— 正是「云台已绿却停在洞口 / 蹭进去后动不了」的成因。代价地图在
-    // processPointCloud 里用同一张影响区把这些点滤掉了，这里必须跟它保持一致。
-    // 影响区只在语义地图更新时重建，拷贝一份到局部变量后逐点查表即可，避免每点
-    // 都抢 map_mutex_。
-    TunnelRegionGrid tunnel_region;
-    {
-      std::lock_guard<std::mutex> lk(map_mutex_);
-      tunnel_region = tunnel_region_;
-    }
-    const bool has_tunnel_region = !tunnel_region.empty();
-
-    try {
-      sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
-      sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
-      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y) {
-        if (!std::isfinite(*iter_x) || !std::isfinite(*iter_y)) {
-          obs_world.emplace_back(
-            std::numeric_limits<double>::quiet_NaN(),
-            std::numeric_limits<double>::quiet_NaN());
-          continue;
-        }
-        // base_link -> map
-        const double bx = static_cast<double>(*iter_x);
-        const double by = static_cast<double>(*iter_y);
-        const double wx = robot_pos.x() + cos_yaw * bx - sin_yaw * by;
-        const double wy = robot_pos.y() + sin_yaw * bx + cos_yaw * by;
-        if (has_tunnel_region && tunnel_region.specNearPoint(wx, wy) != nullptr) {
-          // 隧道结构（顶板/门楣/侧壁上沿）不该参与整车碰撞，通行由静态地图的
-          // 壁面致命格决定，与代价地图的语义一致。
-          continue;
-        }
-        obs_world.emplace_back(wx, wy);
-      }
-    } catch (const std::exception & ex) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "ESDF: failed to iterate obstacle cloud fields: %s", ex.what());
-      return true;
-    }
-
-    double pred_yaw = robot_yaw;
-    for (int step = 0; step < steps; ++step) {
-      // 航向按速度方向近似。
-      if (step < static_cast<int>(vseq.size()) && vseq[step].norm() > 0.05) {
-        pred_yaw = std::atan2(vseq[step].y(), vseq[step].x());
-      }
-      const double cos_pred = std::cos(pred_yaw);
-      const double sin_pred = std::sin(pred_yaw);
-      const Eigen::Vector2d & pred_pos = predicted_positions[step];
-
-      for (std::size_t i = 0; i < obs_world.size(); ++i) {
-        if (!std::isfinite(obs_world[i].x())) {
-          continue;
-        }
-        const double dx = obs_world[i].x() - pred_pos.x();
-        const double dy = obs_world[i].y() - pred_pos.y();
-        // 转到该时刻车体系。
-        const Eigen::Vector2d obs_body(
-           cos_pred * dx + sin_pred * dy,
-          -sin_pred * dx + cos_pred * dy);
-        double dist;
-        Eigen::Vector2d grad;
-        if (esdf_map_.query(obs_body, dist, grad) && dist < esdf_safety_margin_) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
   // 发布当前位置和速度箭头。
   void publishMarkers(const Eigen::Vector2d & pos, double vx_w, double vy_w)
   {
@@ -1255,6 +1160,12 @@ private:
   std::string local_costmap_topic_, replan_topic_, robot_base_frame_;
   double control_fps_, expected_speed_, goal_tolerance_, max_track_error_;
   double blind_radius_, delay_time_, default_wz_, predict_dt_;
+  bool approach_enable_{true};
+  double approach_distance_{1.5};
+  double approach_velocity_{0.5};
+  double direct_approach_distance_{0.5};
+  double direct_approach_kp_{1.0};
+  std::atomic<bool> approach_enabled_{true};
   int steps_;
   bool use_delay_comp_;
   bool use_tf_pose_{true};
@@ -1264,25 +1175,12 @@ private:
   double local_costmap_timeout_, replan_cooldown_;
   LocalPathSafetyPolicy safety_policy_;
 
-  // RC-ESDF 碰撞检查。
-  RcEsdfMap esdf_map_;
-  bool esdf_enabled_{false};
-  double esdf_safety_margin_{0.04};
-  int esdf_check_steps_{5};
-  std::string esdf_obstacle_topic_;
-  sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_esdf_obstacle_;
-
   // 隧道限速窗口。语义地图在订阅回调里写、在 rebuildSpeedProfile 的窗口查询里读，
   // 两者可能不同线程（单容器多线程执行器），用独立的 map_mutex_ 护住 receiver_ ——
   // 与控制状态的 mtx_ 分开，避免把地图订阅和控制环相互阻塞。
   bool tunnel_speed_window_enabled_{true};
-  double tunnel_margin_m_{0.20};
   std::string semantic_map_topic_;
   SemanticMapReceiver receiver_;
-  // 隧道影响区（本体 + tunnel_margin_m_ 边距），随语义地图重建。ESDF 整车碰撞
-  // 检查用它跳过顶板/门楣点云，语义与代价地图的 inTunnelRegion 一致。空表时
-  // specNearPoint 恒返回 nullptr，等价于「没有隧道」。
-  TunnelRegionGrid tunnel_region_;
   std::mutex map_mutex_;
 
   std::mutex mtx_;
@@ -1299,8 +1197,8 @@ private:
   bool goal_changed_ = false;
   std::optional<Eigen::Vector2d> last_goal_;
   // 链路末端实际下发的速率，由 executed_cmd_sub_ 在订阅线程写入。这是
-  // 「底盘真的收到了什么」的唯一可信来源：本节点发布的指令会被下游的
-  // goal_approach_controller 覆写、被 rm_velocity_smoother 限幅或超时归零。
+  // 「底盘真的收到了什么」的唯一可信来源：本节点发布的指令仍会被
+  // rm_velocity_smoother 限幅或超时归零。
   double executed_speed_{0.0};
   std::optional<rclcpp::Time> last_executed_cmd_time_;
   // 云台收放的请求与实测，由各自的订阅回调写入。请求到位之前车不走 —— 判据见 control()。
@@ -1351,8 +1249,7 @@ private:
   double recovery_max_duration_{10.0};
   int recovery_max_attempts_{3};
   double goal_change_threshold_{0.3};
-  // 目标附近抑制失效检测的半径，避免与下游 goal_approach_controller 的
-  // 零速区形成死区。
+  // 目标附近抑制失效检测的半径，到点静止不应进恢复链。
   double recovery_suppress_near_goal_{0.35};
   // 本次恢复动作的运行状态。
   Eigen::Vector2d reverse_direction_{Eigen::Vector2d::Zero()};
@@ -1370,7 +1267,6 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr local_costmap_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr esdf_obstacle_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr executed_cmd_sub_;
   rclcpp::Subscription<decision_interfaces::msg::GimbalPosture>::SharedPtr gimbal_posture_sub_;
   rclcpp::Subscription<decision_interfaces::msg::GimbalPostureState>::SharedPtr
@@ -1383,6 +1279,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr state_marker_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr replan_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr approach_enabled_pub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr approach_enabled_sub_;
   std::string approach_enabled_topic_;
   std::optional<rclcpp::Time> last_replan_request_;
   rclcpp::TimerBase::SharedPtr timer_;

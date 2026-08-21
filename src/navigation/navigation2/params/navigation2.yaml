@@ -1,6 +1,5 @@
-# 到达判定半径（m）：goal_approach_controller 与 rm_mpc_controller 必须一致
-# （否则在两者之间形成死区，车到点反复蠕动）。两处用 YAML 锚点共享这一个值，
-# 改这里即可同步。rm_mpc_controller 的 recovery.suppress_near_goal 必须 >= 它
+# 到达判定半径（m）：接近段已并进 rm_mpc_controller，这是唯一到点半径。
+# rm_mpc_controller 的 recovery.suppress_near_goal 必须 >= 它
 # （当前 0.35 是刻意更宽的失效检测抑制带，不参与共享）。
 goal_tolerance_default: &goal_tolerance_default 0.25
 
@@ -36,7 +35,6 @@ rm_global_planner:
     allow_unknown: true
     unknown_cost: 1.4
     obstacle_threshold: 100
-    apply_internal_inflation: false
     # A* 格代价映射：cellCost = 1 + map_cost_weight * (格值/100)^map_cost_exponent。
     # weight 越大越绕开高代价格（越不贴墙）；exponent <1 抬高低代价、>1 放大高代价。
     map_cost_weight: 20.0
@@ -141,7 +139,7 @@ rm_minco_path_smoother:
     # MINCO 优化参数
     smooth_weight: 0.1        # 平滑项权重（降低以保持原路径形状）
     data_weight: 10.0         # 数据项权重（保持接近原路径）
-    enable_optimization: true # 是否启用优化
+    enable_optimization: true  # MINCO L-BFGS 优化
 
     # 时间分配参数
     default_velocity: 1.5     # 默认速度（用于计算段时间）
@@ -204,33 +202,6 @@ rm_local_costmap:
     reuse_previous_grid: true
     previous_obstacle_decay: 8
 
-# 到点接近控制器：插在 MPC 与 velocity_smoother 之间，负责「快到目标时的减速与对准」。
-# MPC 的输出（/cmd_vel_nav_raw）经过这里再交给 velocity_smoother。三段式：
-#   dist >  approach_distance         原样转发 MPC 指令（含朝向）
-#   dist <= approach_distance         限速到 approach_velocity，方向不动
-#   dist <= direct_approach_distance  P 控制对准目标（速度 = dist * kp，越近越慢）
-#   dist <= goal_tolerance            到达，无条件发零 Twist
-goal_approach_controller:
-  ros__parameters:
-    use_sim_time: true
-    global_frame: map
-    robot_base_frame: base_link_fake
-    input_cmd_vel_topic: /cmd_vel_nav_raw
-    output_cmd_vel_topic: /cmd_vel_nav
-    path_topic: /plan
-    approach_enabled_topic: /goal_approach_controller/enabled
-    # 距离目标多远开始限速（m）。调小=更晚减速、冲得更近；调大=更早收住。
-    approach_distance: 1.5
-    # 接近段速度上限（m/s）。调小=到点更慢更稳，调大=冲得更快。
-    approach_velocity: 0.5
-    # 直接对准段半径（m）：小于此值后用 P 控制直接对准目标（角度速度置零）。
-    direct_approach_distance: 0.5
-    # 对准段 P 增益：目标速度 = dist * kp。越大到点越果断，过大易过冲、摆动。
-    direct_approach_kp: 1.0
-    # 到达判定半径（m）。与上游 MPC 共享文件顶部的锚点值，必须保持两者一致，
-    # 否则 MPC 还在发速度、这里已经按住车不动，会到点反复蠕动。
-    goal_tolerance: *goal_tolerance_default
-
 # 速度平滑器：对上游指令做限幅 + 平滑，输出最终 /cmd_vel。车「一顿一顿」或
 # 「起步/刹车太猛」优先查这里。
 rm_velocity_smoother:
@@ -263,13 +234,16 @@ rm_mpc_controller:
     target_frame: map
     path_topic: /plan
     odom_topic: /Odometry
-    cmd_vel_topic: /cmd_vel_nav_raw
+    cmd_vel_topic: /cmd_vel_nav
     control_fps: 30.0
     expected_speed: 1.5
-    # 与下游 goal_approach_controller 共享文件顶部的锚点值，必须保持一致，否则
-    # 两者之间形成死区：本节点还认为「没到」继续求解发速度，下游已无条件发零
-    # Twist 把车按住，白算一场。
     goal_tolerance: *goal_tolerance_default
+    # 接近段（原独立节点）。恢复期和 follow 中间点仍走 /goal_approach_controller/enabled。
+    approach.enable: true
+    approach.distance: 1.5
+    approach.velocity: 0.5
+    approach.direct_distance: 0.5
+    approach.direct_kp: 1.0
     # 跟踪残差超过此值判为「跟丢」（触发 tracker 丢失 / 恢复链）。调大=更容忍
     # 路径偏差（不易报丢但可能偏离路线），调小=更严格（频繁报丢）。
     max_track_error: 0.5
@@ -309,11 +283,6 @@ rm_mpc_controller:
     # 车在进洞前就减到位，而不是洞口瞬间跳变（跳变的参考 MPC 跟不上）。
     # 收不到语义地图或图里没隧道时静默失效。设 enable=false 关闭。
     tunnel_speed_window.enable: true
-    # 隧道影响区边距，供 MPC 的 RC-ESDF 整车碰撞检查跳过顶板/门楣点云。必须与
-    # rm_global_costmap / rm_local_costmap 的同名参数一致 —— 代价地图在点云里按这张
-    # 影响区把顶板滤掉，ESDF 直接吃 /segmentation/obstacle 原始点云，不一致的话会
-    # 出现「云台已绿却停在洞口、或蹭进去后动不了」的假碰撞。
-    tunnel_margin_m: 0.20
     semantic_map_topic: /map_server/semantic_map
     # 弧长域速度剖面。替代全程恒定的 expected_speed，在弯道自动减速，
     # 避免 MPC 参考轨迹本身就不可跟踪（过弯不减速 → 参考跑到弯道外 → 切角）。
@@ -326,10 +295,8 @@ rm_mpc_controller:
     speed_profile.sample_spacing: 0.10      # 剖面采样间距（m）
     speed_profile.curvature_window: 3       # 曲率平滑窗（样本数，双侧）
     speed_profile.stop_at_goal: true        # 终点是否减速至零
-    # 指令链路反馈。本节点发布的指令会被下游改写：goal_approach_controller 会
-    # 覆写或置零，rm_velocity_smoother 会限幅、并在输入超时后归零。所以「是否
-    # 真的有指令」必须以链路末端的实测值为准，不能用自己发布的值 —— 否则 stuck
-    # 判据会被喂假数据（这正是到点反复蠕动那个 bug 的成因）。
+    # 指令链路反馈。本节点发布的指令仍会被 rm_velocity_smoother 限幅、并在输入
+    # 超时后归零。所以「是否真的有指令」必须以链路末端的实测值为准。
     # rm_velocity_smoother 以 smoothing_frequency(20 Hz) 无条件定频发布，所以
     # 此话题静默代表它已经死了，而不是「本来就没有指令」，会单独报警。
     feedback.executed_cmd_topic: /cmd_vel
@@ -340,16 +307,6 @@ rm_mpc_controller:
     # 节点停车等 —— 云台立着进洞会撞在顶板上，停着等的代价只是不动。
     gimbal.posture_topic: /gimbal_posture
     gimbal.posture_state_topic: /gimbal_posture_state
-    # RC-ESDF whole-body collision check (cylinder footprint, octagon-approximated).
-    # Obstacle in body frame is queried; unsafe if dist-to-boundary < safety_margin.
-    esdf.enable: true
-    # 车体是圆柱，整车碰撞检查也用圆柱足迹（正八边形外接圆逼近）。半径与
-    # global_costmap 的 robot_radius、urdf 的 radius_base 一致。别退回成矩形：
-    # 隧道只比车稍宽，矩形车头一转就戳进侧壁，MPC 会在唯一的通路里误判碰撞。
-    esdf.robot_radius: 0.25   # meters, cylinder radius
-    esdf.safety_margin: 0.04  # meters, flag collision when obstacle < this from boundary
-    esdf.check_steps: 5       # number of predicted horizon steps to check
-    esdf.obstacle_topic: /segmentation/obstacle
     # 多假设弧长进度跟踪。替代原来的全路径最近点扫描：回绕路径上最近点会在
     # 两个弧长相差很远、空间距离接近的位置间跳变，且进度可回退。
     # 跟踪丢失沿用上面的 max_track_error，只是改为需要持续超限 lost_grace_time。
@@ -393,13 +350,11 @@ rm_mpc_controller:
     # 检查否决）连续持续超过此时长，就从「停车+重规划」升级为物理脱困。单帧的
     # 坏代价图或偶发 QP 抖动应由重规划解决，不该惊动恢复链，所以这里留 1.5 s。
     recovery.veto_recovery_time: 1.5
-    # 距目标小于此值时关闭失效检测。必须 >= 下游 goal_approach_controller 的
-    # goal_tolerance(0.25)，否则会在两个容差之间形成死区：本节点还认为「没到」
-    # 而继续发速度，下游已经按住车不动，stuck 误触发导致到点后反复前后蠕动。
+    # 距目标小于此值时关闭失效检测。必须 >= goal_tolerance，否则到点静止会被
+    # stuck 误触发。
     recovery.suppress_near_goal: 0.35
-    # 恢复期必须临时关掉 goal_approach_controller：它在距目标 goal_tolerance
-    # (0.25 m) 内无条件发零 Twist、direct_approach_distance(0.5 m) 内覆写
-    # linear.x/y，会把倒车指令吃掉。
+    # 恢复期关掉接近段，否则 0.5 m 内的对准会把倒车指令吃掉。话题名保持旧名，
+    # 航点执行器仍往这里写。
     recovery.approach_enabled_topic: /goal_approach_controller/enabled
     # 危险判据与恢复期通行判据。通行只看 lethal 是必要的放宽：车已经在膨胀圈
     # 里，用 local_safety.obstacle_threshold(50) 检查会让所有方向立即被否，

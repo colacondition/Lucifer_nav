@@ -27,12 +27,14 @@
   <depend>nav2_msgs</depend>
   <depend>builtin_interfaces</depend>
   <depend>osqp_vendor</depend>
-  <!-- Eigen 被公开头文件（semantic_map/tunnel_posture/rc_esdf）直接包含，必须声明。 -->
+  <!-- Eigen 被公开头文件（semantic_map/tunnel_posture）直接包含，必须声明。 -->
   <depend>eigen</depend>
   <!-- 语义地图文件格式（msgpack.hpp 是 header-only，无需链接） -->
   <depend>libmsgpack-dev</depend>
   <!-- SemanticMap / TunnelSpec / ChassisMode 消息 -->
   <depend>decision_interfaces</depend>
+
+  <exec_depend>fake_vel_transform</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

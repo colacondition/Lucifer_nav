@@ -12,9 +12,11 @@ RoboMaster 哨兵导航工作空间，ROS 2 Humble + Gazebo Classic 11，支持�
 
 `navigation2` 是组件化的单个功能包：10 个导航节点（全局/局部规划、代价地图、路径平滑、
 MPC 控制器、隧道云台请求、云台可视化等）编进同一个 shared library，
-用 `rclcpp_components` 注册，全部加载进一个 `component_container_mt`，进程内零拷贝。
+用 `rclcpp_components` 注册，全部加载进一个固定线程数容器。Humble 下
+`/map`、costmap、云台等 latch 话题是 `transient_local`，不能开 intra-process；
+感知容器里的 volatile 点云才走进程内指针投递。
 全局规划用 A*，在 `OccupancyGrid` 上构建 2D 距离场做 clearance cost 让路径远离障碍；
-平滑后的 `/plan` 交给 MPC 控制器跟踪，控制器内含弧长进度跟踪、卡住检测、
+`/plan` 交给 MPC 控制器跟踪（接近减速并在本节点内完成），控制器内含弧长进度跟踪、卡住检测、
 倒车与安全点脱困恢复链和速度剖面。
 
 数据流：
@@ -28,12 +30,10 @@ Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /L
                                                        │
 /Laser_map_dense ──► fast_location ──(map→odom)──┐     │
                                                  ▼     ▼
-                                        navigation2 (A* + 距离场 + MPC)
+                                        navigation2 (A* + 距离场 + MPC + 接近段)
                                            │
-        /cmd_vel_nav_raw ──► goal_approach_controller
-                             ──► /cmd_vel_nav ──► velocity_smoother
-                             ──► /cmd_vel ──► fake_vel_transform
-                             ──► /cmd_vel_chassis ──► 底盘 / Gazebo
+        /cmd_vel_nav ──► velocity_smoother ──► /cmd_vel
+                             ──► fake_vel_transform（同容器）──► /cmd_vel_chassis ──► 底盘 / Gazebo
 ```
 
 主要话题：
@@ -70,7 +70,6 @@ src/localization/small_glim                  LIO 里程计与建图（GLIM 精�
                                              GTSAM ISAM2 + GICP/iVox）
 src/localization/fast_location               点云对先验 PCD 的主定位
 src/navigation/navigation2                   导航栈（组件化，A* + 距离场 + MPC）
-src/control/goal_approach_controller         目标接近减速
 src/control/fake_vel_transform               底盘速度坐标转换
 src/control/waypoint_editor                  航点编辑与 follow / patrol 执行器
 src/decision/decision_node                   决策节点（包名 decision）
@@ -103,7 +102,7 @@ rviz/mapping.rviz                            mapping 模式（Fixed Frame = worl
 `navigation2` 的 10 个组件：`rm_map_server`、`rm_global_costmap`、`rm_global_planner`、
 `rm_minco_path_smoother`、`rm_local_costmap`、`rm_mpc_controller`、`rm_velocity_smoother`、
 `rm_nav2_compat`、`rm_tunnel_posture`、`rm_gimbal_visualizer`；
-`goal_approach_controller` 从独立包组合进同一容器。
+`fake_vel_transform` 从独立包组合进同一容器。接近减速在 `rm_mpc_controller` 内完成。
 
 ## 三. 编译
 

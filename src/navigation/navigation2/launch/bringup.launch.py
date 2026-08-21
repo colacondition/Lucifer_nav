@@ -23,11 +23,11 @@ def generate_launch_description():
     start_path_smoother = LaunchConfiguration('start_path_smoother')
     start_local_costmap = LaunchConfiguration('start_local_costmap')
     start_mpc_controller = LaunchConfiguration('start_mpc_controller')
-    start_goal_approach_controller = LaunchConfiguration('start_goal_approach_controller')
     start_velocity_smoother = LaunchConfiguration('start_velocity_smoother')
     start_nav2_compat = LaunchConfiguration('start_nav2_compat')
     start_tunnel_posture = LaunchConfiguration('start_tunnel_posture')
     start_gimbal_visualizer = LaunchConfiguration('start_gimbal_visualizer')
+    start_fake_vel_transform = LaunchConfiguration('start_fake_vel_transform')
     container_name = LaunchConfiguration('container_name')
 
     common_params = [params_file, {'use_sim_time': use_sim_time}]
@@ -68,10 +68,10 @@ def generate_launch_description():
         respawn=True, respawn_delay=2.0,
         package='navigation2',
         # 固定线程数组件容器（Humble 自带 component_container_mt 的线程数
-        # 恒为 hardware_concurrency 且不可配）；6 个 executor 线程对互斥回调组
-        # 串行化的导航组件已足够，核数无关。
+        # 恒为 hardware_concurrency 且不可配）。导航回调被互斥组串行化，
+        # 2 个 executor 足够让 A* 与 MPC 重叠；6 是超订。
         executable='nav_container_mt',
-        arguments=['6'],
+        arguments=['2'],
         output='screen',
     )
 
@@ -106,16 +106,14 @@ def generate_launch_description():
             # 默认开。忘开的代价只是 RViz 里看不到云台状态，不影响行驶。
             nav_component('navigation2::RmGimbalVisualizer', 'rm_gimbal_visualizer',
                           start_gimbal_visualizer),
-            # goal_approach_controller lives in its own package (PCL-free, separate deps)
-            # but composes into the same container.
             LoadComposableNodes(
-                condition=IfCondition(start_goal_approach_controller),
+                condition=IfCondition(start_fake_vel_transform),
                 target_container=container_name,
                 composable_node_descriptions=[
                     ComposableNode(
-                        package='goal_approach_controller',
-                        plugin='goal_approach_controller::GoalApproachControllerNode',
-                        name='goal_approach_controller',
+                        package='fake_vel_transform',
+                        plugin='fake_vel_transform::FakeVelTransform',
+                        name='fake_vel_transform',
                         parameters=common_params,
                     )
                 ],
@@ -157,11 +155,11 @@ def generate_launch_description():
         DeclareLaunchArgument('start_path_smoother', default_value='true'),
         DeclareLaunchArgument('start_local_costmap', default_value='true'),
         DeclareLaunchArgument('start_mpc_controller', default_value='true'),
-        DeclareLaunchArgument('start_goal_approach_controller', default_value='true'),
         DeclareLaunchArgument('start_velocity_smoother', default_value='true'),
         DeclareLaunchArgument('start_nav2_compat', default_value='true'),
         DeclareLaunchArgument('start_tunnel_posture', default_value='true'),
         DeclareLaunchArgument('start_gimbal_visualizer', default_value='true'),
+        DeclareLaunchArgument('start_fake_vel_transform', default_value='true'),
         DeclareLaunchArgument('container_name', default_value='nav_container'),
 
         container,

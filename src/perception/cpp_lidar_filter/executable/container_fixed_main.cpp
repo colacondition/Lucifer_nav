@@ -3,7 +3,7 @@
 // Humble 自带的 component_container_mt 不接受线程数参数，executor 线程数恒为
 // hardware_concurrency()。本机 24 核时会起 24 个 executor 线程，而感知链只有
 // lidar_filter + ground_segmentation 两个节点、单帧流水线很短，绝大多数线程
-// 都在空转。本可执行文件的第一个位置参数指定线程数（默认 2，由 bringup launch
+// 都在空转。本可执行文件的第一个位置参数指定线程数（默认 2；bringup 传入 1），
 // 的 perception_threads 参数传入），其余参数照常是 ros args。
 //
 // 用法：perception_container_mt [线程数] [--ros-args ...]

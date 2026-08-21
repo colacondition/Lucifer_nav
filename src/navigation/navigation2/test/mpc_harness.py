@@ -2,7 +2,7 @@
 #
 # Why this exists: unit tests only cover pure functions (isHazardous,
 # findSafePoint, RouteTracker, ProgressMonitor). FSM transitions, the
-# goal_approach_controller on/off sequence, and whether executed_speed_
+# approach-enabled topic on/off sequence, and whether executed_speed_
 # actually drives ProgressMonitor are all inside the node -- gtest cannot
 # reach them. The creep-at-goal bug was exactly this class: all unit tests
 # passed, it only showed on the real robot.
@@ -201,7 +201,7 @@ def mpc_test_params(**overrides):
         'control_fps': 30.0,
         'expected_speed': 1.5,
         'goal_tolerance': 0.25,
-        'esdf.enable': False,
+        'approach.enable': False,
         'local_safety.costmap_topic': '/local_costmap/costmap',
         'local_safety.costmap_timeout': 1.0,
         'feedback.executed_cmd_topic': '/cmd_vel',

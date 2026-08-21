@@ -1,6 +1,6 @@
 ground_segmentation:
   ros__parameters:
-    n_threads: 4                # number of threads to use.
+    n_threads: 2                # OpenMP fork-join; keep sim aligned with real budget.
 
     r_min: 0.2                  # minimum point distance.
     r_max: 10.0                 # maximum navigation point distance.

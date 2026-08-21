@@ -15,7 +15,6 @@
   <exec_depend>cpp_lidar_filter</exec_depend>
   <exec_depend>linefit_ground_segmentation_ros</exec_depend>
   <exec_depend>navigation2</exec_depend>
-  <exec_depend>goal_approach_controller</exec_depend>
   <exec_depend>fake_vel_transform</exec_depend>
   <exec_depend>waypoint_editor</exec_depend>
   <exec_depend>serial_driver</exec_depend>

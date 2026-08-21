@@ -1,7 +1,7 @@
 # 回归测试：停在目标附近不得触发恢复。
 #
 # 这条测试守的是实车上出现过的「到点后反复前后蠕动」：
-#   MPC 的 goal_tolerance(曾为 0.2) 比下游 goal_approach_controller 的(0.25) 小，
+#   MPC 的 goal_tolerance 曾小于接近段容差，形成死区 —— MPC 认为「没到」继续发速度，接近段认为「到了」无条件发零
 #   中间形成死区 —— MPC 认为「没到」继续发速度，下游认为「到了」无条件发零
 #   Twist。stuck 判据被喂了「有指令 + 无位移」的假数据 → 倒车 → 脱离死区 →
 #   重规划 → 再开回来 → 再卡住。
@@ -66,7 +66,7 @@ class TestNearGoalNoRecovery(unittest.TestCase):
         # 这正是死区所在的位置。
         parked = (4.70, 0.0)
 
-        # 下游把速度置零（真实 goal_approach_controller 在此距离的行为），
+        # 下游把速度置零（平滑器超时归零 / 接近段到点置零），
         # 所以链路末端实测速率为 0。位置恒定 = 车没动。
         self.harness.drive(
             duration_s=4.0, robot_xy=parked, goal_xy=goal, executed_speed=0.0)

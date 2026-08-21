@@ -188,8 +188,6 @@ private:
     allow_unknown_ = declare_parameter<bool>("allow_unknown", true);
     unknown_cost_ = declare_parameter<double>("unknown_cost", 1.4);
     obstacle_threshold_ = declare_parameter<int>("obstacle_threshold", 50);
-    inflation_radius_ = declare_parameter<double>("inflation_radius", 0.25);
-    apply_internal_inflation_ = declare_parameter<bool>("apply_internal_inflation", true);
     map_cost_weight_ = declare_parameter<double>("map_cost_weight", 10.0);
     map_cost_exponent_ = declare_parameter<double>("map_cost_exponent", 2.0);
     planner_tolerance_ = declare_parameter<double>("planner_tolerance", 0.5);
@@ -209,8 +207,6 @@ private:
     path_prune_enabled_ = declare_parameter<bool>("path_prune_enabled", true);
     prune_segment_max_cost_ = declare_parameter<int>("prune_segment_max_cost", 75);
     path_resample_distance_ = declare_parameter<double>("path_resample_distance", 0.18);
-    inflation_cost_scaling_factor_ =
-      declare_parameter<double>("inflation_cost_scaling_factor", 8.0);
     // 规划失败后的冷却时间。目标不可达时规划器会在 planning_frequency 的频率
     // 反复重试，浪费算力且洪水般地刷日志。冷却期内如果目标没有明显变化就跳过，
     // 等待环境更新（新代价图、障碍移动）后再重试。
@@ -554,10 +550,6 @@ private:
     if (grid.header.frame_id.empty()) {
       grid.header.frame_id = global_frame_;
     }
-    if (apply_internal_inflation_) {
-      applyInflationCostGradient(
-        grid, inflation_radius_, obstacle_threshold_, inflation_cost_scaling_factor_);
-    }
     return grid;
   }
 
@@ -667,8 +659,8 @@ private:
       return static_cast<double>(clearance_cache_.cost[static_cast<std::size_t>(index)]);
     };
 
-    // 轴线表按 grid 的格号索引，而 grid 来自 preparePlanningGrid（可能加了膨胀，但
-    // 几何不变）。几何不变就能复用，所以只在语义地图或代价地图几何变化时重建。
+    // 轴线表按 grid 的格号索引。几何不变就能复用，所以只在语义地图或代价地图
+    // 几何变化时重建。
     const TunnelAxisGrid & tunnel_axis = tunnelAxisFor(grid);
 
     g_score[static_cast<std::size_t>(*start_index)] = 0.0;
@@ -987,8 +979,6 @@ private:
   bool allow_unknown_{true};
   double unknown_cost_{1.4};
   int obstacle_threshold_{50};
-  double inflation_radius_{0.25};
-  bool apply_internal_inflation_{true};
   double map_cost_weight_{10.0};
   double map_cost_exponent_{2.0};
   double planner_tolerance_{0.5};
@@ -1005,7 +995,6 @@ private:
   bool path_prune_enabled_{true};
   int prune_segment_max_cost_{75};
   double path_resample_distance_{0.18};
-  double inflation_cost_scaling_factor_{8.0};
 
   nav_msgs::msg::OccupancyGrid::ConstSharedPtr map_;
   std::optional<geometry_msgs::msg::PoseStamped> goal_;

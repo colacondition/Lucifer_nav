@@ -2,7 +2,7 @@
 
 `navigation2` 是泓龙哨兵导航工程的 ROS 2 导航系统。系统采用地图服务、全局规划、代价地图、路径平滑、MPC 局部控制、速度平滑和 RViz 兼容 action 的模块化链路，提供从目标点接收到速度指令输出的完整导航能力。
 
-各节点均注册为 ROS 2 Component，默认组合到一个 `component_container_mt` 中运行，以减少进程数量并便于组件级调试。系统借鉴 Nav2 的链路划分和常用话题接口，但不依赖完整 `nav2_bringup`、BT Navigator 或 lifecycle manager。
+各节点均注册为 ROS 2 Component，默认组合到一个固定线程数容器中运行。Humble 下 latch 话题不能开 intra-process。系统借鉴 Nav2 的链路划分和常用话题接口，但不依赖完整 `nav2_bringup`、BT Navigator 或 lifecycle manager。
 
 
 
@@ -21,12 +21,11 @@
 - `rm_map_server_node`：读取 `map/<world>.msgpack` 语义地图并发布 `/map`（占据栅格由 `terrain` 通道的 OBSTACLE 格推导；隧道等「能站但要摆姿态才能进」的先验在另一张语义通道里，不参与 /map 占据判定）。
 - `rm_global_planner_node`：订阅 `/goal_pose` 和 `/map`，生成 `/plan_raw`。含规划失败冷却、路径发布前验收和规划代次校验。
 - `rm_global_costmap_node`：订阅 `/map` 和 `/segmentation/obstacle`，发布全局代价地图。
-- `rm_minco_path_smoother_node`：用 MINCO 轨迹优化（车体系 ESDF + L-BFGS）平滑 `/plan_raw` 并发布 `/plan`，详见 `MINCO_README.md`。
+- `rm_minco_path_smoother_node`：用 MINCO L-BFGS 平滑 `/plan_raw` 并发布 `/plan`，详见 `MINCO_README.md`。
 - `rm_local_costmap_node`：基于 `/segmentation/obstacle` 点云构建滚动局部代价地图。
-- `rm_mpc_controller_node`：使用 OSQP 跟踪平滑路径，发布 `/cmd_vel_nav_raw` 和 `/predict_path`。内置多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）、弧长域速度剖面和指令链路闭环反馈。
-- `goal_approach_controller_node`：接近目标时将 `/cmd_vel_nav_raw` 修正为 `/cmd_vel_nav`。
-- `rm_velocity_smoother_node`：将 `/cmd_vel_nav` 平滑为 `/cmd_vel`。
-- `fake_vel_transform_node`：总 bringup 中将 `/cmd_vel` 转换并发布为底盘执行话题 `/cmd_vel_chassis`。
+- `rm_mpc_controller_node`：使用 OSQP 跟踪路径，发布 `/cmd_vel_nav` 和 `/predict_path`。内置接近减速、多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）、弧长域速度剖面和指令链路闭环反馈。
+- `rm_velocity_smoother_node`：将 `/cmd_vel_nav` 限幅平滑为 `/cmd_vel`。
+- `fake_vel_transform`：同容器内将 `/cmd_vel` 转为底盘执行话题 `/cmd_vel_chassis`。
 - `rm_nav2_compat_node`：提供 `/navigate_to_pose` action，把 RViz Nav2 Goal 转成 `/goal_pose`。
 - `rm_tunnel_posture_node`：订阅语义地图与车体位姿，判断车是否接近/正在隧道内，向电控发布 `/gimbal_posture` 收云台请求（距最近隧道本体格 ≤ `run_up` 发收、洞里全程保持、退开 `run_up + hysteresis` 才发抬）。判据只看距离，不读车体参数；收多低、到位没到位全归电控。
 - `rm_gimbal_visualizer_node`：订阅电控持续回传的 `/gimbal_posture_state` 和请求 `/gimbal_posture`，发布 `/gimbal_status` MarkerArray（实车/仿真通用；RViz 显示方块+文字：绿=收下/低，红=立着/高）。
@@ -97,11 +96,7 @@ MPC 使用 `/local_costmap/costmap` 对求解后的预测运动逐段做碰撞�
 
 ### 指令链路闭环
 
-本节点发布的指令会被下游节点改写（`goal_approach_controller` 覆写/置零、`rm_velocity_smoother` 限幅或超时归零），所以"是否真的有指令"以链路末端 `/cmd_vel` 的实测值为准（`feedback.executed_cmd_topic`），并据此检测下游越权与链路静默。目标附近用 `recovery.suppress_near_goal` 关闭失效检测，避免与下游的到点容差错配形成死区。
-
-### 动态障碍物跟踪（未启用）
-
-`rm_local_costmap` 内有一个障碍簇跟踪的预留实现（`src/obstacle_tracker`），会从代价图中提取障碍簇、跨帧质心匹配、EMA 估计速度。**当前该功能整体未启用、结果不参与任何导航决策**：早期试运行时，小障碍物在速度噪声下被误判为高速移动，叠加标准膨胀产生过度膨胀，因此预测位置注入（`injectDynamicFootprints`）被禁用，跟踪结果对系统没有实际作用。代价地图完全来自激光/点云的原始障碍标记。`tracker.*` 参数已预留，需要时再评估启用。
+本节点发布的指令仍会被 `rm_velocity_smoother` 限幅或超时归零，所以"是否真的有指令"以链路末端 `/cmd_vel` 的实测值为准（`feedback.executed_cmd_topic`），并据此检测下游越权与链路静默。接近减速已并进本节点；目标附近用 `recovery.suppress_near_goal` 关闭失效检测。
 
 ## 单独启动
 
@@ -126,7 +121,7 @@ src/navigation/navigation2/params/navigation2.yaml
 
 ## 测试
 
-- **单元测试（gtest）**：`RouteTracker` / `ProgressMonitor` / `RecoveryPlanner` / `SpeedProfile` / `ObstacleTracker` / `DistanceField` / `LocalPathSafety` / `PathStitching`，覆盖各模块的纯逻辑。
+- **单元测试（gtest）**：`RouteTracker` / `ProgressMonitor` / `RecoveryPlanner` / `SpeedProfile` / `LocalPathSafety` / `PathStitching` / `SemanticMap` / `TunnelPosture`，覆盖各模块的纯逻辑。
 - **集成测试（launch_testing）**：起真节点、喂合成 `/plan`、`/Odometry`、`/local_costmap/costmap`、`/cmd_vel`，断言 FSM 行为。覆盖目标附近不误触发恢复、卡住时确实进恢复、覆写检测、veto 连击升级、`HAZARD_RECOVERY → FOLLOW` 完整闭环。测试文件位于 `test/`，共用夹具 `test/mpc_harness.py`。
 
 运行全部测试：
@@ -137,6 +132,6 @@ colcon test --packages-select navigation2 --event-handlers console_direct+
 
 ## 参考与致谢
 
-本包的模块划分、A* + MPC 导航链路、距离场/ESDF 思路参考了武汉科技大学崇实战队开源的 ROSE NAVIGATION，并结合泓龙哨兵工程的 `OccupancyGrid`、组件化节点和 MPC 控制链路实现。执行层的多假设弧长进度跟踪、无进展/卡住检测、倒车与安全点脱困恢复链、定位质量门控（条件数检查 + EMA 平滑）借鉴了浙江大学 Hello World 战队开源的 HWSentryNav26 设计思路。
+本包的模块划分、A* + MPC 导航链路、距离场思路参考了武汉科技大学崇实战队开源的 ROSE NAVIGATION，并结合泓龙哨兵工程的 `OccupancyGrid`、组件化节点和 MPC 控制链路实现。执行层的多假设弧长进度跟踪、无进展/卡住检测、倒车与安全点脱困恢复链、定位质量门控（条件数检查 + EMA 平滑）借鉴了浙江大学 Hello World 战队开源的 HWSentryNav26 设计思路。
 
 感谢武汉科技大学崇实战队对 ROSE NAVIGATION 的开源贡献，也感谢相关开源项目对 RoboMaster 地面机器人导航生态的支持。

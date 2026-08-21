@@ -118,7 +118,7 @@ def generate_launch_description():
     declare_log_level = DeclareLaunchArgument('log_level', default_value='warn')
     declare_node_output = DeclareLaunchArgument('node_output', default_value='log')
     declare_perception_threads = DeclareLaunchArgument(
-        'perception_threads', default_value='2',
+        'perception_threads', default_value='1',
         description='感知容器 executor 线程数（lidar_filter + ground_segmentation）')
     declare_waypoint_file = DeclareLaunchArgument(
         'waypoint_file', default_value='/tmp/navigation_waypoints.csv')
@@ -209,8 +209,8 @@ def generate_launch_description():
         respawn=True, respawn_delay=2.0,  # 容器崩溃自愈（两节点均可从参数重建）
         package='cpp_lidar_filter',
         # 固定线程数容器：不用 Humble 自带的 component_container_mt，后者线程数
-        # 恒为 hardware_concurrency()（本机 24），感知链只用 2 个 executor 线程
-        # 即可覆盖两个节点并保留相邻帧流水线重叠，线程数与 footprint 都可控。
+        # 恒为 hardware_concurrency()（本机 24）。默认 1 个 executor 线程；
+        # linefit 内部用 OpenMP 做分片，不必再给 executor 超订。
         executable='perception_container_mt',
         arguments=[perception_threads] + common_log_arguments,
         output=node_output,
@@ -368,18 +368,9 @@ def generate_launch_description():
             'start_mpc_controller': 'True',
         }.items())
 
-    # ===== 7. 速度转换 =====
-    vel_transform_node = Node(
-        condition=nav_condition,
-        respawn=True, respawn_delay=2.0,
-        package='fake_vel_transform',
-        executable='fake_vel_transform_node',
-        name='fake_vel_transform',
-        output=node_output,
-        parameters=[{'use_sim_time': use_sim_time}],
-        arguments=common_log_arguments)
+    # ===== 7. 速度转换已并进 navigation2 容器（fake_vel_transform 组件）=====
 
-    # ===== 8. Waypoint Editor Executors =====
+    # ===== 8. Waypoint follow executor（patrol 可执行文件保留，bringup 不再双开）=====
     waypoint_follow_executor = Node(
         condition=LaunchConfigurationEquals('mode', 'nav'),
         package='waypoint_editor',
@@ -392,20 +383,6 @@ def generate_launch_description():
             'goal_topic': '/goal_pose',
             'status_topic': '/navigation2/status',
             'saved_waypoint_file_topic': '/waypoint_editor/saved_waypoint_file',
-        }],
-        arguments=common_log_arguments)
-
-    waypoint_patrol_executor = Node(
-        condition=LaunchConfigurationEquals('mode', 'nav'),
-        package='waypoint_editor',
-        executable='waypoint_patrol_executor',
-        name='waypoint_patrol_executor',
-        output=node_output,
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            'waypoint_file': waypoint_file,
-            'goal_topic': '/goal_pose',
-            'status_topic': '/navigation2/status',
         }],
         arguments=common_log_arguments)
 
@@ -477,9 +454,7 @@ def generate_launch_description():
         fast_loc_node,
         start_navigation,
         start_navigation_mapping,
-        vel_transform_node,
         waypoint_follow_executor,
-        waypoint_patrol_executor,
         serial_driver,
         decision_node,
         nav_rviz_node,
