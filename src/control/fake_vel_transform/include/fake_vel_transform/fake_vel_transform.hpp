@@ -47,6 +47,13 @@ private:
 
   double current_angle_{0.0};
   double base_link_angle_{0.0};
+  // map 系下的路径切向（滤波后）。TF 发布时再减 base_link yaw，得到相对偏置。
+  // 不能把偏置本身当状态：/plan 的 orientation 是单位四元数，旧逻辑会把 fake
+  // 锁到 map +X，并在每次重规划时跟着底盘航向反打，轨迹跟着跳。
+  double filtered_path_yaw_{0.0};
+  bool have_path_yaw_{false};
+  double path_lookahead_distance_{0.8};
+  double yaw_filter_alpha_{0.25};
   float angular_deadband_{0.05F};
   float min_translate_speed_for_spin_{0.15F};
   float spin_speed_{0.0F};

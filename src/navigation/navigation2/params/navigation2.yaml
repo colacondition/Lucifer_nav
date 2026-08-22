@@ -51,7 +51,8 @@ rm_global_planner:
     replan_request_topic: /navigation2/replan_request
     # 转向惩罚：turn_cost = turn_penalty * (1 - cos(转向角))。越大路径越直（少
     # 拐弯、少蛇形），但可能绕更远；越小越贴近几何最短但拐角多。
-    turn_penalty: 0.12
+    # 折线拐角会被 speed_profile 按曲率限速，turn_penalty 太小会让整段路像爬行。
+    turn_penalty: 0.30
     # 局部缝合：重规划时在旧路径前方 stitch_min_lookahead_distance 处接新路径，
     # 避免整条路径跳变；缝合段最长 stitch_max_distance。车头路径抖优先看这里。
     local_stitch_enabled: true
@@ -137,7 +138,7 @@ rm_minco_path_smoother:
     output_path_topic: /plan
 
     # MINCO 优化参数
-    smooth_weight: 0.1        # 平滑项权重（降低以保持原路径形状）
+    smooth_weight: 0.5        # 平滑项权重（0.1 几乎贴着 A* 折线，弯道曲率限速会把车速压到 min_speed）
     data_weight: 10.0         # 数据项权重（保持接近原路径）
     enable_optimization: true  # MINCO L-BFGS 优化
 
@@ -155,7 +156,7 @@ rm_minco_path_smoother:
     performance.print_enable: false
 
     # 时间分配参数
-    default_velocity: 1.5     # 默认速度（用于计算段时间）
+    default_velocity: 2.0     # 默认速度（用于计算段时间）
     min_segment_time: 0.1     # 最小段时间（秒）
 
     # 语义地图：隧道格的轴线用来在洞内给「偏离轴线」加软代价。收不到或图里没隧道时
@@ -266,12 +267,12 @@ rm_mpc_controller:
     odom_topic: /Odometry
     cmd_vel_topic: /cmd_vel_nav
     control_fps: 30.0
-    expected_speed: 1.5
+    expected_speed: 2.0
     goal_tolerance: *goal_tolerance_default
     # 接近段（原独立节点）。恢复期和 follow 中间点仍走 /goal_approach_controller/enabled。
     approach.enable: true
-    approach.distance: 1.5
-    approach.velocity: 0.5
+    approach.distance: 1.0
+    approach.velocity: 1.0
     approach.direct_distance: 0.5
     approach.direct_kp: 1.0
     # 跟踪残差超过此值判为「跟丢」（触发 tracker 丢失 / 恢复链）。调大=更容忍
@@ -293,7 +294,8 @@ rm_mpc_controller:
     #   速度/角速度抖不抖 → 调 Rd（大=越平滑，但响应滞后）
     Q: [15.0, 15.0]
     R: [0.1, 0.1]
-    Rd: [1.0, 0.05]
+    # 原先 Rd=[1.0, 0.05] 世界系 x 比 y 平滑一个数量级，沿场地 x 方向加速明显发闷。
+    Rd: [0.15, 0.15]
     # Odometry delay compensation (off by default; extrapolates pose over odom->now latency).
     delay_compensation.enable: false
     delay_compensation.max_dt: 0.5
@@ -321,9 +323,9 @@ rm_mpc_controller:
     # 避免 MPC 参考轨迹本身就不可跟踪（过弯不减速 → 参考跑到弯道外 → 切角）。
     # 关掉 speed_profile.enable 可退回原先的常数速度行为。
     speed_profile.enable: true
-    speed_profile.max_lateral_accel: 2.0    # 侧向加速度上限（m/s²），主要调参项
-    speed_profile.max_tangential_accel: 1.5 # 切向加速度上限（m/s²）
-    speed_profile.max_tangential_decel: 2.5 # 切向减速度上限（m/s²）
+    speed_profile.max_lateral_accel: 4.0    # 侧向加速度上限（m/s²），主要调参项
+    speed_profile.max_tangential_accel: 2.5 # 切向加速度上限（m/s²）
+    speed_profile.max_tangential_decel: 3.0 # 切向减速度上限（m/s²）
     speed_profile.min_speed: 0.3            # 速度下限（m/s），防止极小圆弧处停车
     speed_profile.sample_spacing: 0.10      # 剖面采样间距（m）
     speed_profile.curvature_window: 3       # 曲率平滑窗（样本数，双侧）

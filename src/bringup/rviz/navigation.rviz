@@ -457,7 +457,7 @@ Visualization Manager:
           Length: 0.30000001192092896
           Line Style: Lines
           Line Width: 0.029999999329447746
-          Name: Local Plan
+          Name: Predict Path
           Offset:
             X: 0
             Y: 0
@@ -473,7 +473,7 @@ Visualization Manager:
             Filter size: 10
             History Policy: Keep Last
             Reliability Policy: Reliable
-            Value: /local_plan
+            Value: /predict_path
           Value: true
         - Class: rviz_default_plugins/MarkerArray
           Enabled: false

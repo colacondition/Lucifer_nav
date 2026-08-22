@@ -79,10 +79,10 @@ private:
   void publishMarkers()
   {
     visualization_msgs::msg::MarkerArray arr;
-    // 时间戳用 0 而不是 now()：这个节点在导航容器里 use_sim_time=true，而 RViz
-    // 没用仿真时钟（sim.launch.py 的 rviz2 节点没传 use_sim_time）。带仿真时间戳的
-    // marker 在 RViz 里按系统时钟查 TF 会失败，显示块报红 Status Error。stamp=0
-    // 让 RViz 用最新 TF，marker 实时跟着 base_link_fake 走 —— 跟车指示器的标准写法。
+    // 时间戳用 0 而不是 now()：stamp=0 让 RViz 用最新 TF，marker 实时跟着
+    // base_link_fake 走 —— 跟车指示器的标准写法。sim.launch / real.launch 的
+    // rviz2 已传入 use_sim_time，带仿真时间戳也能查到 TF；这里仍用 0，避免
+    // 仿真时钟偶发滞后时 marker 短暂丢 TF。
     const auto stamp = rclcpp::Time(0);
 
     // 方块：实态。z 高度随实态上下移动，绿=收下、红=立着。

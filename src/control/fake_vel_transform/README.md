@@ -9,7 +9,7 @@
 节点会创建一个虚拟坐标系 `base_link_fake`：
 
 - `base_link_fake` 的位置跟随 `base_link`。
-- `base_link_fake` 的 yaw 方向参考局部路径 `/local_plan` 的前方姿态。
+- `base_link_fake` 的 yaw 方向跟全局路径 `/plan` 在车体附近的 XY 切向（前瞻 `path_lookahead_distance`），并做指数平滑。不要用 pose.orientation：MINCO 发布的 `/plan` 朝向是单位四元数，拿它当航向会把 fake 锁到 map +X，重规划时整条轨迹跟着跳。
 - 导航控制链路先输出并平滑中间速度 `/cmd_vel`，节点再将其转换为底盘可执行的 `/cmd_vel_chassis`。
 
 这样可以让底盘小陀螺或云台旋转时，导航链路仍更接近“沿路径前进”的控制效果。
@@ -19,7 +19,7 @@
 ### 订阅
 
 - `/cmd_vel` (`geometry_msgs/msg/Twist`): 速度平滑后的中间导航速度指令。
-- `/local_plan` (`nav_msgs/msg/Path`): 局部控制器输出的局部路径，用于估计期望朝向。
+- `/plan` (`nav_msgs/msg/Path`): 全局路径。朝向由车体最近点沿弧长前瞻后的 XY 切向估计，不读 orientation。
 - TF: 查询 `map` 到 `base_link` 的变换，用于计算真实底盘方向。
 
 ### 发布
@@ -32,6 +32,8 @@
 - `spin_speed`: 底盘旋转速度，默认 `-6.0`。配合电控固定小陀螺时，可按实车方向调整正负号。
 - `angular_deadband`: 角速度死区，默认 `0.05`。低于该值时不额外叠加小陀螺角速度。
 - `min_translate_speed_for_spin`: 触发小陀螺叠加的最小平移速度，默认 `0.15`。
+- `path_lookahead_distance`: 从最近点沿路径前瞻的距离（m），默认 `0.8`。
+- `yaw_filter_alpha`: 路径切向 EMA 系数，默认 `0.25`。越小 fake 航向越稳，转向越滞后。
 
 ## 启动
 
@@ -47,5 +49,5 @@ ros2 launch fake_vel_transform fake_vel_transform.launch.py use_sim_time:=True
 ## 联调提示
 
 - 如果底盘运动方向与预期相反，优先检查电控坐标约定和 `spin_speed` 正负号。
-- 如果 `/cmd_vel_chassis` 没有输出，检查 `/local_plan`、`/cmd_vel` 和 `map -> base_link` TF 是否存在。
+- 如果 `/cmd_vel_chassis` 没有输出，检查 `/plan`、`/cmd_vel` 和 `map -> base_link` TF 是否存在。
 - 如果路径跟踪抖动明显，先降低控制器速度上限，再调整 `angular_deadband` 与 `min_translate_speed_for_spin`。

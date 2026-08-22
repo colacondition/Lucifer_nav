@@ -189,8 +189,8 @@ Visualization Manager:
         Value: /map_updates
       Use Timestamp: false
       Value: true
-    # 导航路径：/plan 是 MINCO 平滑后的全局路径（红，带箭头），/local_plan 是
-    # MPC 的局部轨迹（蓝）。两个 publisher 都在 mapping_nav 模式下照常跑
+    # 导航路径：/plan 是 MINCO 平滑后的全局路径（红，带箭头），/predict_path 是
+    # MPC 的预测轨迹（蓝）。两个 publisher 都在 mapping_nav 模式下照常跑
     # （rm_minco_path_smoother / rm_mpc_controller），配完目标后这里就能看到线。
     - Class: rviz_default_plugins/Path
       Color: 255; 0; 0
@@ -226,7 +226,7 @@ Visualization Manager:
       Length: 0.30000001192092896
       Line Style: Lines
       Line Width: 0.029999999329447746
-      Name: Local Plan
+      Name: Predict Path
       Offset:
         X: 0
         Y: 0
@@ -242,7 +242,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /local_plan
+        Value: /predict_path
       Value: true
     # 建图结果本体。Super-LIO 的 /lio/cloud_world 在 launch 里被重映射成
     # /Laser_map，frame_id 是 world（ROSWrapper.cpp:795），QoS 是默认的 Reliable。

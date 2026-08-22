@@ -431,6 +431,7 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         output='log',
+        parameters=[{'use_sim_time': use_sim_time}],
         arguments=['-d', rviz_config, '--ros-args', '--log-level', log_level],
         condition=IfCondition(use_nav_rviz))
 

@@ -36,21 +36,25 @@
     #
     # 现象 → 调法：
     #   map→odom 一直轻微抖        → 调小 ema_alpha（0.3 → 0.2）
-    #   缓慢漂移（走一会儿位置偏）  → 调小 coarse_every（5 → 3）或调大 recovery_alpha
-    #   偶发跳一下（校正/出洞猛收） → 调小 recovery_alpha（0.95 → 0.85）或调大 coarse_every
+    #   缓慢漂移（走一会儿位置偏）  → 调小 coarse_every（12 → 6）或调大 recovery_alpha
+    #   偶发跳一下（校正/出洞猛收） → 调小 recovery_alpha（0.85 → 0.7）或调大 coarse_every
     #
     # EMA 平滑系数 α：每次接受新结果时 T_smooth = α*T_new + (1-α)*T_prev。
     # 值越低正常拍越稳（更少吸收 ICP 单拍噪声），但真实漂移的收敛也越慢。
-    ema_alpha: 0.25
+    # 0.25 时 RViz 里整车仍会跟着 10Hz ICP 微抖；压到 0.15 把单拍噪声再隔一层。
+    ema_alpha: 0.15
     # 出洞/粗→细校正拍的临时 EMA 系数：接近 1 时一拍吸收绝大部分修正（避免数秒
     # 爬行），又保留少量平滑防止单拍噪声完全外露成抖动。
-    recovery_alpha: 0.95
+    # 粗尺度逃逸每 coarse_every 拍也走这个 α；0.95 会把单次粗尺度跳变几乎原样送进 map→odom，
+    # RViz 里就是整车隔半秒跳一下。
+    recovery_alpha: 0.85
     # 出洞迟滞：连续多少拍退化才认定"在洞里"，之后退化→正常才触发快速收敛。
     # 单拍条件数在阈值附近抖动不会误触发。越大越不易误触发，但出洞响应越慢。
     degenerate_enter_streak: 3
     # 粗→细校正周期：每多少拍穿插一次粗尺度 ICP 跳出局部最优（打破累积漂移），
     # 其余拍用单尺度保持逐拍稳定。越小校正越勤、漂移越小，但越接近抖动。
-    coarse_every: 5
+    # 10Hz 下 coarse_every=5 等于每 0.5s 一次近乎全量校正，RViz 里整车会周期性跳。
+    coarse_every: 12
 
     # ========== 话题配置 ==========
     sub_scan_topic: "/Laser_map_dense"          # 订阅点云话题（small_glim 的定位稠密点云，更细下采样）

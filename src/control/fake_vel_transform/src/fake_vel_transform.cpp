@@ -1,6 +1,8 @@
 #include "fake_vel_transform/fake_vel_transform.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include <tf2/utils.h>
 
@@ -10,9 +12,23 @@
 
 namespace fake_vel_transform
 {
+namespace
+{
+double wrapToPi(double a)
+{
+  while (a > M_PI) {
+    a -= 2.0 * M_PI;
+  }
+  while (a < -M_PI) {
+    a += 2.0 * M_PI;
+  }
+  return a;
+}
+}  // namespace
+
 const std::string CMD_VEL_TOPIC = "/cmd_vel";
 const std::string AFTER_TF_CMD_VEL = "/cmd_vel_chassis";
-const std::string TRAJECTORY_TOPIC = "/local_plan";
+const std::string TRAJECTORY_TOPIC = "/plan";
 const int TF_PUBLISH_FREQUENCY = 100;  // base_link to base_link_fake. Frequency in Hz.
 const std::string DEFAULT_PLANNER_FRAME = "map";
 
@@ -21,20 +37,23 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
 {
   RCLCPP_INFO(get_logger(), "Start FakeVelTransform!");
 
-  // Declare and get the spin speed parameter
   this->declare_parameter<float>("spin_speed", -6.0);
   this->declare_parameter<float>("angular_deadband", 0.05);
   this->declare_parameter<float>("min_translate_speed_for_spin", 0.15);
+  this->declare_parameter<double>("path_lookahead_distance", 0.8);
+  this->declare_parameter<double>("yaw_filter_alpha", 0.25);
   this->get_parameter("spin_speed", spin_speed_);
   this->get_parameter("angular_deadband", angular_deadband_);
   this->get_parameter("min_translate_speed_for_spin", min_translate_speed_for_spin_);
+  this->get_parameter("path_lookahead_distance", path_lookahead_distance_);
+  this->get_parameter("yaw_filter_alpha", yaw_filter_alpha_);
+  path_lookahead_distance_ = std::max(0.05, path_lookahead_distance_);
+  yaw_filter_alpha_ = std::clamp(yaw_filter_alpha_, 0.0, 1.0);
 
-  // TF broadcaster
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   tf2_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
   tf2_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf2_buffer_);
 
-  // Create Publisher and Subscriber
   cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
     CMD_VEL_TOPIC, 1, std::bind(&FakeVelTransform::cmdVelCallback, this, std::placeholders::_1));
   cmd_vel_chassis_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
@@ -43,13 +62,11 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
     TRAJECTORY_TOPIC, 1,
     std::bind(&FakeVelTransform::localPoseCallback, this, std::placeholders::_1));
 
-  // Create a timer to publish the transform regularly
   tf_timer_ = this->create_wall_timer(
     std::chrono::milliseconds(1000 / TF_PUBLISH_FREQUENCY),
     std::bind(&FakeVelTransform::publishTransform, this));
 }
 
-// Get the local pose from planner
 void FakeVelTransform::localPoseCallback(const nav_msgs::msg::Path::ConstSharedPtr msg)
 {
   if (!msg || msg->poses.empty()) {
@@ -57,57 +74,94 @@ void FakeVelTransform::localPoseCallback(const nav_msgs::msg::Path::ConstSharedP
     return;
   }
 
-  // Choose the pose based on the size of the poses array
-  size_t index = std::min(msg->poses.size() / 4, msg->poses.size() - 1);
-  const geometry_msgs::msg::Pose & selected_pose = msg->poses[index].pose;
-  target_frame_ = msg->header.frame_id.empty() ? msg->poses[index].header.frame_id : msg->header.frame_id;
+  target_frame_ = msg->header.frame_id.empty() ? msg->poses.front().header.frame_id : msg->header.frame_id;
   if (target_frame_.empty()) {
     target_frame_ = DEFAULT_PLANNER_FRAME;
   }
 
-  // Update current angle based on the difference between path yaw and base_link yaw.
-  double path_yaw = tf2::getYaw(selected_pose.orientation);
-  if (!std::isfinite(path_yaw)) {
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "Received non-finite path heading, skip base_link_fake orientation update.");
-    return;
-  }
-
-  // base_link_angle_ 只在 cmdVelCallback 里更新；/local_plan 先于第一条 /cmd_vel
-  // 到达（或 TF 刚恢复）时它还是 0，直接相减会把真实航向当成 0，底盘朝错误方向
-  // 运动。这里与 cmdVelCallback 走同一条 TF 查询路径更新它。
+  double robot_x = 0.0;
+  double robot_y = 0.0;
   try {
-    const std::string planner_frame =
-      target_frame_.empty() ? DEFAULT_PLANNER_FRAME : target_frame_;
     const auto transform_stamped = tf2_buffer_->lookupTransform(
-      planner_frame, "base_link", tf2::TimePointZero);
+      target_frame_, "base_link", tf2::TimePointZero);
+    robot_x = transform_stamped.transform.translation.x;
+    robot_y = transform_stamped.transform.translation.y;
     base_link_angle_ = tf2::getYaw(transform_stamped.transform.rotation);
   } catch (tf2::TransformException & ex) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
       "Cannot look up %s -> base_link for path heading, skip update: %s",
-      (target_frame_.empty() ? DEFAULT_PLANNER_FRAME : target_frame_).c_str(), ex.what());
+      target_frame_.c_str(), ex.what());
+    return;
+  }
+  if (!std::isfinite(base_link_angle_) || !std::isfinite(robot_x) || !std::isfinite(robot_y)) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Lookup returned a non-finite base_link pose, skip base_link_fake orientation update.");
     return;
   }
 
-  if (!std::isfinite(base_link_angle_)) {
+  // /plan 的 orientation 被 MINCO 写成单位四元数，不能当航向用。
+  // 取车体最近路径点再沿弧长前瞻，用 XY 切向当 map 系航向。
+  size_t closest = 0;
+  double best = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < msg->poses.size(); ++i) {
+    const auto & p = msg->poses[i].pose.position;
+    const double d = std::hypot(p.x - robot_x, p.y - robot_y);
+    if (d < best) {
+      best = d;
+      closest = i;
+    }
+  }
+
+  size_t ahead = closest;
+  double acc = 0.0;
+  for (size_t i = closest + 1; i < msg->poses.size(); ++i) {
+    const auto & a = msg->poses[i - 1].pose.position;
+    const auto & b = msg->poses[i].pose.position;
+    acc += std::hypot(b.x - a.x, b.y - a.y);
+    ahead = i;
+    if (acc >= path_lookahead_distance_) {
+      break;
+    }
+  }
+  if (ahead == closest) {
+    if (closest + 1 < msg->poses.size()) {
+      ahead = closest + 1;
+    } else if (closest > 0) {
+      ahead = closest;
+      closest = closest - 1;
+    } else {
+      return;
+    }
+  }
+
+  constexpr double kMinSep = 0.05;
+  const auto & p0 = msg->poses[closest].pose.position;
+  const auto & p1 = msg->poses[ahead].pose.position;
+  const double dx = p1.x - p0.x;
+  const double dy = p1.y - p0.y;
+  if (!(std::hypot(dx, dy) >= kMinSep)) {
+    return;
+  }
+  const double path_yaw = std::atan2(dy, dx);
+  if (!std::isfinite(path_yaw)) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
-      "Lookup returned a non-finite base_link yaw, skip base_link_fake orientation update.");
+      "Computed non-finite path heading, skip base_link_fake orientation update.");
     return;
   }
 
-  current_angle_ = path_yaw - base_link_angle_;
-  if (!std::isfinite(current_angle_)) {
-    RCLCPP_WARN_THROTTLE(
-      this->get_logger(), *this->get_clock(), 2000,
-      "Computed non-finite base_link_fake yaw offset, reset to zero.");
-    current_angle_ = 0.0;
+  if (!have_path_yaw_) {
+    filtered_path_yaw_ = path_yaw;
+    have_path_yaw_ = true;
+  } else {
+    filtered_path_yaw_ = wrapToPi(
+      filtered_path_yaw_ + yaw_filter_alpha_ * wrapToPi(path_yaw - filtered_path_yaw_));
   }
+  current_angle_ = wrapToPi(filtered_path_yaw_ - base_link_angle_);
 }
 
-// Transform the velocity from base_link to base_link_fake
 void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
 {
   constexpr double ZERO_VELOCITY_EPS = 1e-6;
@@ -120,10 +174,9 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
   }
 
   try {
-    geometry_msgs::msg::TransformStamped transform_stamped;
     const std::string planner_frame =
       target_frame_.empty() ? DEFAULT_PLANNER_FRAME : target_frame_;
-    transform_stamped = tf2_buffer_->lookupTransform(
+    const auto transform_stamped = tf2_buffer_->lookupTransform(
       planner_frame, "base_link", tf2::TimePointZero);
     base_link_angle_ = tf2::getYaw(transform_stamped.transform.rotation);
     if (!std::isfinite(base_link_angle_)) {
@@ -135,7 +188,10 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
       return;
     }
 
-    double angle_diff = -current_angle_;
+    if (have_path_yaw_) {
+      current_angle_ = wrapToPi(filtered_path_yaw_ - base_link_angle_);
+    }
+    const double angle_diff = -current_angle_;
     if (!std::isfinite(angle_diff)) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
@@ -154,10 +210,6 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
     aft_tf_vel.linear.y = -msg->linear.x * sin(angle_diff) + msg->linear.y * cos(angle_diff);
 
     cmd_vel_chassis_pub_->publish(aft_tf_vel);
-    // 诊断锚点：线上出现过「MPC 判定 commanding velocity 但车不动」的故障，
-    // 需要知道指令到底在哪一环断掉。这条日志能证明本节点确实收到了 /cmd_vel
-    // 并把非零指令发到了 /cmd_vel_chassis；若 gzserver 仍然没动，剩下的断点
-    // 就在插件/物理侧（配合 ros2 topic echo /cmd_vel_chassis 一起看）。
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 2000,
       "forwarded cmd_vel -> cmd_vel_chassis: in=(%.2f, %.2f, %.2f) out=(%.2f, %.2f, %.2f)",
@@ -172,12 +224,27 @@ void FakeVelTransform::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr
   }
 }
 
-// Publish transform from base_link to base_link_fake
 void FakeVelTransform::publishTransform()
 {
   const auto stamp = get_clock()->now();
   if (!tf_stamp_gate_.accept(stamp.nanoseconds())) {
     return;
+  }
+
+  if (have_path_yaw_) {
+    try {
+      const std::string planner_frame =
+        target_frame_.empty() ? DEFAULT_PLANNER_FRAME : target_frame_;
+      const auto transform_stamped = tf2_buffer_->lookupTransform(
+        planner_frame, "base_link", tf2::TimePointZero);
+      const double yaw = tf2::getYaw(transform_stamped.transform.rotation);
+      if (std::isfinite(yaw)) {
+        base_link_angle_ = yaw;
+        current_angle_ = wrapToPi(filtered_path_yaw_ - base_link_angle_);
+      }
+    } catch (const tf2::TransformException &) {
+      // 保持上一拍偏置，避免 TF 短暂失败时停发。
+    }
   }
 
   geometry_msgs::msg::TransformStamped t;
@@ -219,7 +286,4 @@ void FakeVelTransform::publishTransform()
 
 #include "rclcpp_components/register_node_macro.hpp"
 
-// Register the component with class_loader.
-// This acts as a sort of entry point, allowing the component to be discoverable when its library
-// is being loaded into a running process.
 RCLCPP_COMPONENTS_REGISTER_NODE(fake_vel_transform::FakeVelTransform)

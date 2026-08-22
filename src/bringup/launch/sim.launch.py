@@ -319,9 +319,10 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'map_pcd_path': fast_location_pcd_path,
             'sub_scan_topic': '/Laser_map_dense',
-            'scan_voxel_size': 0.20,
-            'submap_voxel_size_first': 0.20,
-            'submap_voxel_size_track': 0.35,
+            # 0.20 体素对 0.5m 车体太粗，GICP 单拍噪声会打进 map→odom，RViz 整车抖。
+            'scan_voxel_size': 0.10,
+            'submap_voxel_size_first': 0.10,
+            'submap_voxel_size_track': 0.20,
             'fov_far': 12.0,
             # 与 fast_location_main.yaml 保持一致：10Hz 雷达每帧都做一次 ICP。
             'localization_rate_hz': 10.0,
@@ -399,6 +400,9 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         output='log',
+        # RobotModel / TF 必须和导航栈走同一时钟。不传 use_sim_time 时 RViz 用墙钟
+        # 去查仿真时间戳的 TF，整车会在 map 系里抖（gimbal_visualizer 里也写过这个坑）。
+        parameters=[{'use_sim_time': use_sim_time}],
         arguments=['-d', rviz_config, '--ros-args', '--log-level', log_level],
         condition=IfCondition(use_nav_rviz))
 
