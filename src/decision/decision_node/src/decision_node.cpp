@@ -33,19 +33,11 @@
 namespace
 {
 
-constexpr std::size_t kExecutorStatusHistoryDepth = 10;
 constexpr double kTfLookupRetrySec = 1.0;
 
 rclcpp::QoS latchedQos()
 {
   rclcpp::QoS qos(1);
-  qos.reliable().transient_local();
-  return qos;
-}
-
-rclcpp::QoS executorStatusQos()
-{
-  rclcpp::QoS qos{rclcpp::KeepLast(kExecutorStatusHistoryDepth)};
   qos.reliable().transient_local();
   return qos;
 }
@@ -110,6 +102,13 @@ public:
       [this](const decision_interfaces::msg::GameStatus & msg) {
         context_.setGameStatus(msg, nowSec());
       });
+    if (config_.integrity_gate.enable) {
+      localization_status_sub_ = create_subscription<std_msgs::msg::String>(
+        config_.topics.localization_status, latchedQos(),
+        [this](const std_msgs::msg::String & msg) {
+          context_.setLocalizationStatus(msg.data);
+        });
+    }
 
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / config_.loop_hz),
@@ -157,6 +156,17 @@ private:
         decision::toString(result.previous_state).c_str(),
         decision::toString(result.state).c_str(), result.reason.c_str());
       decision_state_pub_->publish(decision::decisionStateMessage(result.state));
+    }
+
+    // 丢定位时仍推进状态机（血量/比赛事件不能丢），但不再发 map 系目标。
+    // ENGAGE 会按 currentRobotPose 钉点；LOST 时 TF 是过期的上一拍 map→odom。
+    // 从没收到过 localization_status 不拦：mapping_nav / 无定位仿真要能下发。
+    if (config_.integrity_gate.enable && context_.localizationLost()) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "定位丢失（%s）；不下发 map 系目标，等重定位。",
+        context_.localizationStatusPayload().c_str());
+      return;
     }
 
     // CENTER 段下发策略：Hold 守中心锚点，Reposition 从战术点池挑单点换位，
@@ -426,6 +436,7 @@ private:
   rclcpp_action::Client<decision_interfaces::action::FollowWaypoints>::SharedPtr through_client_;
   rclcpp::Subscription<decision_interfaces::msg::RobotStatus>::SharedPtr robot_status_sub_;
   rclcpp::Subscription<decision_interfaces::msg::GameStatus>::SharedPtr game_status_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr localization_status_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   std::optional<decision::ExecutorEvent> pending_executor_event_;

@@ -1,7 +1,7 @@
 # mode:=mapping mapping_nav:=True 专用 RViz 配置（建图 + 导航同时跑）。
 #
 # 与 mapping.rviz 的区别只有三点：
-#   1) Fixed Frame 从 world 换成 map —— map 帧由 slam_toolbox 发布（它维护
+#   1) Fixed Frame 从 odom 换成 map —— map 帧由 slam_toolbox 发布（它维护
 #      map->odom 并持续发 /map），GoalTool 的点击坐标落在 map 系里，正好是
 #      rm_nav2_compat / rm_global_planner 期待的目标帧。
 #   2) 加了 Map display 看 slam_toolbox 的 /map（能导到的范围就是已扫到的区域）。
@@ -11,8 +11,8 @@
 #      由 Nav2Panel 去 async_send_goal 到 /navigate_to_pose 并画目标箭头。只加
 #      GoalTool 不加面板的话，点了没反应、目标箭头也不出现。
 #
-# /Laser_map 依旧保留（world 系）：world->odom 是静态恒等、map->odom 由
-# slam_toolbox 发，两条拼起来 world->map 是通的，所以它仍能正常显示。
+# /Laser_map 依旧保留（odom 系）：map->odom 由 slam_toolbox 发，
+# 点云 stamp 在 odom，所以它仍能正常显示。
 # 注意：从 RViz 里「Save Config」会把这些注释全部丢掉。
 Panels:
   - Class: rviz_common/Displays
@@ -130,15 +130,11 @@ Visualization Manager:
           Value: true
         imu_link:
           Value: true
-        lidar_odom:
-          Value: true
         livox_frame:
           Value: true
         map:
           Value: true
         odom:
-          Value: true
-        world:
           Value: true
       Marker Scale: 1
       Name: TF
@@ -148,22 +144,19 @@ Visualization Manager:
       Tree:
         map:
           odom:
-            lidar_odom:
-              base_link:
-                imu_link:
-                  {}
-                livox_frame:
-                  {}
-                wheel_1:
-                  {}
-                wheel_2:
-                  {}
-                wheel_3:
-                  {}
-                wheel_4:
-                  {}
-            world:
-              {}
+            base_link:
+              imu_link:
+                {}
+              livox_frame:
+                {}
+              wheel_1:
+                {}
+              wheel_2:
+                {}
+              wheel_3:
+                {}
+              wheel_4:
+                {}
       Update Interval: 0
       Value: true
     # slam_toolbox 的 /map（边扫边发的普通占据栅格）。Map display 用 Transient

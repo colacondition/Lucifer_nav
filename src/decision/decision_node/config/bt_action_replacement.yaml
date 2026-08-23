@@ -9,6 +9,10 @@ bt_action_replacement:
       game_status: game_status
       goal: /goal_pose
       decision_state: /decision/state
+      localization_status: /localization_status
+
+    integrity_gate:
+      enable: true
 
     waypoint_executor:
       saved_waypoint_file_topic: /waypoint_editor/saved_waypoint_file

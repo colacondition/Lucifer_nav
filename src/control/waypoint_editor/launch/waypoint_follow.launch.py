@@ -42,7 +42,7 @@ def generate_launch_description():
 
     waypoint_follow_node = Node(
         package='waypoint_editor',
-        executable='waypoint_follow_executor',
+        executable='waypoint_executor',
         name='waypoint_follow_executor',
         output=node_output,
         parameters=[{

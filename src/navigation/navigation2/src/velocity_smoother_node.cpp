@@ -18,16 +18,15 @@ public:
   {
     input_topic_ = declare_parameter<std::string>("input_cmd_vel_topic", "/cmd_vel_nav");
     output_topic_ = declare_parameter<std::string>("output_cmd_vel_topic", "/cmd_vel");
-    smoothing_frequency_ = declare_parameter<double>("smoothing_frequency", 20.0);
+    smoothing_frequency_ = declare_parameter<double>("smoothing_frequency", 30.0);
     velocity_timeout_ = declare_parameter<double>("velocity_timeout", 0.5);
     max_velocity_ = toArray(declare_parameter<std::vector<double>>(
       "max_velocity", std::vector<double>{2.0, 2.0, 3.0}), {2.0, 2.0, 3.0});
     min_velocity_ = toArray(declare_parameter<std::vector<double>>(
       "min_velocity", std::vector<double>{-2.0, -2.0, -3.0}), {-2.0, -2.0, -3.0});
-    max_accel_ = toArray(declare_parameter<std::vector<double>>(
-      "max_accel", std::vector<double>{4.0, 4.0, 6.0}), {4.0, 4.0, 6.0});
-    max_decel_ = toArray(declare_parameter<std::vector<double>>(
-      "max_decel", std::vector<double>{-4.0, -4.0, -6.0}), {-4.0, -4.0, -6.0});
+    // 仍声明以免旧 YAML 报未声明；加减速斜坡已并进 MPC speed_profile，这里不再用。
+    declare_parameter<std::vector<double>>("max_accel", std::vector<double>{4.0, 4.0, 6.0});
+    declare_parameter<std::vector<double>>("max_decel", std::vector<double>{-4.0, -4.0, -6.0});
     deadband_velocity_ = toArray(declare_parameter<std::vector<double>>(
       "deadband_velocity", std::vector<double>{0.0, 0.0, 0.0}), {0.0, 0.0, 0.0});
 
@@ -45,7 +44,7 @@ public:
       }
     }
 
-    // 订阅输入速度，输出平滑速度。
+    // 订阅输入速度，立刻限幅转发。定时器只做超时归零，与 MPC 同频。
     // mt 容器下订阅与定时器共享 last_cmd_time_/latest cmd，串行化。
     cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     rclcpp::SubscriptionOptions sub_options;
@@ -54,8 +53,9 @@ public:
     cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       input_topic_, rclcpp::QoS(1),
       [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
-        target_cmd_ = *msg;
         last_cmd_time_ = now();
+        current_cmd_ = arrayToTwist(limitAxes(twistToArray(*msg)));
+        cmd_pub_->publish(current_cmd_);
       },
       sub_options);
     cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(output_topic_, rclcpp::QoS(1));
@@ -98,54 +98,40 @@ private:
     return twist;
   }
 
-  void update()
+  std::array<double, 3> limitAxes(std::array<double, 3> values) const
   {
-    // 超时就把目标归零。
-    const auto stamp = now();
-    double dt = 1.0 / std::max(1.0, smoothing_frequency_);
-    if (last_update_time_.nanoseconds() != 0) {
-      dt = std::max(0.001, (stamp - last_update_time_).seconds());
-    }
-    last_update_time_ = stamp;
-
-    auto target = twistToArray(target_cmd_);
-    if (last_cmd_time_.nanoseconds() == 0 ||
-      (stamp - last_cmd_time_).seconds() > velocity_timeout_)
-    {
-      target = std::array<double, 3>{0.0, 0.0, 0.0};
-    }
-
-    auto current = twistToArray(current_cmd_);
     for (std::size_t i = 0; i < 3; ++i) {
-      target[i] = std::clamp(target[i], min_velocity_[i], max_velocity_[i]);
-      const double delta = target[i] - current[i];
-      const double limit = delta >= 0.0 ? std::abs(max_accel_[i]) * dt :
-        std::abs(max_decel_[i]) * dt;
-      current[i] += std::clamp(delta, -limit, limit);
-      current[i] = std::clamp(current[i], min_velocity_[i], max_velocity_[i]);
-      if (std::abs(current[i]) <= deadband_velocity_[i]) {
-        current[i] = 0.0;
+      values[i] = std::clamp(values[i], min_velocity_[i], max_velocity_[i]);
+      if (std::abs(values[i]) <= deadband_velocity_[i]) {
+        values[i] = 0.0;
       }
     }
+    return values;
+  }
 
-    current_cmd_ = arrayToTwist(current);
+  void update()
+  {
+    // 超时就把指令归零。有新输入时已经在订阅回调里转发过，这里不改写时间剖面。
+    const auto stamp = now();
+    if (last_cmd_time_.nanoseconds() != 0 &&
+      (stamp - last_cmd_time_).seconds() <= velocity_timeout_)
+    {
+      return;
+    }
+    current_cmd_ = geometry_msgs::msg::Twist{};
     cmd_pub_->publish(current_cmd_);
   }
 
   std::string input_topic_;
   std::string output_topic_;
-  double smoothing_frequency_{20.0};
+  double smoothing_frequency_{30.0};
   double velocity_timeout_{0.5};
   std::array<double, 3> max_velocity_{2.0, 2.0, 3.0};
   std::array<double, 3> min_velocity_{-2.0, -2.0, -3.0};
-  std::array<double, 3> max_accel_{4.0, 4.0, 6.0};
-  std::array<double, 3> max_decel_{-4.0, -4.0, -6.0};
   std::array<double, 3> deadband_velocity_{0.0, 0.0, 0.0};
 
-  geometry_msgs::msg::Twist target_cmd_;
   geometry_msgs::msg::Twist current_cmd_;
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
-  rclcpp::Time last_update_time_{0, 0, RCL_ROS_TIME};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
   rclcpp::CallbackGroup::SharedPtr cb_group_;

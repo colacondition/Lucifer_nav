@@ -14,6 +14,14 @@ struct TopicConfig
   std::string game_status{"game_status"};
   std::string goal{"/goal_pose"};
   std::string decision_state{"/decision/state"};
+  // fast_location 二态 OK/LOST；没这条时门是开的（建图/仿真可以不起定位）。
+  std::string localization_status{"/localization_status"};
+};
+
+struct IntegrityGateConfig
+{
+  // 仅 LOST 冻 map 系下发；OK（含握住 TF / 走廊投影）不停。
+  bool enable{true};
 };
 
 struct WaypointExecutorConfig
@@ -92,6 +100,7 @@ struct DecisionConfig
   double retry_interval_sec{1.0};
   std::string goal_frame_id{"map"};
   TopicConfig topics;
+  IntegrityGateConfig integrity_gate;
   WaypointExecutorConfig waypoint_executor;
   GameConfig game;
   HpRecoveryConfig hp_recovery;

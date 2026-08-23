@@ -20,6 +20,7 @@
 // 来源，整拍拒绝会让 TF 冻结、精度完全交给 LIO 开环漂移；部分更新则保留
 // 了强约束方向上的修正，只在退化方向信任 LIO 推算。
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 
 #include <Eigen/Dense>
@@ -275,6 +276,104 @@ inline Eigen::Matrix4f projectToObservableSubspace(
   // z 同样交回初值：退化通常伴随高度约束不足，且平面机器人不需要 GICP 修 z。
   result(2, 3) = initial_guess(2, 3);
   return result;
+}
+
+// 完整性对外两态。只告诉下游当前 map→odom 锁还能不能信。
+// 本拍能不能写 TF、走廊投影、NIS 连败，都在定位节点内部做完再贴 reason。
+// 不改 LIO 进程 / 线程预算。
+enum class IntegrityState : std::uint8_t
+{
+  OK = 0,
+  LOST = 1,
+};
+
+inline const char * integrityStateName(IntegrityState state)
+{
+  switch (state) {
+    case IntegrityState::OK: return "OK";
+    case IntegrityState::LOST: return "LOST";
+  }
+  return "UNKNOWN";
+}
+
+struct ScanToMapNis
+{
+  bool valid{false};
+  double value{-1.0};
+  Eigen::Vector3d innovation{Eigen::Vector3d::Zero()};  // dx, dy, dyaw
+};
+
+inline double wrapAnglePi(double angle)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  while (angle > kPi) {
+    angle -= 2.0 * kPi;
+  }
+  while (angle < -kPi) {
+    angle += 2.0 * kPi;
+  }
+  return angle;
+}
+
+// 观测一致性（NIS）。Hessian 只能说明“这次观测有没有信息”，
+// 不能说明“观测和当前 map→odom 是否统计一致”。
+//
+// 创新 ν = (Δx, Δy, Δyaw)；测量协方差 R = H3^{-1}（FastGICP 6×6 的
+// [yaw, tx, ty] 子块）；当前位姿先验 P 取对角。S = R + P，NIS = ν^T S^{-1} ν。
+// 3 自由度 χ² 99% 约 11.34，默认门限 12。
+inline ScanToMapNis computeScanToMapNis(
+  const Eigen::Matrix4f & pose_guess,
+  const Eigen::Matrix4f & pose_measured,
+  const Eigen::Matrix<double, 6, 6> & hessian,
+  double prior_xy_std,
+  double prior_yaw_std)
+{
+  ScanToMapNis out;
+  if (!hessian.allFinite() || !pose_guess.allFinite() || !pose_measured.allFinite() ||
+    !(prior_xy_std > 0.0) || !(prior_yaw_std > 0.0))
+  {
+    return out;
+  }
+
+  const Eigen::Matrix<double, 6, 6> H = 0.5 * (hessian + hessian.transpose());
+  // FastGICP 状态序 [rot(0:3), trans(3:6)]；yaw 近似 rz = index 2。
+  Eigen::Matrix3d H3;
+  H3 << H(3, 3), H(3, 4), H(3, 2),
+        H(4, 3), H(4, 4), H(4, 2),
+        H(2, 3), H(2, 4), H(2, 2);
+  if (!H3.allFinite()) {
+    return out;
+  }
+
+  const Eigen::LDLT<Eigen::Matrix3d> ldlt(H3);
+  if (ldlt.info() != Eigen::Success || (ldlt.vectorD().array() <= 1e-12).any()) {
+    return out;
+  }
+  const Eigen::Matrix3d R = ldlt.solve(Eigen::Matrix3d::Identity());
+  if (!R.allFinite()) {
+    return out;
+  }
+
+  Eigen::Matrix3d P = Eigen::Matrix3d::Zero();
+  P(0, 0) = prior_xy_std * prior_xy_std;
+  P(1, 1) = prior_xy_std * prior_xy_std;
+  P(2, 2) = prior_yaw_std * prior_yaw_std;
+  const Eigen::Matrix3d S = R + P;
+  const Eigen::LDLT<Eigen::Matrix3d> s_ldlt(S);
+  if (s_ldlt.info() != Eigen::Success || (s_ldlt.vectorD().array() <= 1e-18).any()) {
+    return out;
+  }
+
+  Eigen::Vector3d nu;
+  nu << static_cast<double>(pose_measured(0, 3) - pose_guess(0, 3)),
+        static_cast<double>(pose_measured(1, 3) - pose_guess(1, 3)),
+        wrapAnglePi(
+          std::atan2(static_cast<double>(pose_measured(1, 0)), static_cast<double>(pose_measured(0, 0))) -
+          std::atan2(static_cast<double>(pose_guess(1, 0)), static_cast<double>(pose_guess(0, 0))));
+  out.innovation = nu;
+  out.value = nu.dot(s_ldlt.solve(nu));
+  out.valid = std::isfinite(out.value);
+  return out;
 }
 
 }  // namespace fast_location

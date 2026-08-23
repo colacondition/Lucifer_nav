@@ -28,10 +28,7 @@ source install/setup.bash
 
 ## 直接在导航 bringup 中使用
 
-仿真和实车导航 bringup 都会启动：
-
-- `waypoint_follow_executor`
-- `waypoint_patrol_executor`
+仿真和实车导航 bringup 都会启动同一个 `waypoint_executor`（节点名 `waypoint_follow_executor`，默认 follow）。逐点巡逻用 `waypoint_patrol.launch.py`，仍是这一份可执行文件，只改 `mode:=patrol`。
 
 常用命令：
 
@@ -71,7 +68,7 @@ ros2 launch waypoint_editor waypoint_editor.launch.py
 /home/user/my_waypoints.csv
 ```
 
-现在不需要保存也能跑。编辑器会把当前内存航点发布到 `/waypoint_editor/current_waypoints`，两个执行器会优先使用当前内存航点；只有当前内存航点为空时，才回退读取 CSV。
+现在不需要保存也能跑。编辑器会把当前内存航点发布到 `/waypoint_editor/current_waypoints`，执行器会优先使用当前内存航点；只有当前内存航点为空时，才回退读取 CSV。
 
 ## 执行航点
 
@@ -141,7 +138,7 @@ ros2 topic echo /goal_pose --once
 ros2 topic echo /navigation2/status
 ```
 
-如果看不到 `waypoint_follow_executor` 或 `waypoint_patrol_executor`，重新编译并重新 source：
+如果看不到 `waypoint_follow_executor` 节点，重新编译并重新 source：
 
 ```bash
 colcon build --packages-select bringup waypoint_editor --symlink-install

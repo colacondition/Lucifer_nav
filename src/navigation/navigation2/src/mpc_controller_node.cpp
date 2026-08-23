@@ -15,6 +15,7 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <tf2/utils.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
@@ -85,6 +86,20 @@ double normalizeAngle(double angle)
     angle += 2.0 * M_PI;
   }
   return angle;
+}
+
+// fast_location 的 localization_status 是 "<STATE> <reason>"，例如 "LOST waiting"、"OK accepted"。
+// 只认第一个 token。没收到过消息时门是开的：mapping_nav 不起 fast_location，
+// 现有集成测试也不发这条；缺省停车会把那两条路径全停掉。
+bool integrityStateIsLost(const std::string & payload)
+{
+  if (payload.empty()) {
+    return false;
+  }
+  const auto space = payload.find(' ');
+  const std::string state =
+    space == std::string::npos ? payload : payload.substr(0, space);
+  return state == "LOST";
 }
 
 // 执行层状态。原来的 control() 是无状态的：每拍要么跟踪要么停车，异常一律
@@ -160,25 +175,21 @@ public:
       "local_safety.replan_topic", "/navigation2/replan_request");
     replan_cooldown_ = declare_parameter<double>("local_safety.replan_cooldown", 0.5);
 
-    // 指令反馈。本节点发布的指令仍会被下游改写：
-    //   MPC -> /cmd_vel_nav -> rm_velocity_smoother -> /cmd_vel
-    //       -> fake_vel_transform -> 底盘
-    // 接近段已并进本节点；velocity_smoother 仍会限幅并在输入超时后归零。
-    // 「本节点发了多少」不能当作「车被驱动了多少」—— 用它做卡住判据会被喂假数据。
-    // 这里订阅链路末端，用真实执行值喂失效检测。
-    executed_cmd_topic_ = declare_parameter<std::string>("feedback.executed_cmd_topic", "/cmd_vel");
-    // rm_velocity_smoother 以 smoothing_frequency 无条件定频发布，所以这条流
-    // 是连续的：超时意味着下游真的停了，而不是「本来就没有指令」。
-    executed_cmd_timeout_ = declare_parameter<double>("feedback.executed_cmd_timeout", 0.3);
+    // 卡住检测喂本节点上一拍下发的速率。平滑器只限幅，不再反读 /cmd_vel
+    // 判断下游有没有改写。
     // 云台收放：rm_tunnel_posture 发请求，serial_driver 转发电控回传的实测姿态。
     // 请求「收下来」而回传还没变成「低」时，本节点停车等 —— 判据见 control()。
     gimbal_posture_topic_ = declare_parameter<std::string>(
       "gimbal.posture_topic", "/gimbal_posture");
     gimbal_posture_state_topic_ = declare_parameter<std::string>(
       "gimbal.posture_state_topic", "/gimbal_posture_state");
-    // 本节点发非零、下游却持续为零，说明指令被覆写。持续这么久才报，避开
-    // velocity_smoother 的正常加速爬坡（4.0 m/s² @ 20 Hz，0→1.5 m/s 约 0.375 s）。
-    override_detect_time_ = declare_parameter<double>("feedback.override_detect_time", 1.0);
+
+    // 定位完整性门。LOST 时 map→odom 已不写，再跟 map 系路径会开去错的地方。
+    // OK（含 nis_reject 握住上一拍、projected 走廊投影）不停。
+    // 没收到过消息时不拦：mapping_nav / 测试都不发这条。
+    integrity_gate_enable_ = declare_parameter<bool>("integrity_gate.enable", true);
+    integrity_status_topic_ = declare_parameter<std::string>(
+      "integrity_gate.topic", "/localization_status");
 
     // 弧长进度跟踪参数（多假设，替代单帧最近点投影）。
     mpc::RouteTrackerParams tracker_params;
@@ -379,17 +390,6 @@ public:
         local_costmap_ = std::move(msg);
       });
 
-    // 指令链路末端反馈。本节点的输出要经过 rm_velocity_smoother（限加速度、
-    // 超时归零）才到底盘。订阅链路末端把开环变成闭环：失效判据必须用
-    // 「底盘实际收到什么」而不是「本节点想发什么」。
-    executed_cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
-      executed_cmd_topic_, rclcpp::QoS(10),
-      [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        executed_speed_ = std::hypot(msg->linear.x, msg->linear.y);
-        last_executed_cmd_time_ = now();
-      });
-
     // 云台收放的请求与实测。两条都订：请求告诉我们「要不要等」，实测告诉我们「等到了没」。
     // 只看请求会在云台还立着的时候就放车走；只看实测则分不清「云台是高的」和「本来就该是高的」。
     const auto posture_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
@@ -406,6 +406,17 @@ public:
         gimbal_lowered_ = msg->lowered;
         has_gimbal_state_ = true;
       });
+
+    if (integrity_gate_enable_) {
+      const auto status_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+      localization_status_sub_ = create_subscription<std_msgs::msg::String>(
+        integrity_status_topic_, status_qos,
+        [this](std_msgs::msg::String::ConstSharedPtr msg) {
+          std::lock_guard<std::mutex> lk(mtx_);
+          localization_status_payload_ = msg->data;
+          has_localization_status_ = true;
+        });
+    }
 
     // 语义地图只给隧道限速窗口用。同源同 QoS（transient_local），收不到时静默失效。
     if (tunnel_speed_window_enabled_) {
@@ -493,11 +504,11 @@ private:
     bool ready;
     bool path_changed;
     bool goal_changed;
-    double executed_speed;
-    std::optional<rclcpp::Time> executed_stamp;
     bool gimbal_lower_requested;
     bool gimbal_lowered;
     bool has_gimbal_state;
+    bool localization_lost = false;
+    std::string localization_status_payload;
     {
       std::lock_guard<std::mutex> lk(mtx_);
       ready = has_path_ && has_odom_;
@@ -508,11 +519,13 @@ private:
       path_changed_ = false;
       goal_changed = goal_changed_;
       goal_changed_ = false;
-      executed_speed = executed_speed_;
-      executed_stamp = last_executed_cmd_time_;
       gimbal_lower_requested = gimbal_lower_requested_;
       gimbal_lowered = gimbal_lowered_;
       has_gimbal_state = has_gimbal_state_;
+      if (integrity_gate_enable_ && has_localization_status_) {
+        localization_status_payload = localization_status_payload_;
+        localization_lost = integrityStateIsLost(localization_status_payload_);
+      }
     }
 
     // 控制周期实测值。定时器抖动、以及仿真时钟下 wall timer 与 /clock 的
@@ -527,48 +540,6 @@ private:
       }
     }
     last_control_time_ = control_stamp;
-
-    // 链路末端反馈的有效性。rm_velocity_smoother 以 smoothing_frequency 无条件
-    // 定频发布（输入超时它自己会把目标归零后继续发零），所以这条话题正常情况
-    // 下是连续流；一旦静默就说明平滑器本身没在跑，而不是「没有指令」。
-    const bool feedback_fresh = executed_stamp &&
-      (control_stamp - *executed_stamp).seconds() <= std::max(0.0, executed_cmd_timeout_);
-    if (!feedback_fresh) {
-      // 过期就按零处理：不能拿旧值继续喂失效判据。
-      executed_speed = 0.0;
-    }
-    if (!executed_stamp) {
-      // 从未收到过反馈。整条链路可能没起（单独调试 MPC）或平滑器挂了。
-      // 此时 stuck 判据失效（永远读到零），只剩 noProgress 兜底，必须说清楚。
-      RCLCPP_WARN_ONCE(
-        get_logger(),
-        "No message ever received on %s; stuck detection is degraded to noProgress only. "
-        "Is rm_velocity_smoother running?",
-        executed_cmd_topic_.c_str());
-    } else if (!feedback_fresh) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Feedback on %s is stale (>%.2f s); treating executed speed as zero",
-        executed_cmd_topic_.c_str(), executed_cmd_timeout_);
-    }
-
-    // 越权检测（可观测，不改变行为）。下游把本节点的非零指令压成零并持续
-    // 一段时间，就是「有指令但车不动」这类故障的真正来源。
-    // 平滑器的加减速斜坡是合法的短暂偏离（max_accel 4.0 × 0.05 s = 0.2 m/s
-    // 每拍），所以用持续时间而不是单帧幅值差来判定。
-    const double cmd_epsilon = progress_monitor_.params().cmd_epsilon;
-    if (feedback_fresh && last_published_speed_ > cmd_epsilon && executed_speed <= cmd_epsilon) {
-      override_time_ += dt;
-      if (override_time_ >= std::max(override_detect_time_, 0.0)) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "Downstream is zeroing our command: published %.2f m/s but %s reports %.2f m/s "
-          "for %.1f s (check rm_velocity_smoother)",
-          last_published_speed_, executed_cmd_topic_.c_str(), executed_speed, override_time_);
-      }
-    } else {
-      override_time_ = 0.0;
-    }
 
     if (path_changed) {
       route_tracker_.on_path_replaced();
@@ -616,6 +587,19 @@ private:
         get_logger(), *get_clock(), 1000,
         "等云台收下来再进洞：%s。车已停住。",
         has_gimbal_state ? "电控回传的姿态还是「高」" : "还没收到过电控的姿态回传");
+      return;
+    }
+
+    // LOST 时 map→odom 已停写。继续跟 map 系路径等于开去错的地方；
+    // 也不进恢复链 —— 倒车同样是按坏位姿算的。OK 不停：定位侧已经
+    // 把上一拍有效 TF 握住了。
+    if (localization_lost) {
+      publishStop();
+      progress_monitor_.reset();
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "定位丢失（%s）；停车等重定位，不进恢复链。",
+        localization_status_payload.c_str());
       return;
     }
 
@@ -674,9 +658,9 @@ private:
     if (near_goal) {
       progress_monitor_.reset();
     } else {
-      // 失效检测喂的是**链路末端实际下发的**速率，不是本节点发布的指令。
-      // 下游 rm_velocity_smoother 仍会限幅或超时归零。
-      progress_monitor_.update(pos, executed_speed, dt);
+      // 失效检测喂上一拍本节点下发的速率 + 世界系位移。平滑器只限幅，
+      // 不再反读 /cmd_vel。
+      progress_monitor_.update(pos, last_published_speed_, dt);
 
       // 这是打断「停车 → 重规划 → 起点不可行 → 继续停车」死循环的关键：
       // 安全检查反复否决时下发速度恒为零、位移不增长，noProgress 会在
@@ -694,8 +678,8 @@ private:
     if (progress_monitor_.stuck()) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "Stuck: chassis commanded %.2f m/s but displacement < %.2f m for %.1f s (recovery disabled)",
-        executed_speed, progress_monitor_.params().min_displacement,
+        "Stuck: commanded %.2f m/s but displacement < %.2f m for %.1f s (recovery disabled)",
+        last_published_speed_, progress_monitor_.params().min_displacement,
         progress_monitor_.commandedStagnantTime());
     } else if (progress_monitor_.noProgress()) {
       RCLCPP_WARN_THROTTLE(
@@ -1275,11 +1259,6 @@ private:
   // /goal_pose，只能从路径终点推断目标。
   bool goal_changed_ = false;
   std::optional<Eigen::Vector2d> last_goal_;
-  // 链路末端实际下发的速率，由 executed_cmd_sub_ 在订阅线程写入。这是
-  // 「底盘真的收到了什么」的唯一可信来源：本节点发布的指令仍会被
-  // rm_velocity_smoother 限幅或超时归零。
-  double executed_speed_{0.0};
-  std::optional<rclcpp::Time> last_executed_cmd_time_;
   // 云台收放的请求与实测，由各自的订阅回调写入。请求到位之前车不走 —— 判据见 control()。
   bool gimbal_lower_requested_{false};
   // 初值 false 是拦车判据的安全默认值：还没收到回传时按「没收好」处理。见 control()。
@@ -1287,6 +1266,12 @@ private:
   // 只用来分辨停车日志该说「云台还在动」还是「回传压根没来」。不参与拦车判据 ——
   // 加进判据是多余的，因为 gimbal_lowered_ 的初值已经覆盖了「没收到过」这种情况。
   bool has_gimbal_state_{false};
+
+  // 定位完整性。has_localization_status_ 初值 false：没收到过就不拦。
+  bool integrity_gate_enable_{true};
+  std::string integrity_status_topic_;
+  bool has_localization_status_{false};
+  std::string localization_status_payload_;
 
   mpc::MpcSolver solver_;
   // 进度跟踪与失效检测只在控制线程里用，不需要加锁。
@@ -1302,18 +1287,8 @@ private:
   bool recovery_enabled_{true};
   mpc::HazardPolicy hazard_policy_;
   mpc::SafePointSearchParams safe_point_params_;
-  // 指令链路可观测性。只在控制线程里读写。
-  std::string executed_cmd_topic_;
   std::string gimbal_posture_topic_;
   std::string gimbal_posture_state_topic_;
-  double executed_cmd_timeout_{0.3};
-  double override_detect_time_{1.0};
-  // 「本节点发速度但链路末端为零」的累计时长，超过 override_detect_time_ 报警。
-  double override_time_{0.0};
-  // 是否收到过任何 executed 指令。一直没有说明下游节点没起来。
-  bool ever_received_executed_{false};
-  double no_feedback_time_{0.0};
-  bool feedback_warned_{false};
   // 三条失效路径（跟踪丢失/求解失败/安全否决）的连续否决时长。
   double veto_streak_{0.0};
   double veto_recovery_time_{1.5};
@@ -1346,11 +1321,11 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr local_costmap_sub_;
-  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr executed_cmd_sub_;
   rclcpp::Subscription<decision_interfaces::msg::GimbalPosture>::SharedPtr gimbal_posture_sub_;
   rclcpp::Subscription<decision_interfaces::msg::GimbalPostureState>::SharedPtr
     gimbal_posture_state_sub_;
   rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr localization_status_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr cmd_norm_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr predict_path_pub_;

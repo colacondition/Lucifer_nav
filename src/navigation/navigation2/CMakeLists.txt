@@ -142,7 +142,7 @@ if(BUILD_TESTING)
 
   # ROS 级集成测试：启真节点、喂合成话题、断言 FSM 行为。
   # gtest 只能覆盖纯函数；FSM 状态转移、接近段开关时序、
-  # executed_speed 是否真的驱动 ProgressMonitor 这些必须在节点层验证 ——
+  # last_published_speed 是否真的驱动 ProgressMonitor 这些必须在节点层验证 ——
   # 「到点蠕动」那个 bug 正是 gtest 全过、只在节点跑起来才暴露的一类。
   # 必须用 add_launch_test 而不是 ament_add_pytest_test：这两个文件是 launch
   # test，依赖 launch_testing 的 pytest 插件解析 generate_test_description。
@@ -151,7 +151,6 @@ if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
   add_launch_test(test/test_near_goal_no_recovery.py TIMEOUT 120)
   add_launch_test(test/test_stuck_enters_recovery.py TIMEOUT 120)
-  add_launch_test(test/test_override_detection.py TIMEOUT 60)
   add_launch_test(test/test_veto_escalates.py TIMEOUT 60)
   add_launch_test(test/test_hazard_recovery_cycle.py TIMEOUT 120)
   # 锁住障碍高度带是「相对机器人底盘」的差值（point.z - robo_z）这件事。改成任何
@@ -175,6 +174,12 @@ if(BUILD_TESTING)
   # 「一条回传都没收到过」必须单独一个进程：/gimbal_posture_state 是 transient_local，
   # 跟别的用例共进程的话会被前面发过的姿态污染，这个分支根本进不去。
   add_launch_test(test/test_gimbal_gate_no_feedback.py TIMEOUT 90)
+  # 锁住「LOST 停车、非 LOST 不停」。gtest 碰不到订阅+control() 调度。
+  # 写反的表现是丢定位后仍跟 map 系路径。
+  add_launch_test(test/test_integrity_gate.py TIMEOUT 90)
+  # 「从没收到过 localization_status」必须单独进程：话题是 transient_local，
+  # 跟 LOST 用例共进程会被前面 latch 污染，缺省分支进不去。
+  add_launch_test(test/test_integrity_gate_no_status.py TIMEOUT 90)
 endif()
 
 ament_auto_package(

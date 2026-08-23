@@ -43,7 +43,9 @@ Viewer::~Viewer() {
     viewer_.close();
   }
 
-  view_thread_.join();
+  if (view_thread_.joinable()) {
+    view_thread_.join();
+  }
 }
 
 

@@ -13,5 +13,5 @@
       outlier_std_mul_factor: 1.0 # Standard deviation multiplier for outlier removal
       enable_cropbox_filter: false # If true, filter points out points within box
       k_correspondences: 10 # Number of neighbors for covariance estimation
-      num_threads: 2 # Number of threads for preprocessing (bringup overlays may raise this)
+      num_threads: 2 # 8-core budget (LIO 2); bringup overlays must not raise this
       min_points_after_filter: 100 # Drop frame if preprocessing leaves fewer points than this

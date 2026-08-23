@@ -27,6 +27,9 @@ void declareDecisionParameters(rclcpp::Node & node)
   declareParameter(node, "topics.game_status", defaults.topics.game_status);
   declareParameter(node, "topics.goal", defaults.topics.goal);
   declareParameter(node, "topics.decision_state", defaults.topics.decision_state);
+  declareParameter(
+    node, "topics.localization_status", defaults.topics.localization_status);
+  declareParameter(node, "integrity_gate.enable", defaults.integrity_gate.enable);
 
   declareParameter(
     node, "waypoint_executor.saved_waypoint_file_topic",
@@ -82,6 +85,8 @@ DecisionConfig loadDecisionConfig(rclcpp::Node & node)
   node.get_parameter("topics.game_status", config.topics.game_status);
   node.get_parameter("topics.goal", config.topics.goal);
   node.get_parameter("topics.decision_state", config.topics.decision_state);
+  node.get_parameter("topics.localization_status", config.topics.localization_status);
+  node.get_parameter("integrity_gate.enable", config.integrity_gate.enable);
 
   node.get_parameter(
     "waypoint_executor.saved_waypoint_file_topic",

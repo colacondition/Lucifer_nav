@@ -114,12 +114,11 @@ ament_export_dependencies(
   tf2_ros
 )
 
-# 同一份 waypoint_executor.cpp 编出两个可执行文件：差异（节点名/服务名/状态话题
-# 默认值/到点判定语义）由 WAYPOINT_EXECUTOR_DEFAULT_MODE 编译定义 + mode 参数决定。
-add_executable(waypoint_patrol_executor src/waypoint_executor.cpp)
-target_compile_definitions(waypoint_patrol_executor PRIVATE WAYPOINT_EXECUTOR_DEFAULT_MODE=\"patrol\")
+# 单一可执行文件：follow / patrol 由 mode 参数切换（默认 follow）。
+# 节点名、服务名、action 名仍可通过参数覆盖，decision 的 follow 入口无感。
+add_executable(waypoint_executor src/waypoint_executor.cpp)
 
-ament_target_dependencies(waypoint_patrol_executor
+ament_target_dependencies(waypoint_executor
   rclcpp
   rclcpp_action
   decision_interfaces
@@ -131,22 +130,7 @@ ament_target_dependencies(waypoint_patrol_executor
   tf2_ros
 )
 
-add_executable(waypoint_follow_executor src/waypoint_executor.cpp)
-target_compile_definitions(waypoint_follow_executor PRIVATE WAYPOINT_EXECUTOR_DEFAULT_MODE=\"follow\")
-
-ament_target_dependencies(waypoint_follow_executor
-  rclcpp
-  rclcpp_action
-  decision_interfaces
-  geometry_msgs
-  nav_msgs
-  std_srvs
-  std_msgs
-  tf2
-  tf2_ros
-)
-
-install(TARGETS waypoint_patrol_executor waypoint_follow_executor
+install(TARGETS waypoint_executor
   DESTINATION lib/${PROJECT_NAME}
 )
 

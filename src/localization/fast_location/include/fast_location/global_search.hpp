@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <limits>
 #include <vector>
@@ -102,6 +103,27 @@ std::vector<Eigen::Matrix4f> generatePlanarCandidates(
   const Eigen::Matrix4f & odom_from_base,
   const GlobalSearchConfig & config);
 
+// 上一拍与候选 map→odom 的 XY 平移距离。LOST 仍全场搜，
+// 但跳变超过门限（RMUL 对面角 ≈ 11m）就是锁错角。max_xy_jump<=0 关门。
+inline float mapOdomXyJump(
+  const Eigen::Matrix4f & previous, const Eigen::Matrix4f & candidate)
+{
+  const float dx = candidate(0, 3) - previous(0, 3);
+  const float dy = candidate(1, 3) - previous(1, 3);
+  return std::hypot(dx, dy);
+}
+
+inline bool mapOdomJumpExceeds(
+  const Eigen::Matrix4f & previous,
+  const Eigen::Matrix4f & candidate,
+  float max_xy_jump)
+{
+  if (!(max_xy_jump > 0.0f)) {
+    return false;
+  }
+  return mapOdomXyJump(previous, candidate) > max_xy_jump;
+}
+
 // 给每个候选位姿打分，分数越高越像当前扫描。kdtree 由调用方传入并复用
 // （节点已持有全局图的 kd-tree，每次调用重建是 O(N log N) 的浪费）。
 std::vector<GlobalSearchCandidate> scoreGlobalCandidates(
@@ -113,6 +135,11 @@ std::vector<GlobalSearchCandidate> scoreGlobalCandidates(
 // 只保留彼此间隔足够大的候选点。
 std::vector<GlobalSearchCandidate> selectSeparatedCandidates(
   const std::vector<GlobalSearchCandidate> & ranked,
+  const GlobalSearchConfig & config);
+
+// 去重后的第一、第二名分差小于 margin 时视为歧义，整次拒绝。
+bool candidatesAreAmbiguous(
+  const std::vector<GlobalSearchCandidate> & selected,
   const GlobalSearchConfig & config);
 
 // 对已经入选的少量候选做一次精细打分(stride=1、距离更严),用于打破粗搜的粒度。

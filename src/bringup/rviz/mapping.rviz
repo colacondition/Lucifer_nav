@@ -6,9 +6,9 @@
 # 而且 navigation.rviz 里根本没有 /Laser_map 的 display，即使把 Fixed Frame 改对
 # 也看不到建图结果。
 #
-# 这里的 Fixed Frame 取 world —— Super-LIO 的 /lio/cloud_world（launch 里重映射成
-# /Laser_map）就是发在 world 系里的（ROSWrapper.cpp:795）。odom→world 和
-# odom→lidar_odom 是两条零静态变换，在建图模式下也无条件启动，所以 TF 树连通。
+# 这里的 Fixed Frame 取 odom —— small_glim 的 /Laser_map 和
+# /Laser_map_dense 都戳在 odom 系（odometry_frame_id / cloud_frame_id 都是 odom），
+# 并直接广播 odom→base_link，不再叠恒等静态 TF。
 #
 # 注意：从 RViz 里「Save Config」会把这些注释全部丢掉。
 Panels:
@@ -125,13 +125,9 @@ Visualization Manager:
           Value: true
         imu_link:
           Value: true
-        lidar_odom:
-          Value: true
         livox_frame:
           Value: true
         odom:
-          Value: true
-        world:
           Value: true
       Marker Scale: 1
       Name: TF
@@ -140,26 +136,22 @@ Visualization Manager:
       Show Names: true
       Tree:
         odom:
-          lidar_odom:
-            base_link:
-              imu_link:
-                {}
-              livox_frame:
-                {}
-              wheel_1:
-                {}
-              wheel_2:
-                {}
-              wheel_3:
-                {}
-              wheel_4:
-                {}
-          world:
-            {}
+          base_link:
+            imu_link:
+              {}
+            livox_frame:
+              {}
+            wheel_1:
+              {}
+            wheel_2:
+              {}
+            wheel_3:
+              {}
+            wheel_4:
+              {}
       Update Interval: 0
       Value: true
-    # 建图结果本体。Super-LIO 的 /lio/cloud_world 在 launch 里被重映射成
-    # /Laser_map，frame_id 是 world（ROSWrapper.cpp:795），QoS 是默认的 Reliable。
+    # 建图结果本体。small_glim 发 /Laser_map，frame_id 是 odom，QoS 是默认 Reliable。
     # 这个 publisher 只在有订阅者时才发（has_cloud_world_subscribers），
     # 所以这个 display 关掉就等于关掉建图输出，别以为没用。
     - Alpha: 1
@@ -272,7 +264,7 @@ Visualization Manager:
   Global Options:
     Background Color: 48; 48; 48
     # 建图模式下没有 map 帧。/Laser_map 发在 world 系里，所以取 world。
-    Fixed Frame: world
+    Fixed Frame: odom
     Frame Rate: 30
   Name: root
   # 没有 SetInitialPose / GoalTool / WaypointEditorTool：建图模式下 nav2 和

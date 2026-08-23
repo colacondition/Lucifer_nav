@@ -97,6 +97,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_decision_config test/test_decision_config.cpp)
   target_link_libraries(test_decision_config decision_core)
 
+  ament_add_gtest(test_decision_context test/test_decision_context.cpp)
+  target_link_libraries(test_decision_context decision_core)
+
   ament_add_gtest(test_waypoint_store test/test_waypoint_store.cpp)
   target_link_libraries(test_waypoint_store decision_core)
 

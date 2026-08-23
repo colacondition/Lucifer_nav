@@ -68,9 +68,9 @@ private:
   std::mutex transmit_mutex;
   std::vector<uint8_t> receive_buffer_;
   std::mutex receive_mutex_;
-  // 串口写锁。现在有两个定时器往同一个 fd 写（底盘速度帧和云台姿态帧），单线程执行器
-  // 下回调本来就是串行的，但这个节点注册成了 component，被塞进 component_container_mt
-  // 就会真的并发。两次 write 交错的结果是字节流里出现拼接帧，固件那侧同步不回来。
+  // 串口写锁。底盘速度帧和云台姿态帧各跟一个定时器写同一个 fd；
+  // launch 起的是独立进程（默认单线程 spin），回调本身串行。锁仍保留：
+  // 节点也注册为 component，若被装进多线程容器，没这把锁两次 write 会拼帧。
   std::mutex write_mutex_;
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr chassis_cmd_sub_;

@@ -2,13 +2,13 @@
 
 LIO 里程计 + 建图包（GLIM 的因子图精简版）。吃 Mid360 的 `/livox/lidar/pointcloud`
 和 `/livox/imu`，用 **GTSAM ISAM2 固定滞后平滑 + IMU 预积分 + GICP/iVox** 估计位姿，
-输出 `/Odometry`、`/lio/robo/odom`（供 fast_location）、`/Laser_map`（odometry 下采样世界系点云）、`/Laser_map_dense`（供 fast_location 的定位稠密点云），
-并广播动态 `lidar_odom→base_link` TF。
+输出 `/Odometry`、`/lio/robo/odom`（供 fast_location）、`/Laser_map`（odometry 下采样点云）、`/Laser_map_dense`（供 fast_location 的定位稠密点云），
+并广播动态 `odom→base_link` TF。
 
 ```text
 /livox/lidar/pointcloud ─► preprocess ─► TimeKeeper ─► AsyncOdometryEstimation ─► /Odometry
 /livox/imu ──────────────────────────────────────────►   (ISAM2 + GICP/iVox)      ├─► /lio/robo/odom
-                                                               │                  └─► lidar_odom→base_link TF
+                                                               │                  └─► odom→base_link TF
                                                                ▼
                                                           AsyncMapping ─► /Laser_map
                                                               │
@@ -66,11 +66,12 @@ LIO 里程计 + 建图包（GLIM 的因子图精简版）。吃 Mid360 的 `/liv
 | :- | :- | :- |
 | `node.acc_scale` | 1.0 | IMU 加速度缩放。实车 9.7946（Mid360 内置 IMU 出 g 单位）；仿真 1.0（m/s²） |
 | `node.enable_mapping` | true | 启动即建图，Ctrl-C 落盘。nav 模式由 launch 置 false |
-| `node.enable_tf_publish` | false | 广播 `lidar_odom→base_link`（实车/仿真 launch 置 true） |
+| `node.enable_tf_publish` | false | 广播 `odom→base_link`（实车/仿真 launch 置 true） |
 | `sensors.T_lidar_imu` | 包内默认 | 实车 `[0.011, 0.02329, -0.04412, 0,0,0,1]`（Livox 手册 IMU 位置交叉验证）；
   仿真 `[0, 0, -0.05, 0,0,0,1]`（URDF） |
 | `preprocess.distance_near/far_thresh` | 0.3 / 30.0 | 雷达系距离过滤 |
 | `preprocess.downsample_resolution` | 0.05 | 体素降采样（仿真 0.1，实车 0.05） |
+| `preprocess.num_threads` / `odometry_estimation.num_threads` | 2 | 8 核预算（LIO 2）。仿真 overlay 不要再抬到 4 |
 | `odometry_estimation.smoother_lag` | 3.0 | 固定滞后窗（仿真 1.5，缩小修正滞后） |
 | `odometry_estimation.target_downsampling_rate` | 0.1 | 配准目标体素率（仿真 0.05） |
 | `mapping.output_dir` / `map_name` | "" / "" | 由 launch 传 `map_save_dir` / `<world>.pcd` |
@@ -105,15 +106,15 @@ ros2 launch bringup sim.launch.py  world:=RMUL mode:=mapping nav_rviz:=True
 | `/livox/imu` | 订阅 | IMU |
 | `/Odometry` | 发布 | 里程计，child=base_link 实为雷达位姿（super_lio 约定），MPC 消费；高频补帧开启时为传播流，否则与 `/lio/robo/odom` 同内容 |
 | `/lio/robo/odom` | 发布 | 始终 10Hz 雷达校正流，供 fast_location（与 `/Laser_map_dense` 同源同步） |
-| `/Laser_map` | 发布 | odometry 下采样世界系点云（可视化/调试），frame=`world`（odom→world 是静态恒等） |
-| `/Laser_map_dense` | 发布 | 给 fast_location 的定位稠密点云（更细下采样，独立于 odometry 分辨率），frame=`world` |
+| `/Laser_map` | 发布 | odometry 下采样点云（可视化/调试），frame=`odom` |
+| `/Laser_map_dense` | 发布 | 给 fast_location 的定位稠密点云（更细下采样，独立于 odometry 分辨率），frame=`odom` |
 | `/small_glim/ivox_cloud` | 发布 | 调试用 iVox 目标点云 |
 
-TF：动态 `lidar_odom→base_link`（`enable_tf_publish` 时）；odom 原点 z 锚在开机雷达
-平面。`odom→lidar_odom`、`odom→world` 由 bringup 的静态 TF 提供。
+TF：动态 `odom→base_link`（`enable_tf_publish` 时）；odom 原点 z 锚在开机雷达
+平面。不再叠 `odom→lidar_odom` / `odom→world` 恒等静态 TF。
 
 **高频补帧（默认开，`node.high_rate_odom_hz: 100.0`）**：`/Odometry` 与
-`lidar_odom→base_link` TF 在 10Hz 雷达校正之间用最新 IMU bias 前向传播补帧，
+`odom→base_link` TF 在 10Hz 雷达校正之间用最新 IMU bias 前向传播补帧，
 降低 MPC/TF 查询看到的相位滞后。传播基准每帧校正都先外推到校正时间戳再与校正值做
 指数平滑（`node.high_rate_smoothing_tau`），只吸收校正残差、不抹掉帧间运动；
 z 轴用单独的更慢时间常数（`node.high_rate_smoothing_tau_z`，默认 1.0s），避免
@@ -122,7 +123,7 @@ LIO 高度校正抖动被逐拍吸收成“下沉又弹回地面”。`node.high
 
 **两条数据流要保持语义分离**：`/lio/robo/odom`、`/Laser_map`、`/Laser_map_dense`
 始终是 10Hz 校正流（时间戳 = 雷达帧起点），fast_location 消费它们，不受补帧影响；
-`/Odometry` 与 `lidar_odom→base_link` TF 在高频模式下是传播流（时间戳接近当前 IMU）。
+`/Odometry` 与 `odom→base_link` TF 在高频模式下是传播流（时间戳接近当前 IMU）。
 因此 RViz 里 10Hz 点云相对高频推进的机器人模型会呈现约一个扫描周期的视觉滞后，这是
 时间戳语义所致，不是定位错误。
 

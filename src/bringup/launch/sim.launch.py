@@ -45,9 +45,10 @@ def generate_launch_description():
     mapping_nav = LaunchConfiguration('mapping_nav')
     perception_threads = LaunchConfiguration('perception_threads')
 
-    # 建图模式下也跑导航（SLAM-navigation）：map 帧与 /map 由 slam_toolbox 边扫边
+    # 建图模式下可选再跑导航（SLAM-navigation）：map 帧与 /map 由 slam_toolbox 边扫边
     # 发，语义地图缺席（还没有 .msgpack 可读），隧道相关逻辑全部退化失效，仅作普通
-    # 2D 导航用。默认开，mode:=mapping 即生效；mapping_nav:=False 退回纯净建图。
+    # 2D 导航用。默认关：mode:=mapping 只建图（slam_toolbox + small_glim）；
+    # 要边建边导航再显式 mapping_nav:=True。
     nav_condition = IfCondition(PythonExpression([
         "'", mode, "' == 'nav' or ('", mode, "' == 'mapping' and '",
         mapping_nav, "' == 'True')"
@@ -84,9 +85,9 @@ def generate_launch_description():
         bringup_dir, 'config', 'simulation', 'small_glim_sim.yaml')
     # RViz 配置按 mode 选：navigation.rviz 的 Fixed Frame 是 map，而 map 只有
     # nav 模式下的 fast_location / map_server 才发；建图模式下用 mapping.rviz
-    # （Fixed Frame=world，带 /Laser_map 显示）。见 rviz/mapping.rviz 顶部说明。
+    # （Fixed Frame=odom，带 /Laser_map 显示）。见 rviz/mapping.rviz 顶部说明。
     # 建图 + 导航（mapping_nav）用专门的 mapping_nav.rviz：Fixed Frame 取 map
-    # （slam_toolbox 发），带 GoalTool 和 /map 显示，同时保留 /Laser_map（world 系）。
+    # （slam_toolbox 发），带 GoalTool 和 /map 显示，同时保留 /Laser_map（odom 系）。
     rviz_config = PythonExpression([
         "'", os.path.join(bringup_dir, 'rviz', 'mapping_nav.rviz'), "'",
         " if ('", mode, "' == 'mapping' and '", mapping_nav, "' == 'True') else ",
@@ -114,8 +115,8 @@ def generate_launch_description():
     declare_world = DeclareLaunchArgument('world', default_value='RMUL')
     declare_mode = DeclareLaunchArgument('mode', default_value='nav')
     declare_mapping_nav = DeclareLaunchArgument(
-        'mapping_nav', default_value='True',
-        description='Run the nav stack while mapping (SLAM-navigation, map from slam_toolbox)')
+        'mapping_nav', default_value='False',
+        description='If True with mode:=mapping, also run the nav stack (SLAM-navigation). Default False: mapping is slam_toolbox only.')
     declare_use_sim_time = DeclareLaunchArgument('use_sim_time', default_value='True')
     declare_nav_rviz = DeclareLaunchArgument('nav_rviz', default_value='True')
     declare_gazebo_gui = DeclareLaunchArgument('gazebo_gui', default_value='True')
@@ -182,17 +183,8 @@ def generate_launch_description():
         ],
         arguments=common_log_arguments)
 
-    # 连接 odom 与 Super-LIO 输出系（lidar_odom/world），否则 TF 树断裂
-    tf_odom_to_lidar_odom = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        output='log',
-        arguments=['--frame-id', 'odom', '--child-frame-id', 'lidar_odom'])
-    tf_odom_to_world = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        output='log',
-        arguments=['--frame-id', 'odom', '--child-frame-id', 'world'])
+    # small_glim 直接广播 odom→base_link（odometry_frame_id / cloud_frame_id 都是 odom），
+    # 不再叠 odom→lidar_odom / odom→world 恒等静态 TF。
 
     # ===== 3. 感知链：lidar_filter + ground_segmentation 同容器 intra-process =====
     # 与 real.launch.py 同一套：两节点合并进 component_container_mt，显式打开
@@ -292,6 +284,7 @@ def generate_launch_description():
             'range_max': 10.0,
             'use_inf': True,
             'inf_epsilon': 1.0,
+            'queue_size': 10,
         }],
         arguments=common_log_arguments)
 
@@ -378,11 +371,11 @@ def generate_launch_description():
 
     # ===== 7. 速度转换已并进 navigation2 容器（fake_vel_transform 组件）=====
 
-    # ===== 8. Waypoint follow executor（patrol 可执行文件保留，bringup 不再双开）=====
+    # ===== 8. 航点执行器（单一 waypoint_executor，默认 follow）=====
     waypoint_follow_executor = Node(
         condition=LaunchConfigurationEquals('mode', 'nav'),
         package='waypoint_editor',
-        executable='waypoint_follow_executor',
+        executable='waypoint_executor',
         name='waypoint_follow_executor',
         output=node_output,
         parameters=[{
@@ -415,8 +408,6 @@ def generate_launch_description():
         enable_software_gl,
         start_simulation,
         lio_node,
-        tf_odom_to_lidar_odom,
-        tf_odom_to_world,
         perception_container,
         *make_perception_load_actions(),
         reload_perception_components,

@@ -61,10 +61,10 @@ PointCloudToLaserScanNode::PointCloudToLaserScanNode(const rclcpp::NodeOptions &
 {
   target_frame_ = this->declare_parameter("target_frame", "");
   tolerance_ = this->declare_parameter("transform_tolerance", 0.01);
-  // TODO(hidmic): adjust default input queue size based on actual concurrency levels
-  // achievable by the associated executor
-  input_queue_size_ = this->declare_parameter(
-    "queue_size", static_cast<int>(std::thread::hardware_concurrency()));
+  // Mapping-only subscriber queue. Do not default to hardware_concurrency():
+  // Humble boxes here have 8–24 cores; that would buffer a full second of
+  // obstacle clouds for a node that only exists in mapping mode.
+  input_queue_size_ = this->declare_parameter("queue_size", 10);
   min_height_ = this->declare_parameter("min_height", std::numeric_limits<double>::min());
   max_height_ = this->declare_parameter("max_height", std::numeric_limits<double>::max());
   angle_min_ = this->declare_parameter("angle_min", -M_PI);
@@ -108,7 +108,9 @@ PointCloudToLaserScanNode::PointCloudToLaserScanNode(const rclcpp::NodeOptions &
 PointCloudToLaserScanNode::~PointCloudToLaserScanNode()
 {
   alive_.store(false);
-  subscription_listener_thread_.join();
+  if (subscription_listener_thread_.joinable()) {
+    subscription_listener_thread_.join();
+  }
 }
 
 void PointCloudToLaserScanNode::subscriptionListenerThreadLoop()

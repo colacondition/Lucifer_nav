@@ -62,6 +62,6 @@ The default parameters should work on the KITTI dataset.
 
 ### Other
 
-- **n_threads**  Number of threads to use.
+- **n_threads**  OpenMP fork-join threads for insert/fit/assign (default 2, 8-core budget). Static split of `[0,count)`; do not add a custom pool or per-frame `std::thread` spawn/join.
 - **latch**  Latch output point clouds in ROS node. 
 - **visualize** Visualize the segmentation result. **ONLY FOR DEBUGGING.** Do not set true during online operation.

@@ -46,7 +46,7 @@ def generate_launch_description():
 
     waypoint_follow_executor = Node(
         package="waypoint_editor",
-        executable="waypoint_follow_executor",
+        executable="waypoint_executor",
         name="waypoint_follow_executor",
         output=node_output,
         arguments=["--ros-args", "--log-level", log_level],

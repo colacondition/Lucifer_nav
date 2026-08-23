@@ -7,7 +7,7 @@
       # 高频里程计补帧：在 10Hz 雷达帧之间用最新 bias + IMU 前向传播发布 odom/TF。
       # 0 = 关闭（TF/odom/点云全部回到 10Hz 雷达校正节拍）。当前用 100.0；
       # 若控制端对高频噪声敏感，可退回 50.0。
-      high_rate_odom_hz: 200.0
+      high_rate_odom_hz: 100.0
       # 10Hz 校正帧跳变的平滑时间常数（秒）。新校正帧会先把旧基准用 IMU 外推到
       # 同一时间戳，再与校正值做指数平滑，只吸收校正残差、不抹掉帧间运动。
       # 0 = 不平滑，校正残差完全吸收。
@@ -34,5 +34,5 @@
       localization_cloud_pub_topic: "/Laser_map_dense" # denser cloud for fast_location (decoupled from odometry downsampling)
       ivox_cloud_pub_topic: "/small_glim/ivox_cloud"
       base_frame_id: "base_link" # odometry child frame; carries the lidar pose (super_lio convention)
-      odometry_frame_id: "lidar_odom"
-      cloud_frame_id: "world" # frame_id stamped on published clouds (odom->world is a static identity)
+      odometry_frame_id: "odom"
+      cloud_frame_id: "odom" # published clouds share the odometry frame; no identity TF glue

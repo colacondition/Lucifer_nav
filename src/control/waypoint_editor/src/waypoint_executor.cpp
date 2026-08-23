@@ -1,5 +1,4 @@
-// 单一参数化航点执行器：合并原 waypoint_follow_executor 与 waypoint_patrol_executor
-// （两者约 85% 重复，且「到点判定」语义已经漂移）。差异全部收敛为参数：
+// 单一参数化航点执行器：follow / patrol 由 mode 参数切换。
 //
 //   mode: follow | patrol
 //     follow：非终点航点距离 <= switch_distance 即切换；终点等待 GOAL_REACHED 或
@@ -7,9 +6,8 @@
 //     patrol：每个航点都等 GOAL_REACHED；超时且 remaining < fallback_tolerance 时
 //             按距离兜底接受；approach 全程启用。
 //
-// 两个可执行文件（waypoint_follow_executor / waypoint_patrol_executor）由本文件
-// 以不同的 WAYPOINT_EXECUTOR_DEFAULT_MODE 编译而成，节点名/服务名/状态话题名
-// 保持与旧版一致（decision 与 bringup 的 launch 无感）。
+// 只有一个可执行文件 waypoint_executor。默认 node/service/action 名走 follow，
+// patrol 由 launch 覆盖 mode 与名称。bringup 只起 follow。
 #include <atomic>
 #include <builtin_interfaces/msg/time.hpp>
 #include <chrono>
@@ -36,10 +34,6 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
-#ifndef WAYPOINT_EXECUTOR_DEFAULT_MODE
-#define WAYPOINT_EXECUTOR_DEFAULT_MODE "follow"
-#endif
-
 namespace
 {
 
@@ -58,7 +52,7 @@ public:
     tf_buffer_(std::make_shared<tf2_ros::Buffer>(get_clock())),
     tf_listener_(std::make_shared<tf2_ros::TransformListener>(*tf_buffer_))
   {
-    declare_parameter<std::string>("mode", WAYPOINT_EXECUTOR_DEFAULT_MODE);
+    declare_parameter<std::string>("mode", "follow");
     declare_parameter<std::string>("waypoint_file", "");
     declare_parameter<std::string>("frame_id", "map");
     declare_parameter<std::string>("goal_topic", "/goal_pose");
@@ -198,31 +192,27 @@ private:
 
   static const char * defaultNodeName()
   {
-    return std::string(WAYPOINT_EXECUTOR_DEFAULT_MODE) == "patrol" ?
-      "waypoint_patrol_executor" : "waypoint_follow_executor";
+    return "waypoint_executor";
   }
 
   static const char * defaultServiceName()
   {
-    return std::string(WAYPOINT_EXECUTOR_DEFAULT_MODE) == "patrol" ?
-      "start_waypoint_through" : "start_waypoint_following";
+    return "start_waypoint_following";
   }
 
   static const char * defaultStatusTopic()
   {
-    return std::string(WAYPOINT_EXECUTOR_DEFAULT_MODE) == "patrol" ?
-      "/waypoint_editor/through_status" : "/waypoint_editor/follow_status";
+    return "/waypoint_editor/follow_status";
   }
 
   static double defaultStatusTimeout()
   {
-    return std::string(WAYPOINT_EXECUTOR_DEFAULT_MODE) == "patrol" ? 20.0 : 30.0;
+    return 30.0;
   }
 
   static const char * defaultActionName()
   {
-    return std::string(WAYPOINT_EXECUTOR_DEFAULT_MODE) == "patrol" ?
-      "/waypoint_editor/through_waypoints" : "/waypoint_editor/follow_waypoints";
+    return "/waypoint_editor/follow_waypoints";
   }
 
   bool loadWaypointsFromCSV(

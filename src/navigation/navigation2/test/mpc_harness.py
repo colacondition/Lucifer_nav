@@ -2,7 +2,7 @@
 #
 # Why this exists: unit tests only cover pure functions (isHazardous,
 # findSafePoint, RouteTracker, ProgressMonitor). FSM transitions, the
-# approach-enabled topic on/off sequence, and whether executed_speed_
+# approach-enabled topic on/off sequence, and whether last_published_speed_
 # actually drives ProgressMonitor are all inside the node -- gtest cannot
 # reach them. The creep-at-goal bug was exactly this class: all unit tests
 # passed, it only showed on the real robot.
@@ -14,7 +14,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry, Path
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 # Grid covers x in [-1, 7], y in [-3, 3].  Fits path (0,0)->(5,0) plus
 # the full MPC prediction horizon at max speed.
@@ -49,9 +49,6 @@ class Harness(Node):
         self.odom_pub = self.create_publisher(Odometry, '/Odometry', 10)
         self.costmap_pub = self.create_publisher(
             OccupancyGrid, '/local_costmap/costmap', transient_local_qos())
-        # Chain-end feedback.  The node uses this (not its own published
-        # speed) to drive ProgressMonitor -- see feedback.executed_cmd_topic.
-        self.executed_cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # 云台收放。默认两条都不发 —— 没有请求时门是开的，其他测试不受影响。
         # 发了请求就必须也发实测姿态，否则节点按「还没收到过回传」停车（这是刻意的保守
@@ -60,6 +57,10 @@ class Harness(Node):
             GimbalPosture, '/gimbal_posture', transient_local_qos())
         self.gimbal_posture_state_pub = self.create_publisher(
             GimbalPostureState, '/gimbal_posture_state', transient_local_qos())
+
+        # 定位完整性。默认不发 —— 没收到过消息时门是开的，其他测试不受影响。
+        self.localization_status_pub = self.create_publisher(
+            String, '/localization_status', transient_local_qos())
 
         self.approach_enabled = []
         self.create_subscription(
@@ -126,10 +127,7 @@ class Harness(Node):
         grid.info.origin.orientation.w = 1.0
         grid.data = list(self.cells)        # copy so later mutations don't alias
         self.costmap_pub.publish(grid)
-
-        executed = Twist()
-        executed.linear.x = float(executed_speed)
-        self.executed_cmd_pub.publish(executed)
+        _ = executed_speed  # 卡住检测改吃 MPC 自己上一拍下发的速率，不再喂 /cmd_vel
 
     def set_gimbal(self, requested_lower, measured_lowered=None):
         """
@@ -146,6 +144,12 @@ class Harness(Node):
             state = GimbalPostureState()
             state.lowered = bool(measured_lowered)
             self.gimbal_posture_state_pub.publish(state)
+
+    def set_localization_status(self, payload):
+        """Latch one localization_status string (e.g. 'LOST waiting', 'OK accepted')."""
+        msg = String()
+        msg.data = str(payload)
+        self.localization_status_pub.publish(msg)
 
     def drive(self, duration_s, robot_xy, goal_xy, executed_speed, rate_hz=20.0):
         """
@@ -204,9 +208,6 @@ def mpc_test_params(**overrides):
         'approach.enable': False,
         'local_safety.costmap_topic': '/local_costmap/costmap',
         'local_safety.costmap_timeout': 1.0,
-        'feedback.executed_cmd_topic': '/cmd_vel',
-        'feedback.executed_cmd_timeout': 0.5,
-        'feedback.override_detect_time': 0.5,
         'progress.min_displacement': 0.15,
         'progress.no_progress_timeout': 10.0,
         'progress.stuck_timeout': 10.0,

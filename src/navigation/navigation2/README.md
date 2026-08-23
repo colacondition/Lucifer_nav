@@ -23,8 +23,8 @@
 - `rm_global_costmap_node`：订阅 `/map` 和 `/segmentation/obstacle`，发布全局代价地图。
 - `rm_minco_path_smoother_node`：用 MINCO L-BFGS 平滑 `/plan_raw` 并发布 `/plan`，详见 `MINCO_README.md`。
 - `rm_local_costmap_node`：基于 `/segmentation/obstacle` 点云构建滚动局部代价地图。
-- `rm_mpc_controller_node`：使用 OSQP 跟踪路径，发布 `/cmd_vel_nav` 和 `/predict_path`。内置接近减速、多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）、弧长域速度剖面和指令链路闭环反馈。
-- `rm_velocity_smoother_node`：将 `/cmd_vel_nav` 限幅平滑为 `/cmd_vel`。
+- `rm_mpc_controller_node`：使用 OSQP 跟踪路径，发布 `/cmd_vel_nav` 和 `/predict_path`。内置接近减速、多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）和弧长域速度剖面。订阅 `/localization_status`：仅 `LOST` 停车等重定位、不进恢复链；`OK`（含 `nis_reject` 握住 TF、`projected` 走廊投影）不停；没收到过消息时不拦（`mapping_nav` / 测试）。
+- `rm_velocity_smoother_node`：将 `/cmd_vel_nav` 限幅为 `/cmd_vel`（夹速度、死区、输入超时归零；不加减速斜坡）。
 - `fake_vel_transform`：同容器内将 `/cmd_vel` 转为底盘执行话题 `/cmd_vel_chassis`。
 - `rm_nav2_compat_node`：提供 `/navigate_to_pose` action，把 RViz Nav2 Goal 转成 `/goal_pose`。
 - `rm_tunnel_posture_node`：订阅语义地图与车体位姿，判断车是否接近/正在隧道内，向电控发布 `/gimbal_posture` 收云台请求（距最近隧道本体格 ≤ `run_up` 发收、洞里全程保持、退开 `run_up + hysteresis` 才发抬）。判据只看距离，不读车体参数；收多低、到位没到位全归电控。
@@ -94,9 +94,9 @@ MPC 使用 `/local_costmap/costmap` 对求解后的预测运动逐段做碰撞�
 
 `src/mpc/speed_profile` 按路径曲率限侧向加速度，再用前/后向扫描保证切向加减速可达，替代原先的常数 `expected_speed`。MPC 参考窗口按弧长采样并优先使用剖面速度，弯道自动减速、接近目标时减速至零。`speed_profile.enable: false` 可退回常数速度。
 
-### 指令链路闭环
+### 指令链路
 
-本节点发布的指令仍会被 `rm_velocity_smoother` 限幅或超时归零，所以"是否真的有指令"以链路末端 `/cmd_vel` 的实测值为准（`feedback.executed_cmd_topic`），并据此检测下游越权与链路静默。接近减速已并进本节点；目标附近用 `recovery.suppress_near_goal` 关闭失效检测。
+接近减速已并进本节点。平滑器只做最后一道限幅与超时归零，卡住检测喂本节点上一拍下发的速率，不再反读 `/cmd_vel`。目标附近用 `recovery.suppress_near_goal` 关闭失效检测。
 
 ## 单独启动
 
@@ -122,7 +122,7 @@ src/navigation/navigation2/params/navigation2.yaml
 ## 测试
 
 - **单元测试（gtest）**：`RouteTracker` / `ProgressMonitor` / `RecoveryPlanner` / `SpeedProfile` / `LocalPathSafety` / `PathStitching` / `SemanticMap` / `TunnelPosture`，覆盖各模块的纯逻辑。
-- **集成测试（launch_testing）**：起真节点、喂合成 `/plan`、`/Odometry`、`/local_costmap/costmap`、`/cmd_vel`，断言 FSM 行为。覆盖目标附近不误触发恢复、卡住时确实进恢复、覆写检测、veto 连击升级、`HAZARD_RECOVERY → FOLLOW` 完整闭环。测试文件位于 `test/`，共用夹具 `test/mpc_harness.py`。
+- **集成测试（launch_testing）**：起真节点、喂合成 `/plan`、`/Odometry`、`/local_costmap/costmap`、`/cmd_vel`，断言 FSM 行为。覆盖目标附近不误触发恢复、卡住时确实进恢复、覆写检测、veto 连击升级、`HAZARD_RECOVERY → FOLLOW` 完整闭环。完整性门在 `test_integrity_gate.py`（`LOST` 停车、`OK nis_reject` 仍走、`OK accepted` 恢复）和 `test_integrity_gate_no_status.py`（从没收到过状态必须能走；单独文件是因为 `localization_status` 是 transient_local，同进程一旦发过就会 latch）。本机若还在跑 `sim.launch.py`，这些用例要换独立 `ROS_DOMAIN_ID`，否则会被仿真钉死的 LOST/costmap 串进测试。测试文件位于 `test/`，共用夹具 `test/mpc_harness.py`。
 
 运行全部测试：
 

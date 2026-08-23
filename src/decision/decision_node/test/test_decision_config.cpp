@@ -17,6 +17,8 @@ TEST(DecisionConfig, LoadsDefaults)
   EXPECT_EQ(config.topics.game_status, "game_status");
   EXPECT_EQ(config.topics.goal, "/goal_pose");
   EXPECT_EQ(config.topics.decision_state, "/decision/state");
+  EXPECT_EQ(config.topics.localization_status, "/localization_status");
+  EXPECT_TRUE(config.integrity_gate.enable);
   EXPECT_EQ(config.waypoint_executor.follow_action, "/waypoint_editor/follow_waypoints");
   EXPECT_EQ(config.waypoint_executor.through_action, "/waypoint_editor/through_waypoints");
   EXPECT_DOUBLE_EQ(config.loop_hz, 10.0);

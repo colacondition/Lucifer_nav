@@ -247,6 +247,16 @@ std::vector<GlobalSearchCandidate> selectSeparatedCandidates(
   return selected;
 }
 
+bool candidatesAreAmbiguous(
+  const std::vector<GlobalSearchCandidate> & selected,
+  const GlobalSearchConfig & config)
+{
+  if (selected.size() < 2) {
+    return false;
+  }
+  return selected.front().score - selected[1].score < config.minimum_score_margin;
+}
+
 std::vector<GlobalSearchCandidate> refineCandidateScores(
   const pcl::KdTreeFLANN<Point> & kdtree,
   const PointCloudXYZI::ConstPtr & scan,

@@ -4,17 +4,17 @@
     # small_glim 自动生成伪时间戳）和 /livox/imu（gazebo_ros_imu_sensor）
     node:
       acc_scale: 1.0           # 仿真 IMU 输出 m/s²（含重力），无需缩放
-      enable_tf_publish: true  # 广播动态 lidar_odom -> base_link
+      enable_tf_publish: true  # 广播动态 odom -> base_link
     sensors:
       # URDF：imu_link 在 base+[0.12,0,0.125]，livox 在 base+[0.12,0,0.175] ⇒ IMU 在雷达系下方 0.05m
       T_lidar_imu: [0.0, 0.0, -0.05, 0.0, 0.0, 0.0, 1.0]
     preprocess:
-      num_threads: 4
+      num_threads: 2           # 8-core budget: LIO 2; do not overlay 4
       # 0.05 -> 0.1：每帧点数约减半，单帧 GICP 耗时波动更小（开阔场地特征稀疏时
       # 耗时起伏是 odom 节律不均、看着顿挫的主因）。实车保留 0.05。
       downsample_resolution: 0.1
     odometry_estimation:
-      num_threads: 4
+      num_threads: 2           # 8-core budget: LIO 2
       # 3.0 -> 1.5：后台 ISAM2 修正滞后减半，odom 的 IMU 预测参考状态更"新鲜"。
       smoother_lag: 1.5
       # 0.1 -> 0.05：target 体素图点更少，配准更快。

@@ -3,6 +3,8 @@
 导航系统的决策层（包名 `decision`，节点 `bt_action_replacement`）。它根据比赛状态、
 机器人血量、导航执行结果和**交战态势**，在 `HOME`、`MOVE`、`CENTER` 三个大状态之间
 切换，并把当前状态对应的航点任务下发给 `waypoint_follow_executor`。
+订 `/localization_status`：仅 `LOST` 时冻 map 系下发（不钉当前位、不换航点）；
+`OK`（含 `nis_reject` / `projected`）不冻。状态机照跑。从没收到过这条不拦。
 
 决策节点不直接规划路径，也不在循环中创建新的进程。它只负责：
 
@@ -165,6 +167,7 @@ TF 不可用时不猜测偏离、不定时重发（TF 查询失败最多每秒�
 |---|---|---|---|
 | `robot_status` | `decision_interfaces/RobotStatus` | serial_driver（裁判系统） | QoS(10) |
 | `game_status` | `decision_interfaces/GameStatus` | serial_driver（裁判系统） | QoS(10) |
+| `/localization_status` | `std_msgs/String` | fast_location 二态 OK/LOST + reason | reliable + transient_local |
 | `/waypoint_editor/follow_status` | `std_msgs/String` | waypoint_follow_executor | reliable + transient_local |
 | `/waypoint_editor/through_status` | `std_msgs/String` | waypoint executor | reliable + transient_local |
 
@@ -188,6 +191,7 @@ TF 不可用时不猜测偏离、不定时重发（TF 查询失败最多每秒�
 robot_status ─┐
               ├─> DecisionContext ──> combatAssessment()
 game_status ──┘          │
+localization_status ─────┘  （仅 LOST 冻下发；OK 含 nis_reject 不冻；没收到过不拦）
                          v
                 DecisionStateMachine::tick()
                          │
@@ -210,6 +214,9 @@ game_status ──┘          │
 - 相同目标正在运行时不重复请求；服务请求未返回时不重复创建。
 - 连续相同请求合并；切换任务复用同一个 executor。
 - TF 缺失时不通过定时重发重启执行线程。
+- `localization_status=LOST` 时不发 map 系目标（含 ENGAGE 钉当前位）。状态机继续 tick。
+  `OK`（含 `nis_reject` 握住 TF、`projected` 走廊投影）不冻。从没收到过这条不拦。
+  关闸用 `integrity_gate.enable: false`。不要把 `OK nis_reject` 当 LOST。
 - 决策循环不调用 `system()`/`popen()`/`fork()`，不启动新 launch。
 
 这些限制防止"状态异常 → 重发目标 → 重启线程 → 再次异常"的高频循环。
@@ -232,6 +239,8 @@ game_status ──┘          │
 | `combat.reposition_grace_sec` | 3.0 | — | 换位期间暂缓回家的宽限期 |
 | `maintain_goal.enable` / `xy_tolerance` / `drift_hold_sec` | true / 0.35 / 0.8 | — | 守点纠偏 |
 | `maintain_goal.robot_base_frame` | `base_link_fake` | — | 守点用的机器人 frame |
+| `integrity_gate.enable` | true | true | 仅 LOST 冻 map 系下发；OK（含 nis_reject）不冻 |
+| `topics.localization_status` | `/localization_status` | 同左 | fast_location 二态 OK/LOST |
 | `targets.*_waypoint_file` | ""（6 个） | bringup 传入 | 各状态航点 CSV |
 | `waypoint.switch_distance` / `final_goal_tolerance` | 0.6 / 0.35 | — | 航点推进/到点判定 |
 
@@ -261,7 +270,7 @@ game_status ──┘          │
 | `src/decision_node.cpp` | 节点 `BtActionReplacementNode`：订阅发布、定时循环、TF、战术处理 |
 | `src/decision_state_machine.cpp` | 状态切换规则、优先级、`tickCenter()` 交战子状态 |
 | `src/decision_state.cpp` | 状态字符串化、状态→目标映射、`/decision/state` QoS |
-| `src/decision_context.cpp` | 保存 RobotStatus/GameStatus、计算交战态势 |
+| `src/decision_context.cpp` | 保存 RobotStatus/GameStatus、计算交战态势、解析 localization_status |
 | `src/waypoint_executor_client.cpp` | executor 请求、路径下发、执行状态跟踪 |
 | `src/waypoint_store.cpp` | 加载 CSV、准备 follow 航点（选机器人前方的点） |
 | `src/decision_config.cpp` | 参数声明、读取、校验 |

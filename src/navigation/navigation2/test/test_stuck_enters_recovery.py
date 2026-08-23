@@ -1,8 +1,8 @@
 # 集成测试：真的卡住时恢复链必须触发。
 #
 # 覆盖三件此前只有纯函数单测的事：
-#   1. executed_speed_ 确实驱动 ProgressMonitor（喂非零的 /cmd_vel + 位置不动
-#      → stuck）。这是指令链路闭环改动的核心断言。
+#   1. last_published_speed_ 确实驱动 ProgressMonitor（MPC 发非零 + 位置不动
+#      → stuck / noProgress）。
 #   2. FSM 确实从 FOLLOW 转到恢复态。
 #   3. 进入恢复时确实把接近段关掉（否则倒车指令会被它
 #      吃掉 —— 距目标 0.25 m 内无条件发零 Twist）。
@@ -33,8 +33,7 @@ def generate_test_description():
         name='rm_mpc_controller',
         output='screen',
         parameters=[mpc_test_params(**{
-            # noProgress 触发恢复比 stuck 更快、且不依赖 /cmd_vel 反馈，
-            # 后者在容器化环境下首次连接不可靠。
+            # noProgress 触发恢复比 stuck 更快。
             'progress.no_progress_timeout': 1.0,
             'progress.stuck_timeout': 10.0,
         })],
@@ -66,9 +65,7 @@ class TestStuckEntersRecovery(unittest.TestCase):
         # 距目标 4 m，不在抑制带内。
         blocked = (1.0, 0.0)
 
-        # 预热：MPC 节点在 component_container_mt 容器内启动，订阅 /cmd_vel
-        # 等话题需要时间完成发现与连接。先用几拍空驱动让它完成初始化，避免
-        # stuck 判据因尚未收到执行反馈而被降级。
+        # 预热：MPC 节点启动后订阅需要时间完成发现与连接。
         import time
         deadline = time.time() + 1.0
         period = 1.0 / 20.0
@@ -76,8 +73,7 @@ class TestStuckEntersRecovery(unittest.TestCase):
             self.harness.publish_inputs(blocked, goal, 0.5)
             rclpy.spin_once(self.harness, timeout_sec=period)
 
-        # 底盘确实收到了 0.5 m/s（链路末端实测），但位置一直不变 —— 顶住
-        # 障碍或打滑。这是 stuck 判据要捕捉的情形。
+        # 位置一直不变 —— 顶住障碍或打滑。noProgress / stuck 都要捕捉。
         self.harness.drive(
             duration_s=8.0, robot_xy=blocked, goal_xy=goal, executed_speed=0.5)
 

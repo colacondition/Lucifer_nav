@@ -122,8 +122,6 @@ Visualization Manager:
           Value: true
         imu_link:
           Value: true
-        lidar_odom:
-          Value: true
         livox_frame:
           Value: true
         map:
@@ -146,22 +144,21 @@ Visualization Manager:
       Tree:
         map:
           odom:
-            lidar_odom:
-              base_link:
-                base_link_fake:
-                  {}
-                imu_link:
-                  {}
-                livox_frame:
-                  {}
-                wheel_1:
-                  {}
-                wheel_2:
-                  {}
-                wheel_3:
-                  {}
-                wheel_4:
-                  {}
+            base_link:
+              base_link_fake:
+                {}
+              imu_link:
+                {}
+              livox_frame:
+                {}
+              wheel_1:
+                {}
+              wheel_2:
+                {}
+              wheel_3:
+                {}
+              wheel_4:
+                {}
       Update Interval: 0
       Value: true
     - Alpha: 1

@@ -31,7 +31,7 @@ public:
     void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
     size_t lidar_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
     // 高频里程计输出：在 10Hz 雷达帧之间用最新估计的 bias 与 IMU 数据前向传播，
-    // 以 high_rate_odom_hz 发布 /Odometry 与 lidar_odom->base_link TF。
+    // 以 high_rate_odom_hz 发布 /Odometry 与 odom->base_link TF。
     // /lio/robo/odom 始终保留 10Hz 校正流，供 fast_location 与点云同源使用。
     void high_rate_timer_callback();
 
@@ -333,7 +333,7 @@ void SmallGlimNode::pub_odometry(const EstimationFrame::ConstPtr frame) {
     //   /lio/robo/odom     → 10Hz 校正流（fast_location 专用，必须与
     //                        /Laser_map_dense 的校正位姿同流，否则 scan 和 odom
     //                        不一致会让 map→odom 漂移，点云看起来跟着车走）
-    //   lidar_odom→base_link TF → 高频传播流
+    //   odom→base_link TF → 高频传播流
     // 10Hz 硬校正值绝不进入 TF 和 /Odometry，传播值绝不进入 /lio/robo/odom。
     const bool high_rate_enabled = high_rate_odom_hz > 0.0;
     pub_odometry_impl(
@@ -358,8 +358,8 @@ void SmallGlimNode::pub_odometry_impl(
     const rclcpp::Time & stamp, bool publish_tf, bool publish_primary_odom,
     bool publish_robo_odom
 ) {
-    // Dynamic lidar_odom -> base_link TF. This is the only edge connecting the odom tree
-    // (map->odom->lidar_odom) to the robot tree (base_link->livox_frame/imu_link/...);
+    // Dynamic odom -> base_link TF. This is the only edge connecting the odom tree
+    // (map->odom) to the robot tree (base_link->livox_frame/imu_link/...);
     // dropping it splits the TF graph and breaks costmap/amcl localization, not just RViz.
     if (publish_tf) {
         geometry_msgs::msg::TransformStamped tf_base_to_odom;

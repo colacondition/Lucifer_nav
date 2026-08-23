@@ -278,7 +278,9 @@ namespace mid360_driver {
             mid360_driver->stop();
         }
         io_context.stop();
-        io_thread.join();
+        if (io_thread.joinable()) {
+            io_thread.join();
+        }
     }
 
 }// namespace mid360_driver

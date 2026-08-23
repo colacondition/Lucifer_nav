@@ -28,6 +28,17 @@ PointCloudXYZI::Ptr makeAsymmetricMap()
 }
 }  // namespace
 
+TEST(GlobalSearchTest, MapOdomJumpRejectsFarCorner)
+{
+  const auto previous = fast_location::planarPoseMatrix({0.0, 0.0, 0.0});
+  const auto near = fast_location::planarPoseMatrix({1.5, -0.5, 0.2});
+  const auto far = fast_location::planarPoseMatrix({8.0, 10.0, 3.14});
+  EXPECT_FALSE(fast_location::mapOdomJumpExceeds(previous, near, 4.0f));
+  EXPECT_TRUE(fast_location::mapOdomJumpExceeds(previous, far, 4.0f));
+  EXPECT_NEAR(fast_location::mapOdomXyJump(previous, far), std::hypot(8.0f, 10.0f), 1e-4f);
+  EXPECT_FALSE(fast_location::mapOdomJumpExceeds(previous, far, 0.0f));
+}
+
 TEST(GlobalSearchTest, CoversMapBoundsAndFullYawRange)
 {
   fast_location::PlanarBounds bounds{-2.0f, 2.0f, -1.0f, 3.0f};
@@ -175,6 +186,25 @@ TEST(GlobalSearchTest, SelectsSeparatedTopCandidates)
   ASSERT_EQ(selected.size(), 2u);
   EXPECT_NEAR(selected[0].score, 0.90f, 1e-6f);
   EXPECT_NEAR(selected[1].score, 0.80f, 1e-6f);
+}
+
+TEST(GlobalSearchTest, RejectsAmbiguousSeparatedCandidates)
+{
+  GlobalSearchConfig config;
+  config.minimum_score_margin = 0.03f;
+  std::vector<GlobalSearchCandidate> close{
+    {fast_location::planarPoseMatrix({0.0, 0.0, 0.0}), 0.81f},
+    {fast_location::planarPoseMatrix({8.0, 8.0, 0.0}), 0.80f},
+  };
+  EXPECT_TRUE(fast_location::candidatesAreAmbiguous(close, config));
+
+  std::vector<GlobalSearchCandidate> clear{
+    {fast_location::planarPoseMatrix({0.0, 0.0, 0.0}), 0.90f},
+    {fast_location::planarPoseMatrix({8.0, 8.0, 0.0}), 0.80f},
+  };
+  EXPECT_FALSE(fast_location::candidatesAreAmbiguous(clear, config));
+  EXPECT_FALSE(fast_location::candidatesAreAmbiguous(
+    {{fast_location::planarPoseMatrix({0.0, 0.0, 0.0}), 0.90f}}, config));
 }
 
 TEST(GlobalSearchTest, RequestsGlobalSearchAfterConfiguredTrackingFailures)

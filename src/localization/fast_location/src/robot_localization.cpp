@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <stdexcept>
+#include <fast_gicp/gicp/fast_gicp.hpp>
 
 
 
@@ -27,6 +28,7 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<float>("global_search_xy_step", 2.0);
     this->declare_parameter<int>("global_search_max_candidates", 2000000);
     this->declare_parameter<float>("global_search_yaw_step_deg", 30.0);
+    this->declare_parameter<float>("global_search_max_map_odom_jump", 4.0);
     this->declare_parameter<float>("global_search_score_distance", 0.45);
     this->declare_parameter<int>("global_search_score_stride", 4);
     this->declare_parameter<int>("global_search_top_k", 6);
@@ -39,9 +41,16 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<float>("global_search_refine_score_distance", 0.20);
     this->declare_parameter<int>("global_search_refine_score_stride", 1);
     this->declare_parameter<int>("global_search_refine_accumulate_frames", 3);
-    this->declare_parameter<bool>("global_search_enable_temporal_verification", false);
+    this->declare_parameter<bool>("global_search_enable_temporal_verification", true);
     this->declare_parameter<float>("global_search_temporal_min_score", 0.30);
     this->declare_parameter<int>("tracking_failures_before_global_search", 5);
+    this->declare_parameter<bool>("enable_nis", true);
+    this->declare_parameter<double>("nis_reject_threshold", 12.0);
+    this->declare_parameter<int>("nis_lost_streak", 8);
+    this->declare_parameter<double>("nis_prior_xy_std", 0.20);
+    this->declare_parameter<double>("nis_prior_yaw_std_deg", 8.0);
+    this->declare_parameter<int>("frontend_diverged_streak", 5);
+    this->declare_parameter<std::string>("pub_localization_status_topic", "localization_status");
     this->declare_parameter<std::string>("scan_input_frame_mode", "odom");
     this->declare_parameter<int>("scan_accumulate_frames", 1);
     this->declare_parameter<float>("scan_min_range", 0.0);
@@ -113,6 +122,8 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     gicp_max_iterations_first_ = this->get_parameter("gicp_max_iterations_first").as_int();
     gicp_max_iterations_track_ = this->get_parameter("gicp_max_iterations_track").as_int();
     enable_global_search_ = this->get_parameter("enable_global_search").as_bool();
+    global_search_max_map_odom_jump_ = static_cast<float>(std::max(
+        0.0, this->get_parameter("global_search_max_map_odom_jump").as_double()));
     global_search_config_.xy_step = std::max(
         0.1, this->get_parameter("global_search_xy_step").as_double());
     global_search_config_.max_candidates = static_cast<std::size_t>(std::max<int64_t>(
@@ -156,6 +167,15 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
         0.0f, 1.0f);
     tracking_recovery_ = fast_location::TrackingRecovery(static_cast<std::size_t>(std::max<int64_t>(
         1, this->get_parameter("tracking_failures_before_global_search").as_int())));
+    enable_nis_ = this->get_parameter("enable_nis").as_bool();
+    nis_reject_threshold_ = this->get_parameter("nis_reject_threshold").as_double();
+    nis_lost_streak_ = static_cast<int>(std::max<int64_t>(
+        1, this->get_parameter("nis_lost_streak").as_int()));
+    nis_prior_xy_std_ = std::max(1e-3, this->get_parameter("nis_prior_xy_std").as_double());
+    nis_prior_yaw_std_ = std::max(
+        1e-3, this->get_parameter("nis_prior_yaw_std_deg").as_double() * M_PI / 180.0);
+    frontend_diverged_streak_limit_ = static_cast<int>(std::max<int64_t>(
+        1, this->get_parameter("frontend_diverged_streak").as_int()));
     scan_input_frame_mode_ = this->get_parameter("scan_input_frame_mode").as_string();
     scan_accumulate_frames_ = this->get_parameter("scan_accumulate_frames").as_int();
     scan_min_range_ = this->get_parameter("scan_min_range").as_double();
@@ -231,6 +251,7 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
         map_publish_rate_hz_, localization_rate_hz_, publish_tf_ ? "true" : "false",
         publish_map_to_odometry_ ? "true" : "false");
 
+    loc_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     tf_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
     pub_pc_in_map = this->create_publisher<sensor_msgs::msg::PointCloud2>(pub_pc_in_map_topic, io_queue_size_);
@@ -241,6 +262,16 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     }
     pub_scan_downsampled = this->create_publisher<sensor_msgs::msg::PointCloud2>(pub_scan_downsampled_topic, io_queue_size_);
     pub_map_downsampled = this->create_publisher<sensor_msgs::msg::PointCloud2>(pub_map_downsampled_topic, io_queue_size_);
+    {
+        // 晚起的 MPC / 决策要立刻拿到最近一态，必须 latch。Humble 的 intra-process
+        // 只接受 volatile durability，所以 main() 不能开 use_intra_process_comms。
+        rclcpp::QoS status_qos(rclcpp::KeepLast(1));
+        status_qos.transient_local();
+        status_qos.reliable();
+        pub_localization_status_ = this->create_publisher<std_msgs::msg::String>(
+            this->get_parameter("pub_localization_status_topic").as_string(), status_qos);
+        publishIntegrityState(fast_location::IntegrityState::LOST, "waiting");
+    }
     if (publish_tf_) {
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     }
@@ -314,7 +345,8 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
 
     localization_timer = this->create_wall_timer(
         std::chrono::duration<double>(1.0 / localization_rate_hz_),
-        std::bind(&RobotLocalizationNode::locationThread, this)
+        std::bind(&RobotLocalizationNode::locationThread, this),
+        loc_callback_group_
     );
     if (publish_tf_) {
         tf_publish_timer = this->create_wall_timer(
@@ -335,20 +367,48 @@ void RobotLocalizationNode::locationThread()
         return;
     }
 
+    bool pending = false;
+    bool use_prior = false;
+    bool had_pose = false;
+    {
+        std::lock_guard<std::mutex> lock(tf_mutex_);
+        loc_tick_epoch_ = reloc_generation_;
+        pending = pending_global_result_valid_;
+        use_prior = use_pose_prior_;
+        had_pose = had_accepted_pose_;
+    }
+
     // 还没进入跟踪前，先做一次初始定位。
     if (!initialized_) {
         // 如果之前有一次全局搜索在等第二帧校验,先处理这个。
-        if (pending_global_result_valid_) {
+        if (pending) {
             initialized_ = verifyPendingGlobalResult();
             if (initialized_) {
                 RCLCPP_DEBUG(this->get_logger(), "Initial localization completed.");
             }
             return;
         }
-        if(!cur_scan_->empty())
+        bool scan_ready = false;
         {
-            initialized_ = enable_global_search_ ?
-                performGlobalSearch() : globalLocalization(initial_pcd_to_odom_);
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            scan_ready = cur_scan_ && !cur_scan_->empty();
+        }
+        if (scan_ready)
+        {
+            if (enable_global_search_ && !use_prior && had_pose) {
+                initialized_ = performGlobalSearch();
+            } else {
+                Eigen::Matrix4f birth_guess;
+                {
+                    std::lock_guard<std::mutex> lock(tf_mutex_);
+                    if (had_pose && !use_prior) {
+                        birth_guess = T_pcd_to_odom_;
+                    } else {
+                        birth_guess = initial_pcd_to_odom_;
+                    }
+                }
+                initialized_ = globalLocalization(birth_guess);
+            }
             if (initialized_) {
                 RCLCPP_DEBUG(this->get_logger(), "Initial localization completed.");
             }
@@ -533,8 +593,7 @@ bool RobotLocalizationNode::performGlobalSearch()
     }
 
     const float second_score = selected.size() > 1 ? selected[1].score : 0.0f;
-    if (selected.size() > 1 &&
-        selected.front().score - second_score < global_search_config_.minimum_score_margin)
+    if (fast_location::candidatesAreAmbiguous(selected, global_search_config_))
     {
         RCLCPP_WARN_THROTTLE(
             this->get_logger(), *this->get_clock(), 3000,
@@ -572,6 +631,17 @@ bool RobotLocalizationNode::performGlobalSearch()
     float best_fitness = 0.0f;
     Eigen::Matrix4f best_result = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f best_guess = selected.front().pcd_from_odom;
+    Eigen::Matrix4f previous_map_odom = Eigen::Matrix4f::Identity();
+    bool gate_map_odom_jump = false;
+    {
+        std::lock_guard<std::mutex> lock(tf_mutex_);
+        if (had_accepted_pose_ && global_search_max_map_odom_jump_ > 0.0f) {
+            previous_map_odom = T_pcd_to_odom_;
+            gate_map_odom_jump = true;
+        }
+    }
+    int skipped_jump = 0;
+    float best_jumped_fitness = 0.0f;
     for (const auto &candidate : selected) {
         // 只对少量高分候选做逐级精化。
         auto submap = gropGlobalMapInFOV(
@@ -597,6 +667,21 @@ bool RobotLocalizationNode::performGlobalSearch()
         const auto refined = runICP(
             scan_for_refine, submap, third,
             1.0f, gicp_max_iterations_first_, fitness);
+        if (gate_map_odom_jump &&
+            fast_location::mapOdomJumpExceeds(
+                previous_map_odom, refined, global_search_max_map_odom_jump_))
+        {
+            ++skipped_jump;
+            if (fitness > best_jumped_fitness) {
+                best_jumped_fitness = fitness;
+            }
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Global search skip: map→odom jump %.2f m > %.2f m (fitness=%.3f).",
+                fast_location::mapOdomXyJump(previous_map_odom, refined),
+                global_search_max_map_odom_jump_, fitness);
+            continue;
+        }
         if (fitness > best_fitness) {
             best_fitness = fitness;
             best_result = refined;
@@ -605,20 +690,34 @@ bool RobotLocalizationNode::performGlobalSearch()
     }
 
     if (best_fitness <= first_localization_th_) {
-        RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 3000,
-            "Global search refinement rejected: fitness %.3f <= %.3f.",
-            best_fitness, first_localization_th_);
+        if (skipped_jump > 0) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 3000,
+                "Global search refinement rejected: fitness %.3f <= %.3f | skipped %d far map→odom (best jumper fitness %.3f).",
+                best_fitness, first_localization_th_, skipped_jump, best_jumped_fitness);
+        } else {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 3000,
+                "Global search refinement rejected: fitness %.3f <= %.3f.",
+                best_fitness, first_localization_th_);
+        }
         return false;
     }
 
     if (enable_temporal_verification_) {
-        // 先把结果挂到 pending,等下一帧扫描再校验一次才算成功。
-        pending_global_result_valid_ = true;
-        pending_global_result_ = best_result;
-        pending_global_guess_ = best_guess;
-        pending_global_fitness_ = best_fitness;
-        // 要求下一次进 verify 时确实拿到新扫描,不复用同一帧。
+        {
+            std::lock_guard<std::mutex> lock(tf_mutex_);
+            if (reloc_generation_ != loc_tick_epoch_) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "Global search discarded: reloc generation changed before pending.");
+                return false;
+            }
+            pending_global_result_valid_ = true;
+            pending_global_result_ = best_result;
+            pending_global_guess_ = best_guess;
+            pending_global_fitness_ = best_fitness;
+        }
         has_new_scan_.store(false, std::memory_order_release);
         RCLCPP_INFO(
             this->get_logger(),
@@ -632,12 +731,23 @@ bool RobotLocalizationNode::performGlobalSearch()
 
 bool RobotLocalizationNode::verifyPendingGlobalResult()
 {
-    // 用一帧新扫描在最佳位姿附近打一次分,过阈值才真正接受。
-    if (!pending_global_result_valid_) {
-        return false;
+    Eigen::Matrix4f pending_result;
+    Eigen::Matrix4f pending_guess;
+    float pending_fitness = 0.0f;
+    {
+        std::lock_guard<std::mutex> lock(tf_mutex_);
+        if (!pending_global_result_valid_) {
+            return false;
+        }
+        if (reloc_generation_ != loc_tick_epoch_) {
+            pending_global_result_valid_ = false;
+            return false;
+        }
+        pending_result = pending_global_result_;
+        pending_guess = pending_global_guess_;
+        pending_fitness = pending_global_fitness_;
     }
     if (!has_new_scan_.exchange(false, std::memory_order_acq_rel)) {
-        // 还没等到新扫描,先不校验。
         return false;
     }
 
@@ -651,7 +761,7 @@ bool RobotLocalizationNode::verifyPendingGlobalResult()
     const float coarse_voxel = std::max(0.25f, scan_voxel_size_ * 2.0f);
     const auto coarse_scan = voxelDownSample(scan_for_verify, coarse_voxel);
     std::vector<fast_location::GlobalSearchCandidate> single{
-        {pending_global_result_, 0.0f}};
+        {pending_result, 0.0f}};
     const auto rechecked = fast_location::refineCandidateScores(
         *kdtree_global_map, coarse_scan, single, global_search_config_);
     const float verify_score = rechecked.empty() ? 0.0f : rechecked.front().score;
@@ -661,7 +771,7 @@ bool RobotLocalizationNode::verifyPendingGlobalResult()
             this->get_logger(),
             "Temporal verification rejected: score %.3f < %.3f. Retrying global search.",
             verify_score, temporal_verification_min_score_);
-        pending_global_result_valid_ = false;
+        abandonPendingGlobalResult();
         return false;
     }
 
@@ -669,12 +779,9 @@ bool RobotLocalizationNode::verifyPendingGlobalResult()
         this->get_logger(),
         "Temporal verification passed (score=%.3f). Accepting pending global result.",
         verify_score);
-    const Eigen::Matrix4f result = pending_global_result_;
-    const Eigen::Matrix4f guess = pending_global_guess_;
-    const float fitness = pending_global_fitness_;
-    pending_global_result_valid_ = false;
+    abandonPendingGlobalResult();
     return acceptLocalizationResult(
-        result, fitness, guess, scan_for_verify, start_time, true);
+        pending_result, pending_fitness, pending_guess, scan_for_verify, start_time, true);
 }
 
 bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess)
@@ -771,6 +878,19 @@ bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess
 
     if(fitness > th)
     {
+        if (!first_localization_ && enable_nis_ && !last_assessment_.is_degenerate) {
+            const auto nis = fast_location::computeScanToMapNis(
+                pose_guess, T_final, last_hessian_,
+                nis_prior_xy_std_, nis_prior_yaw_std_);
+            if (nis.valid && nis.value > nis_reject_threshold_) {
+                handleInconsistentObservation(nis.value);
+                degeneracy_recovery_ = false;
+                coarse_escape_ = false;
+                return false;
+            }
+        }
+        nis_conflict_streak_ = 0;
+        frontend_diverged_streak_ = 0;
         return acceptLocalizationResult(
             T_final, fitness, pose_guess, scan_for_icp, start_time, false);
     }
@@ -788,7 +908,23 @@ bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess
         degeneracy_recovery_ = false;
         coarse_escape_ = false;
         degenerate_streak_ = 0;
-        handleTrackingFailure();
+        if (last_assessment_.usable && !last_assessment_.is_degenerate &&
+            last_assessment_.condition_number > 0.0f) {
+            handleFrontendDiverged();
+        } else {
+            handleDirtyObservation();
+        }
+    } else {
+        // /initialpose 或 LOST 后的局部 ICP 失败原先直接 return，不会进 LOST，
+        // 召回永远不跑。有过接受位姿时记入 TrackingRecovery。
+        bool had_pose = false;
+        {
+            std::lock_guard<std::mutex> lock(tf_mutex_);
+            had_pose = had_accepted_pose_;
+        }
+        if (had_pose) {
+            handleTrackingFailure();
+        }
     }
     return false;
 
@@ -808,8 +944,25 @@ bool RobotLocalizationNode::acceptLocalizationResult(
     const bool recovered = degeneracy_recovery_ || coarse_escape_;
     degeneracy_recovery_ = false;
     coarse_escape_ = false;
+    Eigen::Matrix4f published_T = result;
+    bool jump_rejected = false;
+    float rejected_jump = 0.0f;
     {
         std::lock_guard<std::mutex> lock(tf_mutex_);
+        if (reloc_generation_ != loc_tick_epoch_) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Localization result discarded: reloc generation changed during this tick.");
+            return false;
+        }
+        // 不限全局搜索：/initialpose 局部 ICP 锁对面角也是一次 map→odom 大跳。
+        if (had_accepted_pose_ &&
+            fast_location::mapOdomJumpExceeds(
+                T_pcd_to_odom_, result, global_search_max_map_odom_jump_))
+        {
+            rejected_jump = fast_location::mapOdomXyJump(T_pcd_to_odom_, result);
+            jump_rejected = true;
+        } else {
         // EMA 平滑：防止定位更新在低频（0.5Hz）下产生 map→odom 的突变跳帧。
         // 借鉴 B（HWSentryNav26）的 odom_localizer 平滑策略；α=0.7 时每拍吸收
         // 70% 新结果，约 3 个更新周期（6s）完全收敛。
@@ -842,18 +995,33 @@ bool RobotLocalizationNode::acceptLocalizationResult(
         }
         T_pcd_to_odom_ = ema_transform_;
         tf_ready_ = true;
+        use_pose_prior_ = false;
+        had_accepted_pose_ = true;
+        published_T = T_pcd_to_odom_;
+        }
+    }
+    if (jump_rejected) {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Localization result discarded: map→odom jump %.2f m > %.2f m.",
+            rejected_jump, global_search_max_map_odom_jump_);
+        enterLost("map_odom_jump");
+        return false;
     }
     tracking_recovery_.recordSuccess();
+    publishIntegrityState(
+        fast_location::IntegrityState::OK,
+        last_degenerate_ ? "projected" : "accepted");
 
     const Eigen::Matrix4f map_from_odom =
-        fast_location::composeMapToOdom(map_from_pcd_, result);
-    const Eigen::Vector3f pcd_translation = result.block<3,1>(0,3);
+        fast_location::composeMapToOdom(map_from_pcd_, published_T);
+    const Eigen::Vector3f pcd_translation = published_T.block<3,1>(0,3);
     const Eigen::Vector3f map_translation = map_from_odom.block<3,1>(0,3);
     const Eigen::Quaternionf map_rotation(map_from_odom.block<3,3>(0,0));
-    const double pcd_yaw = std::atan2(result(1, 0), result(0, 0));
+    const double pcd_yaw = std::atan2(published_T(1, 0), published_T(0, 0));
     const double map_yaw = std::atan2(map_from_odom(1, 0), map_from_odom(0, 0));
     const float pose_shift =
-        (pcd_translation - pose_guess.block<3,1>(0,3)).norm();
+        (result.block<3,1>(0,3) - pose_guess.block<3,1>(0,3)).norm();
 
     if (hasPointCloudSubscribers(pub_pc_in_map)) {
         const auto scan_in_map = transformCloud(*scan_for_icp, map_from_odom);
@@ -874,17 +1042,8 @@ bool RobotLocalizationNode::acceptLocalizationResult(
     if (publish_map_to_odometry_ && pub_map_to_odometry) {
         pub_map_to_odometry->publish(odom_msg);
     }
-
-    if (publish_tf_ && tf_broadcaster_) {
-        geometry_msgs::msg::TransformStamped tf_msg;
-        tf_msg.header = odom_msg.header;
-        tf_msg.child_frame_id = base_frame_;
-        tf_msg.transform.translation.x = map_translation.x();
-        tf_msg.transform.translation.y = map_translation.y();
-        tf_msg.transform.translation.z = map_translation.z();
-        tf_msg.transform.rotation = odom_msg.pose.pose.orientation;
-        tf_broadcaster_->sendTransform(tf_msg);
-    }
+    // map→odom TF 只由 tf_publish_timer 发 EMA 后的 T_pcd_to_odom_，
+    // 这里不再另发未平滑的 result，避免与 50Hz 定时器抢同一对 frame。
 
     const auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::high_resolution_clock::now() - start_time).count();
@@ -920,25 +1079,122 @@ bool RobotLocalizationNode::acceptLocalizationResult(
     return true;
 }
 
+void RobotLocalizationNode::abandonPendingGlobalResult()
+{
+    std::lock_guard<std::mutex> lock(tf_mutex_);
+    pending_global_result_valid_ = false;
+}
+
+void RobotLocalizationNode::clearDownsampleCaches()
+{
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    scan_downsample_cache_.clear();
+    map_downsample_cache_.clear();
+}
+
+PointCloudXYZI::Ptr RobotLocalizationNode::cachedOrDownsample(
+    std::unordered_map<int, PointCloudXYZI::Ptr> & cache,
+    int scale_key,
+    const PointCloudXYZI::Ptr & cloud,
+    float voxel_size)
+{
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        const auto it = cache.find(scale_key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+    }
+    auto filtered = voxelDownSample(cloud, voxel_size);
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        const auto it = cache.find(scale_key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+        cache[scale_key] = filtered;
+    }
+    return filtered;
+}
+
+void RobotLocalizationNode::enterLost(const char * reason)
+{
+    initialized_ = false;
+    first_localization_ = true;
+    nis_conflict_streak_ = 0;
+    frontend_diverged_streak_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(tf_mutex_);
+        ++reloc_generation_;
+        tf_ready_ = false;
+        ema_initialized_ = false;
+        pending_global_result_valid_ = false;
+        use_pose_prior_ = false;
+        // 保留 T_pcd_to_odom_ 和 had_accepted_pose_：召回仍全场搜，
+        // 用上一拍 map→odom 限制跳变，对面角会跳 ~11m 被丢掉。
+    }
+    clearDownsampleCaches();
+    has_new_scan_.store(true, std::memory_order_release);
+    publishIntegrityState(fast_location::IntegrityState::LOST, reason);
+}
+
 void RobotLocalizationNode::handleTrackingFailure()
 {
     if (!tracking_recovery_.recordFailure()) {
         return;
     }
 
-    // 连续失败到阈值后，回退到全局搜索。
-    initialized_ = false;
-    first_localization_ = true;
-    {
-        std::lock_guard<std::mutex> lock(tf_mutex_);
-        tf_ready_ = false;
-    }
-    has_new_scan_.store(true, std::memory_order_release);
+    // 连续失败到阈值后，回退到全局搜索。不重置 small_glim。
     RCLCPP_WARN(
         this->get_logger(),
         "Tracking lost after %zu consecutive failures; returning to full global search.",
         tracking_recovery_.failureCount());
+    enterLost("tracking_lost");
 }
+
+void RobotLocalizationNode::publishIntegrityState(
+    fast_location::IntegrityState state, const char * reason)
+{
+    if (!pub_localization_status_) {
+        return;
+    }
+    std_msgs::msg::String msg;
+    msg.data = std::string(fast_location::integrityStateName(state)) + " " + reason;
+    pub_localization_status_->publish(msg);
+}
+
+void RobotLocalizationNode::handleInconsistentObservation(double nis)
+{
+    ++nis_conflict_streak_;
+    publishIntegrityState(fast_location::IntegrityState::OK, "nis_reject");
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "Scan-to-map NIS %.1f > %.1f (streak %d); holding map→odom.",
+        nis, nis_reject_threshold_, nis_conflict_streak_);
+    if (nis_conflict_streak_ >= nis_lost_streak_) {
+        enterLost("nis_lost");
+    }
+}
+
+void RobotLocalizationNode::handleFrontendDiverged()
+{
+    ++frontend_diverged_streak_;
+    publishIntegrityState(fast_location::IntegrityState::OK, "frontend_diverged");
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "Strong Hessian but poor match (streak %d); not resetting LIO.",
+        frontend_diverged_streak_);
+    if (frontend_diverged_streak_ >= frontend_diverged_streak_limit_) {
+        enterLost("frontend_diverged");
+    }
+}
+
+void RobotLocalizationNode::handleDirtyObservation()
+{
+    // Hessian 弱/退化时本拍不写 TF，也不记 TrackingRecovery。对外仍是 OK：锁还信上一拍。
+    publishIntegrityState(fast_location::IntegrityState::OK, "weak_obs");
+}
+
 
 
 
@@ -951,38 +1207,33 @@ Eigen::Matrix4f RobotLocalizationNode::runICP(PointCloudXYZI::Ptr src, PointClou
     {
         RCLCPP_ERROR(this->get_logger(), "Source or target point cloud is empty!");
         fitness_score = 0.0f;
+        last_assessment_ = {};
+        last_hessian_.setZero();
         return Eigen::Matrix4f::Identity();
     }
 
     auto downsample_start = std::chrono::high_resolution_clock::now();
 
-    // 用缓存避免重复下采样。缓存与 SubScan 回调（锁内 clear）共享，必须同样
-    // 在 data_mutex_ 内访问：旧实现 runICP 无锁读写，与 SubScan 并发 clear
-    // 同一 unordered_map 属于数据竞争，会破坏哈希表结构。
+    // 缓存与 SubScan 回调（锁内 clear）共享，必须同样在 data_mutex_ 内
+    // 读写哈希表。体素滤波本身在锁外做：全场搜索每级 cache miss 都可能
+    // 几十毫秒，锁住会卡住 SubScan 进缓冲（时序校验要新帧）。
     int scale_key = static_cast<int>(voxel_scale * 10);  // 转为整数键
 
-    PointCloudXYZI::Ptr src_filtered;
+    PointCloudXYZI::Ptr src_filtered = cachedOrDownsample(
+        scan_downsample_cache_, scale_key, src, scan_voxel_size_ * voxel_scale);
     PointCloudXYZI::Ptr tgt_filtered;
-    {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        if (scan_downsample_cache_.find(scale_key) != scan_downsample_cache_.end()) {
-            src_filtered = scan_downsample_cache_[scale_key];
-        } else {
-            src_filtered = voxelDownSample(src, scan_voxel_size_ * voxel_scale);
-            scan_downsample_cache_[scale_key] = src_filtered;
-        }
-
-        // 地图点云按尺度决定是否再下采样。
-        if (voxel_scale > 1.0) {
-            if (map_downsample_cache_.find(scale_key) != map_downsample_cache_.end()) {
-                tgt_filtered = map_downsample_cache_[scale_key];
-            } else {
-                tgt_filtered = voxelDownSample(tgt, map_voxel_size_ * voxel_scale);
-                map_downsample_cache_[scale_key] = tgt_filtered;
-            }
-        } else {
-            tgt_filtered = tgt;
-        }
+    if (voxel_scale > 1.0) {
+        tgt_filtered = cachedOrDownsample(
+            map_downsample_cache_, scale_key, tgt, map_voxel_size_ * voxel_scale);
+    } else {
+        tgt_filtered = tgt;
+    }
+    if (!src_filtered || src_filtered->empty() || !tgt_filtered || tgt_filtered->empty()) {
+        RCLCPP_ERROR(this->get_logger(), "Downsampled source or target point cloud is empty!");
+        fitness_score = 0.0f;
+        last_assessment_ = {};
+        last_hessian_.setZero();
+        return Eigen::Matrix4f::Identity();
     }
 
     auto downsample_end = std::chrono::high_resolution_clock::now();
@@ -1006,7 +1257,7 @@ Eigen::Matrix4f RobotLocalizationNode::runICP(PointCloudXYZI::Ptr src, PointClou
     }
 
     fast_gicp::FastGICP<Point, Point> gicp;
-    gicp.setNumThreads(gicp_num_threads_ > 0 ? gicp_num_threads_ : 4);
+    gicp.setNumThreads(gicp_num_threads_ > 0 ? gicp_num_threads_ : 2);
     gicp.setInputSource(src_filtered);
     gicp.setInputTarget(tgt_filtered);
     gicp.setMaximumIterations(max_iterations);
@@ -1019,6 +1270,7 @@ Eigen::Matrix4f RobotLocalizationNode::runICP(PointCloudXYZI::Ptr src, PointClou
     final_transformation = gicp.getFinalTransformation();
     // 6×6 Hessian（[rot, trans] 排序）是可观测性的直接来源，比点云空间分布准。
     const Eigen::Matrix<double, 6, 6> hessian = gicp.getFinalHessian();
+    last_hessian_ = hessian;
 
     auto gicp_end = std::chrono::high_resolution_clock::now();
     auto gicp_time = std::chrono::duration_cast<std::chrono::milliseconds>(gicp_end - gicp_start).count();
@@ -1027,6 +1279,8 @@ Eigen::Matrix4f RobotLocalizationNode::runICP(PointCloudXYZI::Ptr src, PointClou
     if (!final_transformation.allFinite())
     {
         fitness_score = 0.0f;
+        last_assessment_ = {};
+        last_hessian_.setZero();
         RCLCPP_WARN(this->get_logger(), "GICP returned a non-finite transformation.");
         return Eigen::Matrix4f::Identity();
     }
@@ -1037,10 +1291,12 @@ Eigen::Matrix4f RobotLocalizationNode::runICP(PointCloudXYZI::Ptr src, PointClou
         static_cast<float>(degenerate_condition_threshold_), &hessian);
     if (!assessment.usable) {
         fitness_score = 0.0f;
+        last_assessment_ = assessment;
         RCLCPP_WARN(this->get_logger(), "GICP returned no usable aligned cloud.");
         return Eigen::Matrix4f::Identity();
     }
     fitness_score = assessment.inlier_ratio;
+    last_assessment_ = assessment;
     // 记录本拍退化状态，供出洞检测（退化→正常的转变）在 acceptLocalizationResult 使用。
     last_degenerate_ = assessment.is_degenerate;
 
@@ -1407,18 +1663,40 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
         cur_scan_->clear();
         has_new_scan_.store(false, std::memory_order_release);
     }
+    bool far_prior = false;
+    float prior_jump = 0.0f;
     {
         std::lock_guard<std::mutex> lock(tf_mutex_);
+        ++reloc_generation_;
         initial_pcd_to_odom_ = pcd_from_odom;
-        T_pcd_to_odom_ = pcd_from_odom;
+        // 不改 T_pcd_to_odom_：跳变门要上一拍真值。把错误 /initialpose 写进去
+        // 会让对面角变成「0 跳变」被局部 ICP 接受，召回永远不会发生。
         tf_ready_ = false;
+        ema_initialized_ = false;
+        pending_global_result_valid_ = false;
+        far_prior = had_accepted_pose_ &&
+            fast_location::mapOdomJumpExceeds(
+                T_pcd_to_odom_, pcd_from_odom, global_search_max_map_odom_jump_);
+        if (far_prior) {
+            prior_jump = fast_location::mapOdomXyJump(T_pcd_to_odom_, pcd_from_odom);
+        }
+        use_pose_prior_ = !far_prior;
     }
+    clearDownsampleCaches();
     initial_pose_received_.store(true, std::memory_order_release);
-    // 唤醒定位线程。
     first_localization_ = true;
-    // 用户重新指定初始位姿,丢弃之前挂起的全局搜索结果。
-    pending_global_result_valid_ = false;
+    initialized_ = false;
 
+    if (far_prior) {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Initial pose map→odom jump %.2f m > %.2f m; ignoring seed and entering LOST recall.",
+            prior_jump, global_search_max_map_odom_jump_);
+        enterLost("pose_prior_jump");
+        return;
+    }
+
+    publishIntegrityState(fast_location::IntegrityState::OK, "pose_prior");
     RCLCPP_INFO(this->get_logger(), "Initial pose received, reset to multi-scale mode.");
 }
 
@@ -1549,14 +1827,43 @@ void RobotLocalizationNode::publishGlobalMap()
 
 RobotLocalizationNode::~RobotLocalizationNode()
 {
-
+    if (localization_timer) {
+        localization_timer->cancel();
+    }
+    if (tf_publish_timer) {
+        tf_publish_timer->cancel();
+    }
+    if (map_publish_timer) {
+        map_publish_timer->cancel();
+    }
+    {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        scan_downsample_cache_.clear();
+        map_downsample_cache_.clear();
+        scan_buffer_.clear();
+        if (cur_scan_) {
+            cur_scan_->clear();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(tf_mutex_);
+        tf_ready_ = false;
+        ema_initialized_ = false;
+        pending_global_result_valid_ = false;
+        use_pose_prior_ = false;
+        ++reloc_generation_;
+    }
 }
 
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
+    // Humble intra-process 只接受 volatile durability。localization_status 必须
+    // transient_local（晚起的 MPC/决策 latch 最近一态），开了会在 create_publisher
+    // 抛 invalid_argument 并 abort —— RViz 里就只剩地图、没有 map 系。
+    // 本节点是独立进程，也不订自己的话题，intra-process 本来没有收益。
     rclcpp::NodeOptions node_options;
-    node_options.use_intra_process_comms(true);
+    node_options.use_intra_process_comms(false);
     auto node = std::make_shared<RobotLocalizationNode>(node_options);
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
     executor.add_node(node);

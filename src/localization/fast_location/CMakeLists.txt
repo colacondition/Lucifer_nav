@@ -17,6 +17,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED)
@@ -75,6 +76,7 @@ ament_target_dependencies(robot_localization_node
   sensor_msgs
   nav_msgs
   geometry_msgs
+  std_msgs
   tf2_ros
   pcl_conversions
   fast_gicp
@@ -118,6 +120,14 @@ if(BUILD_TESTING)
     test/frame_transforms_test.cpp
   )
   target_include_directories(frame_transforms_test PRIVATE
+    include
+    ${PCL_INCLUDE_DIRS}
+  )
+
+  ament_add_gtest(alignment_quality_test
+    test/alignment_quality_test.cpp
+  )
+  target_include_directories(alignment_quality_test PRIVATE
     include
     ${PCL_INCLUDE_DIRS}
   )

@@ -83,7 +83,7 @@ class StandaloneDecisionLaunchTest(unittest.TestCase):
         self.assertEqual(
             [(node.node_package, node.node_executable) for node in nodes],
             [
-                ("waypoint_editor", "waypoint_follow_executor"),
+                ("waypoint_editor", "waypoint_executor"),
                 ("decision", "bt_action_replacement_node"),
             ],
         )

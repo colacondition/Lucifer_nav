@@ -15,6 +15,8 @@ MPC 控制器、隧道云台请求、云台可视化等）编进同一个 shared
 用 `rclcpp_components` 注册，全部加载进一个固定线程数容器。Humble 下
 `/map`、costmap、云台等 latch 话题是 `transient_local`，不能开 intra-process；
 感知容器里的 volatile 点云才走进程内指针投递。
+线程预算按 8 核写死：LIO 2、定位 GICP 2、导航容器 2、感知 executor 1、剩余 1。
+linefit 用 OpenMP 静态分片，不要再自建线程池或每帧 `std::thread` spawn/join。
 全局规划用 A*，在 `OccupancyGrid` 上构建 2D 距离场做 clearance cost 让路径远离障碍；
 `/plan` 交给 MPC 控制器跟踪（接近减速并在本节点内完成），控制器内含弧长进度跟踪、卡住检测、
 倒车与安全点脱困恢复链和速度剖面。
@@ -32,7 +34,7 @@ Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /L
                                                  ▼     ▼
                                         navigation2 (A* + 距离场 + MPC + 接近段)
                                            │
-        /cmd_vel_nav ──► velocity_smoother ──► /cmd_vel
+        /cmd_vel_nav ──► velocity_smoother（限幅）──► /cmd_vel
                              ──► fake_vel_transform（同容器）──► /cmd_vel_chassis ──► 底盘 / Gazebo
 ```
 
@@ -47,6 +49,7 @@ Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /L
 | `/Laser_map_dense` | `PointCloud2` | small_glim 给 fast_location 的定位稠密点云（更细下采样，`world` 系） |
 | `/map` | `OccupancyGrid` | 先验栅格地图 |
 | `/goal_pose` | `PoseStamped` | 导航目标 |
+| `/localization_status` | `String` | fast_location 二态 `OK/LOST` + reason；仅 `LOST` 让 MPC 停车、决策冻下发 |
 | `/plan` `/predict_path` | `Path` | 全局路径 / MPC 预测轨迹 |
 | `/cmd_vel_chassis` | `Twist` | 最终底盘速度 |
 | `/gimbal_posture` | `GimbalPosture` | 云台收/放请求（rm_tunnel_posture → 电控 / 仿真模拟器） |
@@ -173,6 +176,7 @@ sudo ldconfig
 | :- | :- | :- |
 | `world` | `RMUL` | 需与 `map/<world>.*`、`PCD/<world>.pcd` 同名 |
 | `mode` | `nav` | `mapping` 建图 / `nav` 导航 |
+| `mapping_nav` | `False` | 仅 `mode:=mapping` 时有效。`True` 时建图同时开导航栈（SLAM-navigation）；默认只起 slam_toolbox + small_glim |
 | `nav_rviz` | 仿真 `True`，实车 `False` | 启动 RViz，配置按 `mode` 自动选 |
 | `gazebo_gui` | `True` | 仿真专有 |
 | `software_rendering` | `False` | 无 GPU 时置 `True`，避免 RViz/Gazebo 段错误 |
@@ -194,6 +198,12 @@ mapping 模式同时跑两条链、产出两张图，nav 模式各用一张：
 
 ```sh
 ros2 launch bringup sim.launch.py world:=RMUL mode:=mapping nav_rviz:=True
+```
+
+默认只建图（slam_toolbox 出栅格、small_glim 出 PCD），不开导航栈。要边建边导航：
+
+```sh
+ros2 launch bringup sim.launch.py world:=RMUL mode:=mapping mapping_nav:=True nav_rviz:=True
 ```
 
 ```sh
@@ -263,6 +273,10 @@ MPC 只在「请求收、实测还高」时停车等云台到位；出洞请求�
 ros2 launch bringup sim.launch.py  world:=RMUL mode:=nav nav_rviz:=True
 ros2 launch bringup real.launch.py world:=RMUL mode:=nav
 ```
+
+定位锁在 `/localization_status`（`OK <reason>` / `LOST <reason>`）。仅 `LOST` 让
+MPC 停车、决策冻航点；`OK nis_reject` 仍走。远处 2D Pose Estimate 应立刻变成
+`LOST pose_prior_jump`。
 
 ### 4.4 实车雷达配置（mid360_driver）
 

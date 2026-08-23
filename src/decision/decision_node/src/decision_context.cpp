@@ -1,5 +1,6 @@
 #include "decision/decision_context.hpp"
 
+#include <string>
 #include <utility>
 
 namespace decision
@@ -18,6 +19,11 @@ void DecisionContext::setGameStatus(
   const decision_interfaces::msg::GameStatus & msg, double stamp_sec)
 {
   game_status_ = TimedGameStatus{msg, stamp_sec};
+}
+
+void DecisionContext::setLocalizationStatus(const std::string & payload)
+{
+  localization_status_payload_ = payload;
 }
 
 std::optional<int> DecisionContext::effectiveCurrentHp() const
@@ -54,6 +60,22 @@ std::optional<decision_interfaces::msg::GameStatus> DecisionContext::gameStatus(
   }
 
   return game_status_->msg;
+}
+
+bool DecisionContext::hasLocalizationStatus() const
+{
+  return localization_status_payload_.has_value();
+}
+
+bool DecisionContext::localizationLost() const
+{
+  return localization_status_payload_.has_value() &&
+    integrityStateIsLost(*localization_status_payload_);
+}
+
+std::string DecisionContext::localizationStatusPayload() const
+{
+  return localization_status_payload_.value_or(std::string{});
 }
 
 CombatAssessment DecisionContext::combatAssessment() const

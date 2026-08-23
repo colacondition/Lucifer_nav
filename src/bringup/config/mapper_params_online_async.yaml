@@ -1,9 +1,8 @@
 # slam_toolbox 建图参数（mode:=mapping 时由 real/sim launch 加载）。
 # 整份搬自 HL_navigation_27：那边实车/仿真两份 diff 为空，所以这里只留一份共用。
 # 输入是 pointcloud_to_laserscan 从去地面障碍点云转出的 /scan；odom->base_link
-# 由 small_glim 提供（odom->lidar_odom 静态恒等 + lidar_odom->base_link 动态，
-# 见 config/*/small_glim_*.yaml 的 enable_tf_publish），slam_toolbox 在其上发布
-# map->odom 并维护 /map 占据栅格。
+# 由 small_glim 直接广播（odometry_frame_id: odom，enable_tf_publish: true），
+# slam_toolbox 在其上发布 map->odom 并维护 /map 占据栅格。
 slam_toolbox:
   ros__parameters:
 

@@ -233,19 +233,19 @@ rm_local_costmap:
     # （5m×5m@0.05 约 1 万格，仍 <2ms）。未开启时 MINCO 障碍项与梯度倒车静默失效。
     distance_field_enable: true
 
-# 速度平滑器：对上游指令做限幅 + 平滑，输出最终 /cmd_vel。车「一顿一顿」或
-# 「起步/刹车太猛」优先查这里。
+# 速度平滑器：最后一道限幅（夹速度、死区、输入超时归零），与 MPC 同频。
+# 加减速斜坡在 MPC speed_profile，这里不再改写时间剖面。
 rm_velocity_smoother:
   ros__parameters:
     use_sim_time: true
     input_cmd_vel_topic: /cmd_vel_nav
     output_cmd_vel_topic: /cmd_vel
-    smoothing_frequency: 20.0   # 平滑器输出频率（Hz）
+    smoothing_frequency: 30.0   # 与 MPC control_fps 对齐；定时器只做超时归零
     velocity_timeout: 0.5       # 输入超时（s）：超过此时长无输入即归零停车
     max_velocity: [2.0, 2.0, 3.0]     # 速度上限 [x, y, yaw]（m/s, rad/s）
     min_velocity: [-2.0, -2.0, -3.0]  # 速度下限（负值 = 允许倒车/反向转）
-    max_accel: [4.0, 4.0, 6.0]        # 加速度上限 [x, y, yaw]（m/s², rad/s²）
-    max_decel: [-4.0, -4.0, -6.0]     # 减速度上限（负值，越负刹车越急）
+    max_accel: [4.0, 4.0, 6.0]        # 仍声明以免旧配置报未声明；当前不做斜坡
+    max_decel: [-4.0, -4.0, -6.0]
     deadband_velocity: [0.0, 0.0, 0.0]  # 死区：绝对值小于此值强制归零（抑制微抖）
 
 rm_nav2_compat:
@@ -330,18 +330,18 @@ rm_mpc_controller:
     speed_profile.sample_spacing: 0.10      # 剖面采样间距（m）
     speed_profile.curvature_window: 3       # 曲率平滑窗（样本数，双侧）
     speed_profile.stop_at_goal: true        # 终点是否减速至零
-    # 指令链路反馈。本节点发布的指令仍会被 rm_velocity_smoother 限幅、并在输入
-    # 超时后归零。所以「是否真的有指令」必须以链路末端的实测值为准。
-    # rm_velocity_smoother 以 smoothing_frequency(20 Hz) 无条件定频发布，所以
-    # 此话题静默代表它已经死了，而不是「本来就没有指令」，会单独报警。
-    feedback.executed_cmd_topic: /cmd_vel
-    feedback.executed_cmd_timeout: 0.3   # 超过此时长未收到即视为链路断开（s）
-    feedback.override_detect_time: 1.0   # 本节点发速度但末端恒为零持续多久报警（s）
+    # 卡住检测喂本节点上一拍下发的速率，不再反读 /cmd_vel。平滑器只限幅，
+    # 下游改写不再是热路径上的第二套控制。
     # 云台收放。rm_tunnel_posture 在进洞前把 posture_topic 置真，serial_driver 把电控
     # 回传的实测姿态发到 posture_state_topic。请求「收下来」而实测还没变成「低」时，本
     # 节点停车等 —— 云台立着进洞会撞在顶板上，停着等的代价只是不动。
     gimbal.posture_topic: /gimbal_posture
     gimbal.posture_state_topic: /gimbal_posture_state
+    # 定位完整性门。只订 fast_location 的 localization_status：LOST 停车等重定位，
+    # 不进恢复链（倒车同样按坏 map 位姿算）。OK（含握住 TF / 走廊投影）不停。
+    # 没收到过消息时不拦 —— mapping_nav 不起 fast_location，缺省停车会把建图导航停死。
+    integrity_gate.enable: true
+    integrity_gate.topic: /localization_status
     # 多假设弧长进度跟踪。替代原来的全路径最近点扫描：回绕路径上最近点会在
     # 两个弧长相差很远、空间距离接近的位置间跳变，且进度可回退。
     # 跟踪丢失沿用上面的 max_track_error，只是改为需要持续超限 lost_grace_time。

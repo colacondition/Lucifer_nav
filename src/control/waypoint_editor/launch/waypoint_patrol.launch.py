@@ -42,10 +42,15 @@ def generate_launch_description():
 
     waypoint_patrol_node = Node(
         package='waypoint_editor',
-        executable='waypoint_patrol_executor',
+        executable='waypoint_executor',
         name='waypoint_patrol_executor',
         output=node_output,
         parameters=[{
+            'mode': 'patrol',
+            'service_name': 'start_waypoint_through',
+            'action_name': '/waypoint_editor/through_waypoints',
+            'executor_status_topic': '/waypoint_editor/through_status',
+            'status_timeout': 20.0,
             'waypoint_file': waypoint_file,
             'frame_id': frame_id,
             'goal_topic': goal_topic,

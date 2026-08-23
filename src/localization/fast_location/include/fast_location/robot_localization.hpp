@@ -2,31 +2,30 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <builtin_interfaces/msg/time.hpp>
-#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
-#include <pcl/registration/icp.h>
-#include <pcl/registration/gicp.h>
 #include <pcl/common/transforms.h>
-#include <fast_gicp/gicp/fast_gicp.hpp>
 #include <Eigen/Dense>
 #include <chrono>
 #include <atomic>
+#include <cstdint>
 #include <deque>
-#include <condition_variable>
+#include <mutex>
 #include <unordered_map>
 #include "fast_location/frame_transforms.hpp"
 #include "fast_location/global_search.hpp"
+#include "fast_location/alignment_quality.hpp"
 using Point = pcl::PointXYZI;
 using PointCloudXYZI = pcl::PointCloud<Point>;
 
@@ -75,6 +74,18 @@ private:
         const std::chrono::high_resolution_clock::time_point &start_time,
         bool global_search_result);
     void handleTrackingFailure();
+    void enterLost(const char * reason);
+    void abandonPendingGlobalResult();
+    void clearDownsampleCaches();
+    PointCloudXYZI::Ptr cachedOrDownsample(
+        std::unordered_map<int, PointCloudXYZI::Ptr> & cache,
+        int scale_key,
+        const PointCloudXYZI::Ptr & cloud,
+        float voxel_size);
+    void publishIntegrityState(fast_location::IntegrityState state, const char * reason);
+    void handleInconsistentObservation(double nis);
+    void handleFrontendDiverged();
+    void handleDirtyObservation();
     bool loadGlobalMap(const std::string &pcd_file_path);
     PointCloudXYZI::Ptr voxelDownSample(PointCloudXYZI::Ptr cloud, float voxel_size);
     PointCloudXYZI::Ptr gropGlobalMapInFOV(
@@ -120,8 +131,11 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_init_pose_covariance;
     
     rclcpp::TimerBase::SharedPtr map_publish_timer;  // 定时器
-    rclcpp::TimerBase::SharedPtr localization_timer;  
+    rclcpp::TimerBase::SharedPtr localization_timer;
     rclcpp::TimerBase::SharedPtr tf_publish_timer;
+    // 定位与 TF 各占 executor 一条线程；订阅留在默认组，
+    // 全场搜索占住定位周期时 SubScan 仍能进缓冲（时序校验要新帧）。
+    rclcpp::CallbackGroup::SharedPtr loc_callback_group_;
     rclcpp::CallbackGroup::SharedPtr tf_callback_group_;
     pcl::KdTreeFLANN<Point>::Ptr kdtree_global_map;
 
@@ -172,23 +186,46 @@ private:
     bool publish_tf_ = true; // 是否发布 map->odom TF
     bool publish_map_to_odometry_ = false; // 是否发布 map_to_odometry 里程计话题
     bool use_cuda_ = false;      // 是否启用 GPU 加速
-    int gicp_num_threads_ = 0;   // 预留参数：GICP 线程数
+    int gicp_num_threads_ = 2;   // 8-core budget; 0 in YAML still falls back to 2
     bool enable_global_search_ = true;
     float global_search_refine_radius_ = 12.0f;
     // 精化阶段(ICP)使用的堆积帧数;粗搜仍用主 scan。<=1 表示不额外堆积。
     int global_search_refine_accumulate_ = 3;
     // 全局搜索通过后,是否再用下一帧扫描做一次一致性校验。
-    bool enable_temporal_verification_ = false;
+    bool enable_temporal_verification_ = true;
     // 一致性校验时,新扫描在最佳位姿附近的最低得分。
     float temporal_verification_min_score_ = 0.30f;
     fast_location::GlobalSearchConfig global_search_config_;
     fast_location::TrackingRecovery tracking_recovery_{5};
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_localization_status_;
+    fast_location::AlignmentAssessment last_assessment_{};
+    Eigen::Matrix<double, 6, 6> last_hessian_{Eigen::Matrix<double, 6, 6>::Zero()};
+    bool enable_nis_{true};
+    double nis_reject_threshold_{12.0};
+    int nis_lost_streak_{8};
+    double nis_prior_xy_std_{0.20};
+    double nis_prior_yaw_std_{0.139626};
+    int frontend_diverged_streak_limit_{5};
+    int nis_conflict_streak_{0};
+    int frontend_diverged_streak_{0};
 
     // 一致性校验暂存的待接受结果。仅在 enable_temporal_verification_ 为真时使用。
-    std::atomic<bool> pending_global_result_valid_{false};
+    bool pending_global_result_valid_{false};
     Eigen::Matrix4f pending_global_result_ = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f pending_global_guess_ = Eigen::Matrix4f::Identity();
     float pending_global_fitness_ = 0.0f;
+    // loc 回调组独占；每个 locationThread 拍开头从 reloc_generation_ 拷一份。
+    uint64_t loc_tick_epoch_{0};
+    // 与 pending/T_pcd_to_odom_ 同属 tf_mutex_。subInitPose / enterLost 自增后，
+    // 在飞的搜索不得把旧结果写进 map→odom。
+    uint64_t reloc_generation_{0};
+    // 操作员给了近处 /initialpose：下一拍走该先验的多尺度 ICP，不跑全场网格。
+    // 相对上一拍跳变过大则不置位，直接 LOST 召回。
+    bool use_pose_prior_{false};
+    // acceptLocalizationResult 成功过一次。enterLost 不清：召回仍全场搜，
+    // 但用上一拍 T_pcd_to_odom_ 限制 map→odom 跳变；开机没有这个位姿，走出生点局部 ICP。
+    bool had_accepted_pose_{false};
+    float global_search_max_map_odom_jump_{4.0f};
     std::string scan_input_frame_mode_ = "odom"; // 源点云所在坐标系: odom/base
     int scan_accumulate_frames_ = 1;   // 源点云堆积帧数
     float scan_min_range_ = 0.0f;   // 源点云最小距离（米）

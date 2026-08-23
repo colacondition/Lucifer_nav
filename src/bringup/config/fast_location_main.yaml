@@ -83,22 +83,15 @@
     gicp_max_iterations_track: 70   # 跟踪阶段 GICP 最大迭代次数
 
     # ========== 全局重定位参数 ==========
-    # 出生点固定，不需要全场搜索。全场搜索是纯暴力撒点 + 最近邻命中率打分、
-    # 没有任何出生先验，在对称场地（RMUL 两角几何相似）会以一定概率误锁到对角。
-    #
-    # 关掉后，出生定位走 globalLocalization(initial_pcd_to_odom)：初始猜测是
-    # 单位阵 = PCD 原点 = 出生点。成立的前提是 small_glim 的 world 原点锚在
-    # 开机雷达平面，且建图（mapping）和小跑（nav）都从同一个固定出生点起，
-    # 于是 PCD 原点就是出生点。多尺度 ICP 从出生点局部收敛，对角的候选离得
-    # 很远、根本不会被评估到，也就不会跳对角。
-    #
-    # 代价：跟踪丢失后 handleTrackingFailure 把 initialized 置回 false，下一拍
-    # 不再全场重定位，而是从出生点（单位阵）重新做局部 ICP —— 车离出生点远时
-    # 可能收不回来。要恢复「被抱走后全场重定位」，再把这个开关打开。
-    enable_global_search: false
+    # 开机保证在家：走出生点局部 ICP。LOST 仍全场网格搜索；接受时
+    # map→odom XY 相对上一拍不能超过 max_map_odom_jump（默认 4m）。
+    # RMUL 对面角约 11m，跳过去会被丢掉。margin + 时序仍在。
+    # 跳变门配 0 关闭。不加线程、不重置 small_glim。
+    enable_global_search: true
     global_search_xy_step: 2.0
     global_search_max_candidates: 2000000  # 候选硬上限：飞点/大图时自动加大步长防止 OOM
     global_search_yaw_step_deg: 30.0
+    global_search_max_map_odom_jump: 4.0
     global_search_score_distance: 0.45
     global_search_score_stride: 4
     global_search_top_k: 6
@@ -112,14 +105,24 @@
     global_search_refine_score_stride: 1
     # 精化 ICP 阶段用最近 N 帧堆积起来,提高稳定性;粗搜仍用主 scan。
     global_search_refine_accumulate_frames: 3
-    # 全局搜索通过后,再用下一帧扫描做一致性校验才真正接受。对称场地建议打开。
-    global_search_enable_temporal_verification: false
+    # 全局搜索通过后,再用下一帧扫描做一致性校验才真正接受。对称场地必须打开。
+    global_search_enable_temporal_verification: true
     global_search_temporal_min_score: 0.30
     tracking_failures_before_global_search: 5
+    enable_nis: true
+    nis_reject_threshold: 12.0
+    nis_lost_streak: 8
+    nis_prior_xy_std: 0.20
+    nis_prior_yaw_std_deg: 8.0
+    frontend_diverged_streak: 5
+    # 对外二态 OK/LOST + reason；下游只认 LOST。
+    pub_localization_status_topic: "localization_status"
 
     # ========== 坐标系配置 ==========
     map_frame: "map"             # 地图坐标系（TF父）
     base_frame: "odom"           # fast_location发布的TF子frame (map→odom)
     pc_in_map_frame: "map"       # pc_in_map统一发布到map；其他值会回退为map_frame
     map_z_offset: 0.0            # Z轴偏移补偿（仿真地面厚度，实车为0）
-    # pcd_to_map_pose 可由 launch 显式传入 [x, y, yaw]；未传入时使用单位对齐，不读取 map_start_pose
+    # PCD 与 nav 语义图各自独立：定位只读 PCD，导航只读 map/<world>.msgpack。
+    # 不读 occupancy yaml，也不用 map_start_pose。需要对齐时由 launch 传入
+    # pcd_to_map_pose [x, y, yaw]；缺省单位阵。
