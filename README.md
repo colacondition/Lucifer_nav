@@ -17,6 +17,12 @@ MPC 控制器、隧道云台请求、云台可视化等）编进同一个 shared
 感知容器里的 volatile 点云才走进程内指针投递。
 线程预算按 8 核写死：LIO 2、定位 GICP 2、导航容器 2、感知 executor 1、剩余 1。
 linefit 用 OpenMP 静态分片，不要再自建线程池或每帧 `std::thread` spawn/join。
+
+坐标与电控契约：导航把整车抽象成一个可直接在平面平移的“虚拟云台”；本工程中的
+`base_link` 表示该导航云台（正 X 与雷达/云台正方向一致），不是物理轮组底盘朝向。
+MPC 只计算世界系 XY 平移并转到云台系下发；物理底盘小陀螺、云台到底盘的坐标转换、
+全向轮解算、力控和功率控制均由电控完成。不要在导航侧再引入轮速融合或重复底盘变换。
+
 全局规划用 A*，在 `OccupancyGrid` 上构建 2D 距离场做 clearance cost 让路径远离障碍；
 `/plan` 交给 MPC 控制器跟踪（接近减速并在本节点内完成），控制器内含弧长进度跟踪、卡住检测、
 倒车与安全点脱困恢复链和速度剖面。
@@ -24,13 +30,13 @@ linefit 用 OpenMP 静态分片，不要再自建线程池或每帧 `std::thread
 数据流：
 
 ```text
-Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /Laser_map, /Laser_map_dense
-              │      ▲
-              │      └── /livox/imu
-              └─► cpp_lidar_filter ──► linefit_ground_segmentation
+Mid360 点云 ──► small_glim ◄── /livox/imu
+                         ├─► /Odometry、/lio/robo/odom、/Laser_map
+                         └─► /small_glim/deskewed_cloud（唯一权威实时云）
+                         ├─► fast_location ──(map→odom)──┐
+                         └─► cpp_lidar_filter ──► linefit │
                                             └─► /segmentation/obstacle
                                                        │
-/Laser_map_dense ──► fast_location ──(map→odom)──┐     │
                                                  ▼     ▼
                                         navigation2 (A* + 距离场 + MPC + 接近段)
                                            │
@@ -43,7 +49,8 @@ Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /L
 | Topic | Type | 说明 |
 | :- | :- | :- |
 | `/livox/lidar/pointcloud` | `PointCloud2` | 雷达点云（mid360_driver 实车 / 仿真插件统一发这条，不再有 CustomMsg） |
-| `/segmentation/obstacle` | `PointCloud2` | 地面分割后的障碍点，代价地图输入 |
+| `/small_glim/deskewed_cloud` | `PointCloud2` | small_glim 唯一权威实时云：scan-start逐点去畸变、`odom` 系；fast_location与实时感知共同消费 |
+| `/segmentation/obstacle` | `PointCloud2` | 权威去畸变云经车身过滤和地面分割后的障碍点，代价地图唯一在线输入 |
 | `/Odometry` | `Odometry` | small_glim 里程计（`/lio/robo/odom` 内容相同，供 fast_location） |
 | `/Laser_map` | `PointCloud2` | small_glim 世界系点云（odometry 下采样帧，`world` 系，供可视化/调试） |
 | `/Laser_map_dense` | `PointCloud2` | small_glim 给 fast_location 的定位稠密点云（更细下采样，`world` 系） |
@@ -59,6 +66,10 @@ Mid360 点云 ──┬─► small_glim ──► /Odometry, /lio/robo/odom, /L
 ## 二. 代码结构
 
 ```text
+src/bringup/config/common                         实车/仿真共用的完整运行参数真源
+src/bringup/config/reality                      仅实车差异（驱动网络、外参、传感器高度等）
+src/bringup/config/simulation                   仅仿真差异（外参、IMU单位、模拟器参数等）
+src/bringup/config/README.md                    参数覆盖规则与维护约定
 src/bringup                                  总启动，仿真/实车两套 launch 与 config
 src/driver/mid360_driver                     Mid360 自研驱动（实车，被动收 UDP 推流）
 src/driver/livox_ros_driver2                 Livox 官方驱动（实车不再启动，保留给仿真

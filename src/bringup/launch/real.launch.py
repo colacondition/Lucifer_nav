@@ -1,4 +1,3 @@
-import glob
 import os
 import yaml
 
@@ -22,7 +21,6 @@ from launch.substitutions import (
 from launch_ros.actions import ComposableNodeContainer, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableNode
 from launch_ros.parameter_descriptions import ParameterValue
-from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -69,19 +67,22 @@ def generate_launch_description():
         ' rpy:=', launch_params['base_link2livox_frame']['rpy'],
     ])
 
-    # 导航参数唯一真源在 navigation2 包的 params/navigation2.yaml（launch 默认值同源）。
-    navigation_params = os.path.join(
-        get_package_share_directory('navigation2'), 'params', 'navigation2.yaml')
-    fast_location_params = os.path.join(bringup_dir, 'config', 'fast_location_main.yaml')
-    seg_params = os.path.join(bringup_dir, 'config', 'reality', 'segmentation_real.yaml')
-    # slam_toolbox 建图参数，实车/仿真共用一份（HL 的 real/sim 两份 diff 为空）。
-    mapper_params = os.path.join(bringup_dir, 'config', 'mapper_params_online_async.yaml')
-    # small_glim 的参数分两层：包内 config/params_*.yaml 是全量默认值（glob 加载，
-    # 与上游 launch 的行为一致），bringup 的 small_glim_real.yaml 只放实车差异项。
-    small_glim_default_params = sorted(glob.glob(os.path.join(
-        get_package_share_directory('small_glim'), 'config', 'params_*.yaml')))
-    small_glim_params = os.path.join(
-        bringup_dir, 'config', 'reality', 'small_glim_real.yaml')
+    # 运行期参数唯一权威源：先加载 common，再加载 reality 覆盖。
+    common_config_dir = os.path.join(bringup_dir, 'config', 'common')
+    reality_config_dir = os.path.join(bringup_dir, 'config', 'reality')
+    navigation_params = os.path.join(common_config_dir, 'navigation2.yaml')
+    fast_location_params = os.path.join(common_config_dir, 'fast_location.yaml')
+    fast_location_env_params = os.path.join(reality_config_dir, 'fast_location.yaml')
+    seg_params = os.path.join(common_config_dir, 'segmentation.yaml')
+    seg_env_params = os.path.join(reality_config_dir, 'segmentation.yaml')
+    mapper_params = os.path.join(common_config_dir, 'mapper.yaml')
+    lidar_filter_params = os.path.join(common_config_dir, 'lidar_filter.yaml')
+    cloud_to_scan_params = os.path.join(common_config_dir, 'pointcloud_to_laserscan.yaml')
+    waypoint_executor_params = os.path.join(common_config_dir, 'waypoint_executor.yaml')
+    decision_params = os.path.join(common_config_dir, 'decision.yaml')
+    serial_driver_params = os.path.join(reality_config_dir, 'serial_driver.yaml')
+    small_glim_common_params = os.path.join(common_config_dir, 'small_glim.yaml')
+    small_glim_params = os.path.join(reality_config_dir, 'small_glim_real.yaml')
     mid360_driver_params = os.path.join(
         bringup_dir, 'config', 'reality', 'mid360_driver_real.yaml')
     # 与 sim.launch.py 保持一致：mapping 模式没有 map 帧，用专门的 mapping.rviz
@@ -166,14 +167,15 @@ def generate_launch_description():
         arguments=common_log_arguments)
 
     # ===== 3. small_glim (里程计 + 建图) =====
-    # 话题名（/Odometry、/lio/robo/odom、/Laser_map）直接在包内 params_node.yaml
-    # 里按本工作区契约配置，无需 remap。参数顺序有意义：后面的覆盖前面的。
+    # small_glim 完整运行参数来自 bringup common，reality 文件只覆盖实车差异。
+    # 话题、frame、线程预算均不再从包内 params_*.yaml 隐式继承。
     lio_node = Node(
         respawn=True, respawn_delay=2.0,  # LIO 崩溃自愈（无状态，重启重新初始化）
         package='small_glim',
         executable='small_glim_node',
         output='log',
-        parameters=small_glim_default_params + [
+        parameters=[
+            small_glim_common_params,
             small_glim_params,
             {
                 'use_sim_time': use_sim_time,
@@ -230,19 +232,12 @@ def generate_launch_description():
                 'cpp_lidar_filter::LidarFilterNode',
                 'lidar_filter',
                 'cpp_lidar_filter',
-                [{
-                    'use_sim_time': use_sim_time,
-                    'input_topic': '/livox/lidar/pointcloud',
-                    'output_topic': '/livox/lidar_filtered/pointcloud',
-                    'navigation_frame': 'base_link',
-                    'navigation_range': 10.0,
-                    'leaf_size': 0.06,
-                }]),
+                [lidar_filter_params, {'use_sim_time': use_sim_time}]),
             perception_component(
                 'linefit_ground_segmentation::SegmentationNode',
                 'ground_segmentation',
                 'linefit_ground_segmentation_ros',
-                [seg_params, {'use_sim_time': use_sim_time}]),
+                [seg_params, seg_env_params, {'use_sim_time': use_sim_time}]),
         ]
 
     # 容器每次退出（崩溃被 respawn 或正常退出）都重新调度组件加载。Humble 的
@@ -276,23 +271,7 @@ def generate_launch_description():
             ('cloud_in', '/segmentation/obstacle'),
             ('scan', '/scan'),
         ],
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            # 投影到底盘系：侧倾时仍输出重力对齐的 2D 扫描（同 HL 的做法）。
-            'target_frame': 'base_link',
-            'transform_tolerance': 0.05,
-            'min_height': 0.05,
-            'max_height': 1.2,
-            'angle_min': -3.14159,
-            'angle_max': 3.14159,
-            'angle_increment': 0.0043,
-            'scan_time': 0.3333,
-            'range_min': 0.45,
-            'range_max': 10.0,
-            'use_inf': True,
-            'inf_epsilon': 1.0,
-            'queue_size': 10,
-        }],
+        parameters=[cloud_to_scan_params, {'use_sim_time': use_sim_time}],
         arguments=common_log_arguments)
 
     slam_mapping_node = Node(
@@ -313,24 +292,10 @@ def generate_launch_description():
         name='robot_localization_node',
         output='screen',
         additional_env=system_libusb_env,
-        # 基线参数来自 config/fast_location_main.yaml；下面的字典只覆盖实车
-        # 特有项（PCD 路径按 world 拼接、话题重映射、按算力收紧的体素/线程数）。
-        # 顺序有意义：后面的条目覆盖前面的。
-        parameters=[fast_location_params, {
+        # common 完整参数后加载 reality 覆盖；动态路径/时钟保留在 launch。
+        parameters=[fast_location_params, fast_location_env_params, {
             'use_sim_time': use_sim_time,
             'map_pcd_path': fast_location_pcd_path,
-            'sub_scan_topic': '/Laser_map_dense',
-            # 实车算力有限：体素放粗、线程收到 2，牺牲一点精度换实时性。
-            'scan_voxel_size': 0.20,
-            'submap_voxel_size_first': 0.20,
-            'submap_voxel_size_track': 0.35,
-            'fov_far': 12.0,
-            # 与 fast_location_main.yaml 保持一致：10Hz 雷达每帧都做一次 ICP。
-            # 实车若单帧 GICP 超 100ms，改回 5.0 并降低 gicp 迭代/堆叠帧数。
-            'localization_rate_hz': 10.0,
-            'gicp_num_threads': 2,
-            # 全局地图只给 RViz 看，实车压到 0.2Hz 省带宽。
-            'map_publish_rate_hz': 0.2,
         }],
         arguments=['--ros-args', '--log-level', 'info'])
 
@@ -370,12 +335,9 @@ def generate_launch_description():
         executable='waypoint_executor',
         name='waypoint_follow_executor',
         output=node_output,
-        parameters=[{
+        parameters=[waypoint_executor_params, {
             'use_sim_time': use_sim_time,
             'waypoint_file': waypoint_file,
-            'goal_topic': '/goal_pose',
-            'status_topic': '/navigation2/status',
-            'saved_waypoint_file_topic': '/waypoint_editor/saved_waypoint_file',
         }],
         arguments=common_log_arguments)
 
@@ -385,6 +347,7 @@ def generate_launch_description():
             os.path.join(serial_driver_launch_dir, 'serial_driver.launch.py')),
         condition=IfCondition(use_serial_driver),
         launch_arguments={
+            'params_file': serial_driver_params,
             'log_level': log_level,
             'node_output': node_output,
         }.items())
@@ -393,10 +356,9 @@ def generate_launch_description():
     # 这里直接起节点而不 include decision.launch.py：后者会再起一个
     # waypoint_follow_executor，和上面第 8 节的重复。
     #
-    # decision 的路径一律走 FindPackageShare 而非 get_package_share_directory：
-    # 后者在构建 LaunchDescription 时就会解析，未安装 decision 时即使
-    # use_decision:=False 也会抛异常，把整条导航链带崩。
-    decision_share = FindPackageShare('decision')
+    # decision 的完整静态参数由 bringup common 提供；未安装 decision 时条件为 false，
+    # Node 动作不会启动。
+    # decision 的完整静态参数在 bringup common；路径按运行 world 动态覆盖。
     decision_waypoint_files = {
         f'targets.{target}_waypoint_file': PathJoinSubstitution(
             [bringup_dir, 'config', 'waypoints', 'RMUL', f'{target}.csv'])
@@ -411,8 +373,7 @@ def generate_launch_description():
         output=node_output,
         # yaml 的根键是 bt_action_replacement，必须与上面的 name 一致才生效。
         parameters=[
-            PathJoinSubstitution(
-                [decision_share, 'config', 'bt_action_replacement.yaml']),
+            decision_params,
             {'use_sim_time': use_sim_time},
             decision_waypoint_files,
         ],

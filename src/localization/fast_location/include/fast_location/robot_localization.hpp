@@ -44,7 +44,11 @@ private:
     std::mutex tf_mutex_;
     PointCloudXYZI::Ptr global_map_{std::make_shared<PointCloudXYZI>()};
     PointCloudXYZI::Ptr cur_scan_{std::make_shared<PointCloudXYZI>()};
+    builtin_interfaces::msg::Time cur_scan_stamp_;
+    nav_msgs::msg::Odometry cur_scan_odom_;
+    bool cur_scan_has_synced_odom_{false};
     nav_msgs::msg::Odometry::SharedPtr cur_odom_{std::make_shared<nav_msgs::msg::Odometry>()};
+    std::deque<nav_msgs::msg::Odometry> odom_history_;
     Eigen::Matrix4f T_pcd_to_odom_{Eigen::Matrix4f::Identity()};
     Eigen::Matrix4f initial_pcd_to_odom_{Eigen::Matrix4f::Identity()};
     // 默认使用代码内置零位姿作为初始位姿
@@ -230,6 +234,9 @@ private:
     int scan_accumulate_frames_ = 1;   // 源点云堆积帧数
     float scan_min_range_ = 0.0f;   // 源点云最小距离（米）
     float scan_max_range_ = 0.0f;   // 源点云最大距离（米，<=0表示不限制）
+    bool scan_odom_sync_enable_{true};
+    double scan_odom_sync_max_delta_{0.03};
+    std::size_t odom_history_size_{32};
     std::string map_frame_;     // 地图坐标系
     std::string base_frame_;    // 机器人/雷达坐标系
     std::string pc_in_map_frame_;  // pc_in_map 对外统一使用 map_frame
@@ -244,6 +251,10 @@ private:
     // 性能优化相关
     std::unordered_map<int, PointCloudXYZI::Ptr> scan_downsample_cache_;  // 扫描点云下采样缓存
     std::unordered_map<int, PointCloudXYZI::Ptr> map_downsample_cache_;   // 地图点云下采样缓存
+    // SubScan 每次交换 cur_scan_ 后递增。锁外体素滤波回写时必须仍匹配该代次/源指针，
+    // 防止旧扫描A的迟到结果污染新扫描B的共享cache。
+    uint64_t scan_cache_generation_{0};
+    const PointCloudXYZI * scan_cache_source_{nullptr};
     sensor_msgs::msg::PointCloud2 global_map_msg_;
     bool global_map_msg_ready_ = false;
 };

@@ -49,6 +49,9 @@ public:
 
     FrameType frame_type; ///< Coordinate center type of $frame
     gtsam_points::PointCloud::ConstPtr frame; ///< Deskewed points for state estimation
+    // true only when every retained point was deskewed to scan stamp using a complete IMU trajectory.
+    // Initial frame and failed/saturated deskew frames must not be published as authoritative perception.
+    bool deskew_valid{false};
 };
 
 }

@@ -1,5 +1,6 @@
 #include <small_glim/preprocess/cloud_deskewing.hpp>
 #include <small_glim/common/logger.hpp>
+#include <algorithm>
 #include <gtsam/geometry/Pose3.h>
 
 namespace small_glim {
@@ -79,8 +80,10 @@ std::vector<Eigen::Vector4d> CloudDeskewing::deskew(
         return points;
     }
 
-    if (imu_poses.empty()) {
-        return deskew(T_imu_lidar, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), times, points);
+    if (imu_poses.empty() || imu_times.size() != imu_poses.size() ||
+        !std::isfinite(stamp) || !std::isfinite(imu_times.front()) ||
+        imu_times.front() > stamp + 1e-6) {
+        return {};
     }
 
     const double time_eps = 1e-4;
@@ -100,40 +103,51 @@ std::vector<Eigen::Vector4d> CloudDeskewing::deskew(
     const Eigen::Isometry3d T_lidar_imu = T_imu_lidar.inverse();
     std::vector<Eigen::Isometry3d> T_lidar0_lidar1(time_table.size());
 
-    size_t imu_cursor = 0;
-    Eigen::Isometry3d T_imu0_world; // IMU pose at the very beginning of the scan
+    // 绝对时间轨迹插值。区间外 fail-closed，不把缺失 IMU 数据静默钳到端点；exact hit
+    // 直接返回对应姿态，避免 '<' 游标在边界仍使用旧区间。
+    auto pose_at = [&](const double query, Eigen::Isometry3d & pose) -> bool {
+        if (!std::isfinite(query) || query < imu_times.front() - 1e-9 ||
+            query > imu_times.back() + 1e-9) {
+            return false;
+        }
+        const auto upper = std::lower_bound(imu_times.begin(), imu_times.end(), query);
+        if (upper == imu_times.end()) {
+            pose = imu_poses.back();
+            return std::abs(query - imu_times.back()) <= 1e-9;
+        }
+        const size_t right = static_cast<size_t>(upper - imu_times.begin());
+        if (std::abs(*upper - query) <= 1e-9 || right == 0) {
+            pose = imu_poses[right];
+            return true;
+        }
+        const size_t left = right - 1;
+        const double dt = imu_times[right] - imu_times[left];
+        if (!(dt > 0.0) || !std::isfinite(dt)) {
+            return false;
+        }
+        const double p = (query - imu_times[left]) / dt;
+        const Eigen::Quaterniond ql(imu_poses[left].linear());
+        const Eigen::Quaterniond qr(imu_poses[right].linear());
+        pose = Eigen::Isometry3d::Identity();
+        pose.translation() =
+            (1.0 - p) * imu_poses[left].translation() + p * imu_poses[right].translation();
+        pose.linear() = ql.slerp(p, qr).normalized().toRotationMatrix();
+        return pose.matrix().allFinite();
+    };
+
+    Eigen::Isometry3d T_world_imu0;
+    if (!pose_at(stamp, T_world_imu0)) {
+        return {};
+    }
+    const Eigen::Isometry3d T_imu0_world = T_world_imu0.inverse();
 
     // Calculate T_lidar0_lidar1 for each time in time table
     for (size_t i = 0; i < time_table.size(); i++) {
         const double time = stamp + time_table[i];
-
-        while (imu_cursor < imu_times.size() - 1 && imu_times[imu_cursor + 1] < time) {
-            imu_cursor++;
+        Eigen::Isometry3d T_world_imu1;
+        if (!pose_at(time, T_world_imu1)) {
+            return {};
         }
-
-        if (i == 0) {
-            // Should interpolate?
-            T_imu0_world = imu_poses[imu_cursor].inverse();
-        }
-
-        Eigen::Isometry3d T_world_imu1 = Eigen::Isometry3d::Identity();
-        if (imu_cursor + 1 >= imu_times.size()) {
-            T_world_imu1 = imu_poses[imu_cursor];
-        } else {
-            const double imu_t0 = imu_times[imu_cursor];
-            const double imu_t1 = imu_times[imu_cursor + 1];
-
-            const double p = std::max(0.0, std::min(1.0, (time - imu_t0) / (imu_t1 - imu_t0)));
-
-            const Eigen::Vector3d imu_trans_l = imu_poses[imu_cursor].translation();
-            const Eigen::Vector3d imu_trans_r = imu_poses[imu_cursor + 1].translation();
-            const Eigen::Quaterniond imu_quat_l(imu_poses[imu_cursor].linear());
-            const Eigen::Quaterniond imu_quat_r(imu_poses[imu_cursor + 1].linear());
-
-            T_world_imu1.translation() = (1.0 - p) * imu_trans_l + p * imu_trans_r;
-            T_world_imu1.linear() = imu_quat_l.slerp(p, imu_quat_r).toRotationMatrix();
-        }
-
         const Eigen::Isometry3d T_imu0_imu1 = T_imu0_world * T_world_imu1;
         T_lidar0_lidar1[i] = T_lidar_imu * T_imu0_imu1 * T_imu_lidar;
     }

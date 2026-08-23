@@ -22,9 +22,21 @@ struct MincoOptimizer::Impl
   std::vector<Eigen::Vector2d> waypoints_;
   std::vector<int> opt_indices_;
 
+  // Objective 热循环工作区：按 piece_num_ 在 optimize() 入口 resize 一次，cost() 只覆写
+  // 和 setZero，不再为每次 line-search evaluation 创建多组 Eigen 堆对象。
+  Eigen::VectorXd full_x_cache_;
+  Eigen::Matrix2Xd in_ps_cache_;
+  Eigen::Matrix2Xd energy_grad_cache_;
+  Eigen::VectorXd energy_time_grad_cache_;
+  Eigen::MatrixX2d partial_coeff_grad_cache_;
+  Eigen::MatrixX2d adj_coeff_grad_cache_;
+  Eigen::VectorXd partial_time_grad_cache_;
+  Eigen::Matrix2Xd point_grad_cache_;
+  Eigen::VectorXd full_grad_cache_;
+
   Impl()
   {
-    lbfgs_params_.mem_size = 256;
+    lbfgs_params_.mem_size = 32;
     lbfgs_params_.past = 20;
     lbfgs_params_.min_step = 1e-32;
     lbfgs_params_.g_epsilon = 2.0e-7;
@@ -155,6 +167,11 @@ struct MincoOptimizer::Impl
       return 0.0;
     }
     const int M = piece_num_ + 1;  // 总点数（含首尾）
+    const auto point_at = [&](int k) -> Eigen::Vector2d {
+        if (k == 0) return waypoints_.front();
+        if (k == M - 1) return waypoints_.back();
+        return in_ps.col(k - 1);
+      };
     double cost_val = 0.0;
     double c_cost = 0.0;
 
@@ -179,7 +196,20 @@ struct MincoOptimizer::Impl
       kahan_sum(cost_val, c_cost, w * margin * margin);
       // dcost/dp = -2w(safe-d) * grad。grad 指向远离障碍，距离越近代价越高，
       // 所以梯度沿 -grad 方向（把点往远离障碍推）。
-      const Eigen::Vector2d g = -2.0 * w * margin * grad;
+      Eigen::Vector2d g = -2.0 * w * margin * grad;
+      if (params_.obstacle_normal_only) {
+        // 以相邻路标的几何方向近似该点轨迹切向；端点用单侧差分。仅投影 soft
+        // 障碍梯度，距离值和发布前硬安全检查不变。
+        Eigen::Vector2d tangent = Eigen::Vector2d::Zero();
+        if (k == 0 && M > 1) tangent = point_at(1) - point_at(0);
+        else if (k == M - 1 && M > 1) tangent = point_at(M - 1) - point_at(M - 2);
+        else if (k > 0 && k + 1 < M) tangent = point_at(k + 1) - point_at(k - 1);
+        const double tangent_norm = tangent.norm();
+        if (tangent_norm > 1e-9) {
+          tangent /= tangent_norm;
+          g -= g.dot(tangent) * tangent;
+        }
+      }
       if (!g.allFinite()) {
         continue;
       }
@@ -201,7 +231,7 @@ struct MincoOptimizer::Impl
 
     double cost_val = 0.0;
 
-    Eigen::VectorXd full_x(2 * ctrl_num);
+    auto & full_x = instance->full_x_cache_;
 
     for (int i = 0; i < ctrl_num; i++) {
       full_x(i) = instance->waypoints_[i + 1].x();
@@ -214,7 +244,7 @@ struct MincoOptimizer::Impl
       full_x(i + ctrl_num) = x(k + opt_num);
     }
 
-    Eigen::Matrix2Xd in_ps(2, ctrl_num);
+    auto & in_ps = instance->in_ps_cache_;
     in_ps.row(0) = full_x.head(ctrl_num).transpose();
     in_ps.row(1) = full_x.segment(ctrl_num, ctrl_num).transpose();
 
@@ -222,11 +252,13 @@ struct MincoOptimizer::Impl
 
     double energy = 0.0;
 
-    Eigen::Matrix2Xd energy_grad = Eigen::Matrix2Xd::Zero(2, ctrl_num);
-    Eigen::VectorXd energyT_grad = Eigen::VectorXd::Zero(ctrl_num + 1);
+    auto & energy_grad = instance->energy_grad_cache_;
+    energy_grad.setZero();
+    auto & energyT_grad = instance->energy_time_grad_cache_;
+    energyT_grad.setZero();
 
-    Eigen::MatrixX2d partial_grad_by_coeffs;
-    Eigen::VectorXd partial_grad_by_times;
+    auto & partial_grad_by_coeffs = instance->partial_coeff_grad_cache_;
+    auto & partial_grad_by_times = instance->partial_time_grad_cache_;
 
     instance->minco_.getEnergyPartialGradByCoeffs(partial_grad_by_coeffs);
     instance->minco_.getEnergyPartialGradByTimes(partial_grad_by_times);
@@ -236,16 +268,18 @@ struct MincoOptimizer::Impl
       partial_grad_by_coeffs,
       partial_grad_by_times,
       energy_grad,
-      energyT_grad);
+      energyT_grad,
+      instance->adj_coeff_grad_cache_);
 
-    Eigen::Matrix2Xd gradp = energy_grad;
+    auto & gradp = instance->point_grad_cache_;
+    gradp = energy_grad;
 
     cost_val += energy;
     cost_val += instance->attach_penalty_functional(in_ps, gradp);
     cost_val += instance->attach_axis_functional(in_ps, gradp);
     cost_val += instance->attach_obstacle_functional(in_ps, gradp);
 
-    Eigen::VectorXd g_full(2 * ctrl_num);
+    auto & g_full = instance->full_grad_cache_;
     g_full.setZero();
 
     g_full.segment(0, ctrl_num) = gradp.row(0).transpose();
@@ -272,11 +306,11 @@ struct MincoOptimizer::Impl
       return {};
     }
 
-    piece_num_ = waypoints.size() - 1;
-    if (segment_times.size() != piece_num_) {
+    piece_num_ = static_cast<int>(waypoints.size()) - 1;
+    if (segment_times.size() != static_cast<std::size_t>(piece_num_)) {
       RCLCPP_ERROR(
         rclcpp::get_logger("minco_optimizer"),
-        "segment_times size mismatch: expected %zu, got %zu",
+        "segment_times size mismatch: expected %d, got %zu",
         piece_num_, segment_times.size());
       return {};
     }
@@ -304,6 +338,17 @@ struct MincoOptimizer::Impl
     minco_.setConditions(head_state, tail_state, piece_num_, Eigen::Vector2d(w_smooth, w_smooth));
 
     const int ctrl_num = piece_num_ - 1;
+    // 一条 optimize 调用内维度固定；预先准备 objective 的所有动态矩阵。Eigen resize
+    // 在尺寸不变时复用容量，第二阶段同路标数也直接复用第一阶段工作区。
+    full_x_cache_.resize(2 * ctrl_num);
+    in_ps_cache_.resize(2, ctrl_num);
+    energy_grad_cache_.resize(2, ctrl_num);
+    energy_time_grad_cache_.resize(ctrl_num + 1);
+    partial_coeff_grad_cache_.resize(6 * piece_num_, 2);
+    adj_coeff_grad_cache_.resize(6 * piece_num_, 2);
+    partial_time_grad_cache_.resize(piece_num_);
+    point_grad_cache_.resize(2, ctrl_num);
+    full_grad_cache_.resize(2 * ctrl_num);
 
     opt_indices_.clear();
     for (int i = 0; i < ctrl_num; ++i) {
@@ -383,6 +428,8 @@ MincoOptimizer::~MincoOptimizer() = default;
 void MincoOptimizer::setParams(const Params & params)
 {
   impl_->params_ = params;
+  impl_->lbfgs_params_.mem_size = std::clamp(params.lbfgs_memory_size, 4, 128);
+  impl_->lbfgs_params_.max_iterations = std::max(1, params.max_iterations);
 }
 
 void MincoOptimizer::setTunnelAxisQuery(

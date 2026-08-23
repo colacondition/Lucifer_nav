@@ -4,7 +4,6 @@
     # small_glim 自动生成伪时间戳）和 /livox/imu（gazebo_ros_imu_sensor）
     node:
       acc_scale: 1.0           # 仿真 IMU 输出 m/s²（含重力），无需缩放
-      enable_tf_publish: true  # 广播动态 odom -> base_link
     sensors:
       # URDF：imu_link 在 base+[0.12,0,0.125]，livox 在 base+[0.12,0,0.175] ⇒ IMU 在雷达系下方 0.05m
       T_lidar_imu: [0.0, 0.0, -0.05, 0.0, 0.0, 0.0, 1.0]

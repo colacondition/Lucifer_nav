@@ -1,0 +1,3 @@
+simulated_gimbal:
+  ros__parameters:
+    action_delay: 0.5

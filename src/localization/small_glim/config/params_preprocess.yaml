@@ -1,3 +1,4 @@
+# 开发兜底（非运行期权威）：bringup 使用 config/common/small_glim_*.yaml + 环境覆盖。
 /**:
   ros__parameters:
     preprocess:
@@ -5,7 +6,7 @@
       distance_far_thresh: 30.0 # Points out of this range will be filtered out (lidar frame)
       use_random_grid_downsampling: false # If false, use the conventional voxelgrid downsampling
       downsample_resolution: 0.05 # Voxel grid resolution for downsampling
-      localization_downsample_resolution: 0.05 # Finer voxel for the /Laser_map_dense localization cloud (<=0 disables it)
+      localization_downsample_resolution: 0.05 # Voxel for authoritative /small_glim/deskewed_cloud (<=0 disables it)
       random_downsample_target: 10000 # Target number of points for voxel-based random sampling (Enabled when > 0)
       random_downsample_rate: 0.1 # Sampling rate for voxel-based random sampling (Enabled when target <= 0)
       enable_outlier_removal: false # If true, enable statistical outlier removal

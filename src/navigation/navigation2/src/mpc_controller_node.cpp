@@ -332,6 +332,11 @@ public:
     mp.max_accel = declare_parameter<double>("max_accel", 1.0);
     mp.turtle_max_speed = declare_parameter<double>("turtle_max_speed", 1.0);
     mp.Q = declare_parameter<std::vector<double>>("Q", std::vector<double>{15.0, 15.0});
+    mp.path_frame_weighting = declare_parameter<bool>("tracking_frame_weights.enable", false);
+    mp.tangential_weight = declare_parameter<double>("tracking_frame_weights.tangential", 6.0);
+    mp.lateral_weight = declare_parameter<double>("tracking_frame_weights.lateral", 24.0);
+    mp.min_tangent_speed = declare_parameter<double>(
+      "tracking_frame_weights.min_tangent_speed", 0.05);
     mp.R = declare_parameter<std::vector<double>>("R", std::vector<double>{0.1, 0.1});
     mp.Rd = declare_parameter<std::vector<double>>("Rd", std::vector<double>{1.0, 0.05});
     // 参数非法时回退到安全默认值而不是把节点带崩：负 steps 会在 configure()

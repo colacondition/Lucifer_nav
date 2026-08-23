@@ -2,6 +2,10 @@
 
 `navigation2` 是泓龙哨兵导航工程的 ROS 2 导航系统。系统采用地图服务、全局规划、代价地图、路径平滑、MPC 局部控制、速度平滑和 RViz 兼容 action 的模块化链路，提供从目标点接收到速度指令输出的完整导航能力。
 
+本工程利用全向轮与电控侧坐标解耦，把整车建模为可直接平移的二维“虚拟导航云台”：
+`base_link` 的正 X 是云台/雷达正方向，XY MPC 不估计物理轮组底盘 yaw；电控负责小陀螺、
+云台到底盘的坐标变换和轮组执行。该约定是模型定义，不是缺失的 SE(2) 状态。
+
 各节点均注册为 ROS 2 Component，默认组合到一个固定线程数容器中运行。Humble 下 latch 话题不能开 intra-process。系统借鉴 Nav2 的链路划分和常用话题接口，但不依赖完整 `nav2_bringup`、BT Navigator 或 lifecycle manager。
 
 
@@ -21,9 +25,9 @@
 - `rm_map_server_node`：读取 `map/<world>.msgpack` 语义地图并发布 `/map`（占据栅格由 `terrain` 通道的 OBSTACLE 格推导；隧道等「能站但要摆姿态才能进」的先验在另一张语义通道里，不参与 /map 占据判定）。
 - `rm_global_planner_node`：订阅 `/goal_pose` 和 `/map`，生成 `/plan_raw`。含规划失败冷却、路径发布前验收和规划代次校验。
 - `rm_global_costmap_node`：订阅 `/map` 和 `/segmentation/obstacle`，发布全局代价地图。
-- `rm_minco_path_smoother_node`：用 MINCO L-BFGS 平滑 `/plan_raw` 并发布 `/plan`，详见 `MINCO_README.md`。
+- `rm_minco_path_smoother_node`：用 MINCO L-BFGS 平滑 `/plan_raw` 并发布 `/plan`；段时间采用距离 + 转角固定预分配，障碍距离使用进程内 Signed ESDF 的二次插值梯度，详见 `MINCO_README.md`。
 - `rm_local_costmap_node`：基于 `/segmentation/obstacle` 点云构建滚动局部代价地图。
-- `rm_mpc_controller_node`：使用 OSQP 跟踪路径，发布 `/cmd_vel_nav` 和 `/predict_path`。内置接近减速、多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）和弧长域速度剖面。订阅 `/localization_status`：仅 `LOST` 停车等重定位、不进恢复链；`OK`（含 `nis_reject` 握住 TF、`projected` 走廊投影）不停；没收到过消息时不拦（`mapping_nav` / 测试）。
+- `rm_mpc_controller_node`：使用 OSQP 跟踪路径，发布 `/cmd_vel_nav` 和 `/predict_path`。位置代价可按轨迹切向/法向旋转，优先压低窄通道横向误差，同时保持二维虚拟云台模型。内置接近减速、多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）和弧长域速度剖面。订阅 `/localization_status`：仅 `LOST` 停车等重定位、不进恢复链；`OK`（含 `nis_reject` 握住 TF、`projected` 走廊投影）不停；没收到过消息时不拦（`mapping_nav` / 测试）。
 - `rm_velocity_smoother_node`：将 `/cmd_vel_nav` 限幅为 `/cmd_vel`（夹速度、死区、输入超时归零；不加减速斜坡）。
 - `fake_vel_transform`：同容器内将 `/cmd_vel` 转为底盘执行话题 `/cmd_vel_chassis`。
 - `rm_nav2_compat_node`：提供 `/navigate_to_pose` action，把 RViz Nav2 Goal 转成 `/goal_pose`。
@@ -80,6 +84,12 @@ path_acceptance_max_cost: 100
 ```
 
 MPC 使用 `/local_costmap/costmap` 对求解后的预测运动逐段做碰撞检查。地图缺失、过期、越界或预测路径命中障碍时，控制器发布零线速度，并通过 `/navigation2/replan_request` 通知全局规划器立即重规划。相关参数位于 `rm_mpc_controller.local_safety.*`，求解和路径参考代码位于 `src/mpc`。
+
+几何权威关系：语义 `msgpack` 是先验真源；A* 只读全局代价图并按内容缓存自己的
+clearance EDT；在线 Signed ESDF 只由 `rm_local_costmap` 从同帧局部代价图生成，经
+`DistanceFieldRegistry` 只读提供给 MINCO soft cost 和恢复方向。MINCO/MPC 不各自重建
+ESDF，也不发布第二张几何地图。局部 ESDF 的 seeds、两次 EDT 输出和抛物线工作区在
+固定地图尺寸下复用容量，避免 10 Hz 热路径反复分配。
 
 ### 执行层：进度跟踪与恢复链
 

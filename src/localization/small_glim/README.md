@@ -2,7 +2,7 @@
 
 LIO 里程计 + 建图包（GLIM 的因子图精简版）。吃 Mid360 的 `/livox/lidar/pointcloud`
 和 `/livox/imu`，用 **GTSAM ISAM2 固定滞后平滑 + IMU 预积分 + GICP/iVox** 估计位姿，
-输出 `/Odometry`、`/lio/robo/odom`（供 fast_location）、`/Laser_map`（odometry 下采样点云）、`/Laser_map_dense`（供 fast_location 的定位稠密点云），
+输出 `/Odometry`、`/lio/robo/odom`（供 fast_location）、`/Laser_map`（odometry 下采样调试云）和 `/small_glim/deskewed_cloud`（定位与实时感知共用的唯一权威去畸变云），
 并广播动态 `odom→base_link` TF。
 
 ```text
@@ -104,10 +104,10 @@ ros2 launch bringup sim.launch.py  world:=RMUL mode:=mapping nav_rviz:=True
 | :- | :- | :- |
 | `/livox/lidar/pointcloud` | 订阅 | 雷达点云（仿真插件无逐点时间戳 → 自动伪时间戳） |
 | `/livox/imu` | 订阅 | IMU |
-| `/Odometry` | 发布 | 里程计，child=base_link 实为雷达位姿（super_lio 约定），MPC 消费；高频补帧开启时为传播流，否则与 `/lio/robo/odom` 同内容 |
+| `/Odometry` | 发布 | 虚拟导航云台里程计（历史 frame 名为 `base_link`，正 X 与云台/雷达正方向一致，不表示物理轮组底盘 yaw）；高频补帧开启时为传播流，否则与 `/lio/robo/odom` 同内容 |
 | `/lio/robo/odom` | 发布 | 始终 10Hz 雷达校正流，供 fast_location（与 `/Laser_map_dense` 同源同步） |
 | `/Laser_map` | 发布 | odometry 下采样点云（可视化/调试），frame=`odom` |
-| `/Laser_map_dense` | 发布 | 给 fast_location 的定位稠密点云（更细下采样，独立于 odometry 分辨率），frame=`odom` |
+| `/small_glim/deskewed_cloud` | 发布 | 唯一权威实时点云：与对应 EstimationFrame 严格配对，逐点统一到 scan stamp 并发布到 `odom`；fast_location 与 filter→LineFit 感知链共同消费，避免一条已deskew、一条原始扭曲 |
 | `/small_glim/ivox_cloud` | 发布 | 调试用 iVox 目标点云 |
 
 TF：动态 `odom→base_link`（`enable_tf_publish` 时）；odom 原点 z 锚在开机雷达

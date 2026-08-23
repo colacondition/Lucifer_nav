@@ -373,7 +373,8 @@ private:
     }
 
     const auto age = (now() - rclcpp::Time(stamp, get_clock()->get_clock_type())).seconds();
-    return age <= observation_timeout_;
+    // 未来时间戳同样拒绝：负 age 不是“更新鲜”，而是传感器/仿真时钟契约错误。
+    return std::isfinite(age) && age >= 0.0 && age <= observation_timeout_;
   }
 
   bool hasFreshObservation()
@@ -1165,17 +1166,16 @@ private:
     if (inflated_grid.data.size() != cell_count) {
       return;
     }
-    std::vector<std::uint8_t> seeds_obs(cell_count, 0);
-    std::vector<std::uint8_t> seeds_free(cell_count, 0);
+    esdf_seeds_obs_.assign(cell_count, 0);
+    esdf_seeds_free_.assign(cell_count, 0);
     for (std::size_t i = 0; i < cell_count; ++i) {
       const bool obs = inflated_grid.data[i] >= 100;
-      seeds_obs[i] = obs ? 1 : 0;
-      seeds_free[i] = obs ? 0 : 1;
+      esdf_seeds_obs_[i] = obs ? 1 : 0;
+      esdf_seeds_free_[i] = obs ? 0 : 1;
     }
-    // O(n) 精确欧氏距离变换（Felzenszwalb & Huttenlocher），100×100 格 <1ms，
-    // 两次变换仍 <2ms，不阻塞 10Hz 发布路径。结果单位是格，乘 resolution 转米。
-    auto dist_to_obs = exactSquaredDistanceTransform(seeds_obs, w, h);
-    auto dist_to_free = exactSquaredDistanceTransform(seeds_free, w, h);
+    // 写入式 O(n) 精确 EDT；地图尺寸不变时 seeds、输出和抛物线工作区全部复用。
+    exactDistanceTransform(esdf_seeds_obs_, w, h, esdf_obs_workspace_, esdf_dist_to_obs_);
+    exactDistanceTransform(esdf_seeds_free_, w, h, esdf_free_workspace_, esdf_dist_to_free_);
     navigation2::DistanceFieldSnapshot snapshot;
     snapshot.resolution = static_cast<double>(inflated_grid.info.resolution);
     snapshot.origin_x = inflated_grid.info.origin.position.x;
@@ -1186,7 +1186,8 @@ private:
     snapshot.valid = true;
     snapshot.distance.resize(cell_count);
     for (std::size_t i = 0; i < cell_count; ++i) {
-      const double signed_cells = seeds_obs[i] ? -dist_to_free[i] : dist_to_obs[i];
+      const double signed_cells = esdf_seeds_obs_[i] ?
+        -esdf_dist_to_free_[i] : esdf_dist_to_obs_[i];
       snapshot.distance[i] = static_cast<float>(signed_cells * snapshot.resolution);
     }
     navigation2::DistanceFieldRegistry::instance().publish(std::move(snapshot));
@@ -1313,6 +1314,13 @@ private:
   double dynamic_decay_clear_time_{1.2};
   bool prior_merge_enable_{false};
   HitAgeCache hit_age_;
+  // Signed ESDF 唯一生产者的复用工作区；local costmap 回调组串行，无需锁。
+  std::vector<std::uint8_t> esdf_seeds_obs_;
+  std::vector<std::uint8_t> esdf_seeds_free_;
+  std::vector<double> esdf_dist_to_obs_;
+  std::vector<double> esdf_dist_to_free_;
+  DistanceTransformWorkspace esdf_obs_workspace_;
+  DistanceTransformWorkspace esdf_free_workspace_;
 
   sensor_msgs::msg::LaserScan::ConstSharedPtr latest_scan_;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_pointcloud_;

@@ -183,6 +183,11 @@ public:
   GroundSegmentationParams params_;
   std::shared_ptr<GroundSegmentation> segmenter_;
   std::string gravity_aligned_frame_;
+  // 可选处理坐标系：权威云在 odom，但 LineFit 的 r_min/r_max 与径向 bins 必须以当前
+  // 传感器/虚拟云台为原点。设为 base_link 时按消息 stamp 把 odom 云搬回局部系，输出
+  // header 同步改为 base_link，costmap 再按同一 stamp 变回 map，避免移动后点距 odom
+  // 原点超过 r_max 而全部消失。
+  std::string processing_frame_;
   // 雷达安装高度不再由 yaml 手填，而是从 URDF 外参的 TF 里查出来，见
   // resolveSensorHeight()。空字符串表示关闭该行为、退回 sensor_height 参数。
   std::string sensor_height_frame_;
@@ -204,6 +209,7 @@ SegmentationNode::SegmentationNode(const rclcpp::NodeOptions &node_options)
     : Node("ground_segmentation", node_options) {
   gravity_aligned_frame_ =
       this->declare_parameter("gravity_aligned_frame", "gravity_aligned");
+  processing_frame_ = this->declare_parameter("processing_frame", std::string(""));
 
   params_.visualize = this->declare_parameter("visualize", params_.visualize);
   params_.n_bins = this->declare_parameter("n_bins", params_.n_bins);
@@ -360,8 +366,10 @@ void SegmentationNode::resolveSensorHeight(const std::string &cloud_frame) {
 void SegmentationNode::scanCallback(
     const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
   bumpStage(1);
-  const bool publish_ground = ground_pub_->get_subscription_count() > 0;
-  const bool publish_obstacle = obstacle_pub_->get_subscription_count() > 0;
+  const bool publish_ground =
+      ground_pub_->get_subscription_count() + ground_pub_->get_intra_process_subscription_count() > 0;
+  const bool publish_obstacle =
+      obstacle_pub_->get_subscription_count() + obstacle_pub_->get_intra_process_subscription_count() > 0;
   if (!publish_ground && !publish_obstacle) {
     return;
   }
@@ -373,12 +381,41 @@ void SegmentationNode::scanCallback(
   pcl::PointCloud<pcl::PointXYZ> cloud;
   pcl::fromROSMsg(*msg, cloud);
   pcl::PointCloud<pcl::PointXYZ> cloud_transformed;
+  std::string output_frame = msg->header.frame_id;
 
   bumpStage(3);
   std::vector<int> labels;
 
   bool is_original_pc = true;
-  if (!gravity_aligned_frame_.empty()) {
+  if (!processing_frame_.empty() && processing_frame_ != msg->header.frame_id) {
+    try {
+      const auto tf_stamped = tf_buffer_->lookupTransform(
+        processing_frame_, msg->header.frame_id, msg->header.stamp,
+        tf2::durationFromSec(0.05));
+      Eigen::Affine3d tf = Eigen::Affine3d::Identity();
+      tf.translate(Eigen::Vector3d(
+          tf_stamped.transform.translation.x,
+          tf_stamped.transform.translation.y,
+          tf_stamped.transform.translation.z));
+      tf.rotate(Eigen::Quaterniond(
+          tf_stamped.transform.rotation.w, tf_stamped.transform.rotation.x,
+          tf_stamped.transform.rotation.y, tf_stamped.transform.rotation.z));
+      pcl::transformPointCloud(cloud, cloud_transformed, tf);
+      is_original_pc = false;
+      output_frame = processing_frame_;
+    } catch (tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Drop point cloud: cannot transform processing frame %s <- %s: %s",
+        processing_frame_.c_str(), msg->header.frame_id.c_str(), ex.what());
+      return;
+    }
+  }
+
+  // processing_frame 已经是重力对齐系时无需第二次旋转。否则只旋转、不平移。
+  if (is_original_pc && !gravity_aligned_frame_.empty() &&
+    gravity_aligned_frame_ != msg->header.frame_id)
+  {
     geometry_msgs::msg::TransformStamped tf_stamped;
     try {
       // 给查询加 50ms 上限：Timeout 0（缺省）意味着「等多久都行」，一旦这条
@@ -402,8 +439,9 @@ void SegmentationNode::scanCallback(
     } catch (tf2::TransformException &ex) {
       RCLCPP_WARN_THROTTLE(
         this->get_logger(), *this->get_clock(), 2000,
-        "Failed to transform point cloud into gravity frame: %s",
+        "Drop point cloud: cannot transform into required gravity frame: %s",
         ex.what());
+      return;
     }
   }
 
@@ -431,25 +469,30 @@ void SegmentationNode::scanCallback(
   if (publish_obstacle) {
     obstacle_cloud.reserve(cloud.size());
   }
-  for (size_t i = 0; i < cloud.size(); ++i) {
+  // labels 对应 cloud_proc；输出也必须取 cloud_proc。旧代码变换到 processing_frame 后
+  // 却仍复制原始 cloud 点，再把 header 改成 processing_frame，导致 odom 数值被伪装成
+  // base_link 点：启动时那一片障碍会永久粘在车上随机器人移动。
+  for (size_t i = 0; i < cloud_proc.size(); ++i) {
     if (labels[i] == 1) {
       if (publish_ground) {
-        ground_cloud.push_back(cloud[i]);
+        ground_cloud.push_back(cloud_proc[i]);
       }
     } else if (publish_obstacle) {
-      obstacle_cloud.push_back(cloud[i]);
+      obstacle_cloud.push_back(cloud_proc[i]);
     }
   }
   if (publish_ground) {
     sensor_msgs::msg::PointCloud2 ground_msg;
     pcl::toROSMsg(ground_cloud, ground_msg);
     ground_msg.header = msg->header;
+    ground_msg.header.frame_id = output_frame;
     ground_pub_->publish(ground_msg);
   }
   if (publish_obstacle) {
     sensor_msgs::msg::PointCloud2 obstacle_msg;
     pcl::toROSMsg(obstacle_cloud, obstacle_msg);
     obstacle_msg.header = msg->header;
+    obstacle_msg.header.frame_id = output_frame;
     obstacle_pub_->publish(obstacle_msg);
   }
   bumpStage(6);

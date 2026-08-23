@@ -8,11 +8,24 @@
 namespace navigation2
 {
 
-// 精确欧氏距离变换（Felzenszwalb & Huttenlocher 两遍抛物线下包络），返回每格到
-// 最近种子格（seeds[i] != 0）的欧氏距离（单位：格）。O(n)，无堆、cache 友好。
-//
-// 不沿用八邻域 Dijkstra：那个版本对 45° 之外的方向系统性高估最多约 8%，误差
-// 直接落在代价梯度上。也不引 OpenCV —— 为一个距离变换拖进整个 imgproc 不值得。
+// EDT 工作区。地图尺寸不变时复用全部临时数组，避免 local costmap 10Hz 热路径反复
+// malloc/free。一个工作区只能被一个调用线程使用；当前 local costmap 回调组串行，符合约束。
+struct DistanceTransformWorkspace
+{
+  std::vector<double> squared;
+  std::vector<double> f;
+  std::vector<double> line_out;
+  std::vector<int> envelope_indices;
+  std::vector<double> envelope_breaks;
+};
+
+// 写入式精确欧氏距离变换（Felzenszwalb & Huttenlocher 两遍抛物线下包络）。
+// output 返回每格到最近种子格（seeds[i] != 0）的欧氏距离（单位：格）。O(n)、无堆。
+void exactDistanceTransform(
+  const std::vector<std::uint8_t> & seeds, int width, int height,
+  DistanceTransformWorkspace & workspace, std::vector<double> & output);
+
+// 兼容非热路径调用的返回式封装；内部临时工作区只在本次调用存在。
 std::vector<double> exactSquaredDistanceTransform(
   const std::vector<std::uint8_t> & seeds, int width, int height);
 

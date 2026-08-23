@@ -55,6 +55,9 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<int>("scan_accumulate_frames", 1);
     this->declare_parameter<float>("scan_min_range", 0.0);
     this->declare_parameter<float>("scan_max_range", 0.0);
+    this->declare_parameter<bool>("scan_odom_sync.enable", true);
+    this->declare_parameter<double>("scan_odom_sync.max_delta", 0.03);
+    this->declare_parameter<int>("scan_odom_sync.history_size", 32);
 
     this->declare_parameter<std::string>("sub_scan_topic", "/lio/cloud_world");
     this->declare_parameter<std::string>("sub_odom_topic", "/lio/robo/odom");
@@ -180,6 +183,11 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     scan_accumulate_frames_ = this->get_parameter("scan_accumulate_frames").as_int();
     scan_min_range_ = this->get_parameter("scan_min_range").as_double();
     scan_max_range_ = this->get_parameter("scan_max_range").as_double();
+    scan_odom_sync_enable_ = this->get_parameter("scan_odom_sync.enable").as_bool();
+    scan_odom_sync_max_delta_ = std::max(
+        0.0, this->get_parameter("scan_odom_sync.max_delta").as_double());
+    odom_history_size_ = static_cast<std::size_t>(std::max<int64_t>(
+        2, this->get_parameter("scan_odom_sync.history_size").as_int()));
     if (scan_input_frame_mode_ != "odom" && scan_input_frame_mode_ != "base") {
         RCLCPP_WARN(this->get_logger(), "Invalid scan_input_frame_mode='%s', fallback to 'odom'", scan_input_frame_mode_.c_str());
         scan_input_frame_mode_ = "odom";
@@ -189,6 +197,12 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     }
     if (scan_accumulate_frames_ <= 0) {
         scan_accumulate_frames_ = 1;
+    }
+    if (scan_input_frame_mode_ == "base" && scan_accumulate_frames_ > 1) {
+        RCLCPP_WARN(
+            get_logger(), "base-frame scans lack per-frame pose compensation; force accumulate=1");
+        scan_accumulate_frames_ = 1;
+        global_search_refine_accumulate_ = 1;
     }
     if (scan_max_range_ > 0.0f && scan_max_range_ <= scan_min_range_) {
         RCLCPP_WARN(this->get_logger(), "scan_max_range must be larger than scan_min_range, disable max-range filter.");
@@ -460,7 +474,17 @@ bool RobotLocalizationNode::snapshotLocalizationInput(
         // 免去每 tick 一次整帧深拷贝。此后该对象只归 scan_snapshot 独占，
         // SubScan/重置路径都只操作新的 cur_scan_，并发安全由引用计数保证。
         scan_snapshot.swap(cur_scan_);
-        odom_snapshot = *cur_odom_;
+        if (scan_odom_sync_enable_) {
+            if (!cur_scan_has_synced_odom_) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 5000, "Scan has no time-synchronized odometry");
+                return false;
+            }
+            odom_snapshot = cur_scan_odom_;
+        } else {
+            odom_snapshot = *cur_odom_;
+        }
+        cur_scan_has_synced_odom_ = false;
     }
 
     const auto &p = odom_snapshot.pose.pose.position;
@@ -1098,8 +1122,19 @@ PointCloudXYZI::Ptr RobotLocalizationNode::cachedOrDownsample(
     const PointCloudXYZI::Ptr & cloud,
     float voxel_size)
 {
+    uint64_t scan_generation = 0;
+    const bool is_scan_cache = &cache == &scan_downsample_cache_;
     {
         std::lock_guard<std::mutex> lock(data_mutex_);
+        if (is_scan_cache) {
+            // 同一代cache只能服务同一源云；源改变时即使调用者漏clear也重新开代次。
+            if (scan_cache_source_ != cloud.get()) {
+                scan_downsample_cache_.clear();
+                scan_cache_source_ = cloud.get();
+                ++scan_cache_generation_;
+            }
+            scan_generation = scan_cache_generation_;
+        }
         const auto it = cache.find(scale_key);
         if (it != cache.end()) {
             return it->second;
@@ -1108,6 +1143,11 @@ PointCloudXYZI::Ptr RobotLocalizationNode::cachedOrDownsample(
     auto filtered = voxelDownSample(cloud, voxel_size);
     {
         std::lock_guard<std::mutex> lock(data_mutex_);
+        // 滤波在锁外执行；期间若SubScan换了源，当前结果只供本次ICP使用，不得回写共享cache。
+        if (is_scan_cache &&
+            (scan_generation != scan_cache_generation_ || scan_cache_source_ != cloud.get())) {
+            return filtered;
+        }
         const auto it = cache.find(scale_key);
         if (it != cache.end()) {
             return it->second;
@@ -1126,7 +1166,10 @@ void RobotLocalizationNode::enterLost(const char * reason)
     {
         std::lock_guard<std::mutex> lock(tf_mutex_);
         ++reloc_generation_;
-        tf_ready_ = false;
+        // 健康状态由 /localization_status 表达；TF 连通性单独处理。一旦接受过位姿，
+        // LOST/召回期间继续广播最后锚点，避免唯一 map→odom 边从 tf2 缓存中老化消失。
+        // 冷启动尚无可信锚点时仍不广播。
+        tf_ready_ = had_accepted_pose_;
         ema_initialized_ = false;
         pending_global_result_valid_ = false;
         use_pose_prior_ = false;
@@ -1546,6 +1589,22 @@ PointCloudXYZI::Ptr RobotLocalizationNode::voxelDownSample(PointCloudXYZI::Ptr c
 
 void RobotLocalizationNode::SubScan(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
+    // frame 契约是定位正确性的硬门：odom 模式下上游已经把逐点 deskew 后的扫描统一到
+    // odom，不能把 livox/base 点云静默当 odom 堆积。base 模式当前沿用 base_frame 参数。
+    const auto normalize_frame = [](std::string frame) {
+        while (!frame.empty() && frame.front() == '/') frame.erase(frame.begin());
+        return frame;
+    };
+    const std::string actual_frame = normalize_frame(msg->header.frame_id);
+    const std::string expected_frame = normalize_frame(base_frame_);
+    if (actual_frame.empty() || actual_frame != expected_frame) {
+        RCLCPP_ERROR_THROTTLE(
+            this->get_logger(), *this->get_clock(), 5000,
+            "Drop scan with frame '%s': scan_input_frame_mode=%s requires '%s'",
+            msg->header.frame_id.c_str(), scan_input_frame_mode_.c_str(), expected_frame.c_str());
+        return;
+    }
+
     PointCloudXYZI::Ptr scan_in(new PointCloudXYZI);
     pcl::fromROSMsg(*msg, *scan_in);
     if (scan_in->empty()) {
@@ -1603,14 +1662,42 @@ void RobotLocalizationNode::SubScan(const sensor_msgs::msg::PointCloud2::SharedP
         *stacked_scan += *cloud;
     }
 
-    // 更新当前定位使用的扫描。指针交换：新合并云进 cur_scan_，旧缓冲随局部变量
-    // 析构，免去每 tick 一次整帧深拷贝。所有权交接都在 data_mutex_ 内完成。
+    // 更新当前定位使用的扫描。绑定消息时间戳最近的 odom，定位 timer 不再任意读取 latest。
+    nav_msgs::msg::Odometry matched_odom;
+    bool have_matched_odom = !scan_odom_sync_enable_;
+    double best_delta = std::numeric_limits<double>::infinity();
+    const rclcpp::Time scan_stamp(msg->header.stamp, get_clock()->get_clock_type());
     {
         std::lock_guard<std::mutex> lock(data_mutex_);
+        if (scan_odom_sync_enable_) {
+            for (const auto & odom : odom_history_) {
+                const double delta = std::abs(
+                    (rclcpp::Time(odom.header.stamp, get_clock()->get_clock_type()) - scan_stamp).seconds());
+                if (std::isfinite(delta) && delta < best_delta) {
+                    best_delta = delta;
+                    matched_odom = odom;
+                }
+            }
+            have_matched_odom = best_delta <= scan_odom_sync_max_delta_;
+        } else if (odom_received_.load(std::memory_order_acquire)) {
+            matched_odom = *cur_odom_;
+        }
+        if (!have_matched_odom) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 5000,
+                "Drop scan: nearest odom delta %.3f s exceeds %.3f s",
+                best_delta, scan_odom_sync_max_delta_);
+            return;
+        }
         cur_scan_.swap(stacked_scan);
+        cur_scan_stamp_ = msg->header.stamp;
+        cur_scan_odom_ = matched_odom;
+        cur_scan_has_synced_odom_ = true;
         has_new_scan_.store(true, std::memory_order_release);
         // 新扫描到了，清空旧缓存。
         scan_downsample_cache_.clear();
+        scan_cache_source_ = cur_scan_.get();
+        ++scan_cache_generation_;
     }
 
 }
@@ -1618,8 +1705,22 @@ void RobotLocalizationNode::SubScan(const sensor_msgs::msg::PointCloud2::SharedP
 
 void RobotLocalizationNode::SubOdom(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
+    const rclcpp::Time stamp(msg->header.stamp, get_clock()->get_clock_type());
+    if (stamp.nanoseconds() <= 0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Drop odometry with zero stamp");
+        return;
+    }
     std::lock_guard<std::mutex> lock(data_mutex_);
+    if (!odom_history_.empty()) {
+        const rclcpp::Time last(odom_history_.back().header.stamp, get_clock()->get_clock_type());
+        if (stamp < last) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "Drop out-of-order odometry");
+            return;
+        }
+    }
     cur_odom_ = msg;
+    odom_history_.push_back(*msg);
+    while (odom_history_.size() > odom_history_size_) odom_history_.pop_front();
     odom_received_.store(true, std::memory_order_release);
 }
 
@@ -1671,7 +1772,8 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
         initial_pcd_to_odom_ = pcd_from_odom;
         // 不改 T_pcd_to_odom_：跳变门要上一拍真值。把错误 /initialpose 写进去
         // 会让对面角变成「0 跳变」被局部 ICP 接受，召回永远不会发生。
-        tf_ready_ = false;
+        // 接受新结果前继续广播上一可信锚点；是否可走由完整性状态决定。
+        tf_ready_ = had_accepted_pose_;
         ema_initialized_ = false;
         pending_global_result_valid_ = false;
         far_prior = had_accepted_pose_ &&

@@ -388,11 +388,12 @@ public:
         const Eigen::MatrixX2d& partialGradByCoeffs,
         const Eigen::VectorXd& partialGradByTimes,
         Eigen::Matrix2Xd& gradByPoints,
-        Eigen::VectorXd& gradByTimes
+        Eigen::VectorXd& gradByTimes,
+        Eigen::MatrixX2d& adjGrad
     ) {
         gradByPoints.resize(2, N - 1);
         gradByTimes.resize(N);
-        Eigen::MatrixX2d adjGrad = partialGradByCoeffs;
+        adjGrad = partialGradByCoeffs;
         A.solveAdj(adjGrad);
 
         for (int i = 0; i < N - 1; i++) {

@@ -1,0 +1,25 @@
+# waypoint_executor 完整运行参数真源；waypoint_file 由 launch 动态覆盖。
+waypoint_follow_executor:
+  ros__parameters:
+    mode: "follow"
+    waypoint_file: ""
+    frame_id: "map"
+    goal_topic: "/goal_pose"
+    status_topic: "/navigation2/status"
+    saved_waypoint_file_topic: "/waypoint_editor/saved_waypoint_file"
+    current_waypoints_topic: "/waypoint_editor/current_waypoints"
+    override_waypoints_topic: "/waypoint_editor/executor_waypoints"
+    override_waypoints_fresh_sec: 1.0
+    approach_enabled_topic: "/goal_approach_controller/enabled"
+    robot_base_frame: "base_link_fake"
+    global_frame: "map"
+    switch_distance: 0.6
+    final_goal_tolerance: 0.35
+    fallback_tolerance: 0.35
+    goal_republish_interval: 1.0
+    goal_republish_stall_sec: 2.5
+    goal_progress_epsilon: 0.05
+    service_name: "/waypoint_editor/start_follow"
+    action_name: "/waypoint_editor/follow_waypoints"
+    executor_status_topic: "/waypoint_editor/follow_status"
+    status_timeout: 1.0

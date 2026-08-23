@@ -436,6 +436,12 @@ EstimationFrame::ConstPtr OdometryEstimationCPU::insert_frame(
         raw_frame->times,
         raw_frame->points
     );
+    if (deskewed.size() != raw_frame->points.size()) {
+        logger::warn(
+            "odom_estimation", "drop frame: deskew returned {} points for {} input points",
+            deskewed.size(), raw_frame->points.size());
+        return nullptr;
+    }
     for (auto& pt: deskewed) {
         pt = T_imu_lidar * pt;
     }
@@ -452,6 +458,7 @@ EstimationFrame::ConstPtr OdometryEstimationCPU::insert_frame(
     frame->add_normals(deskewed_normals);
     new_frame->frame = frame;
     new_frame->frame_type = FrameType::IMU;
+    new_frame->deskew_valid = !new_frame->deskew_imu_saturated;
 
     frames.push_back(new_frame);
 

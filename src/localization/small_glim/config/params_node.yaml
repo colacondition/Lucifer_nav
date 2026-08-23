@@ -1,3 +1,4 @@
+# 开发兜底（非运行期权威）：bringup 使用 config/common/small_glim_*.yaml + 环境覆盖。
 /**:
   ros__parameters:
     node:
@@ -31,7 +32,8 @@
       odometry_pub_topic: "/Odometry"
       robo_odometry_pub_topic: "/lio/robo/odom" # consumed by fast_location (not remapped in launch)
       registered_cloud_pub_topic: "/Laser_map" # odometry downsampled frame (viz/debug)
-      localization_cloud_pub_topic: "/Laser_map_dense" # denser cloud for fast_location (decoupled from odometry downsampling)
+      localization_cloud_pub_topic: "/small_glim/deskewed_cloud" # authoritative scan-start deskewed cloud for fast_location + perception
+      perception_cloud_frame_id: "odom" # exact frame of the authoritative deskewed cloud
       ivox_cloud_pub_topic: "/small_glim/ivox_cloud"
       base_frame_id: "base_link" # odometry child frame; carries the lidar pose (super_lio convention)
       odometry_frame_id: "odom"

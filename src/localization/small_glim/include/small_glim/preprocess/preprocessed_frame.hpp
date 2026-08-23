@@ -28,6 +28,11 @@ public:
     std::vector<double> intensities; // Point intensities
     std::vector<Eigen::Vector4d> points; // Points (homogeneous coordinates)
 
+    // 与本帧严格同时间戳的定位稠密云。只挂在送入里程计队列的主 frame 上，避免节点用
+    // “最新稠密云 + 当前完成的估计帧”松散配对；定位线程积压时二者仍保持一一对应。
+    // 稠密子帧自身不再挂子帧，不形成引用环。
+    ConstPtr localization_frame;
+
     size_t k_neighbors; // Number of neighbors of each point
     std::vector<size_t> neighbor_indices; // k-nearest neighbor indices of each point
 };

@@ -8,8 +8,9 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    config = os.path.join(
+    default_config = os.path.join(
         get_package_share_directory('serial_driver'), 'config', 'serial_driver.yaml')
+    params_file = LaunchConfiguration('params_file')
     log_level = LaunchConfiguration('log_level')
     node_output = LaunchConfiguration('node_output')
 
@@ -20,11 +21,12 @@ def generate_launch_description():
         namespace='',
         output=node_output,
         emulate_tty=True,
-        parameters=[config],
+        parameters=[params_file],
         arguments=['--ros-args', '--log-level', log_level],
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('params_file', default_value=default_config),
         DeclareLaunchArgument('log_level', default_value='warn'),
         DeclareLaunchArgument('node_output', default_value='log'),
         serial_driver_node,

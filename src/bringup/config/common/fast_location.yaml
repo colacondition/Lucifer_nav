@@ -8,9 +8,13 @@
     scan_accumulate_frames: 5     # 源点云坐标系下堆积帧数
     scan_min_range: 0.0           # 源点云最小距离过滤（米）
     scan_max_range: 0.0           # 源点云最大距离过滤（米，<=0关闭）
+    # scan 与 /lio/robo/odom 同戳绑定：固定容量历史，不增加线程；超差扫描直接丢弃。
+    scan_odom_sync.enable: true
+    scan_odom_sync.max_delta: 0.03
+    scan_odom_sync.history_size: 32
     submap_voxel_size_first: 0.1 # 首次定位子图体素尺寸（米，建议=map_voxel_size）
     submap_voxel_size_track: 0.15 # 跟踪子图体素尺寸（米，建议>map_voxel_size）
-    fov_far: 20.0                # 视场内最远距离（米）
+    fov_far: 12.0                # 运行期 real/sim 共同视场距离
     localization_th: 0.90        # 定位匹配阈值（内点比例）
     first_localization_th: 0.95  # 首次匹配阈值（内点比例）
     # 可观测性阈值：GICP 平移信息矩阵 XY 子块的 λ_max/λ_min 超过此值时，判定
@@ -57,7 +61,7 @@
     coarse_every: 12
 
     # ========== 话题配置 ==========
-    sub_scan_topic: "/Laser_map_dense"          # 订阅点云话题（small_glim 的定位稠密点云，更细下采样）
+    sub_scan_topic: "/small_glim/deskewed_cloud" # small_glim唯一权威的scan-start去畸变odom云
     sub_odom_topic: "/lio/robo/odom"            # 订阅里程计话题
     sub_init_pose_topic: "initialpose_3d"      # PoseStamped初始位姿话题
     sub_init_pose_covariance_topic: "/initialpose"  # RViz 2D Pose Estimate 初始位姿
@@ -71,7 +75,7 @@
 
     # ========== 频率与队列 ==========
     io_queue_size: 10            # 发布/订阅队列长度
-    map_publish_rate_hz: 5.0     # 全局地图发布频率（Hz）
+    map_publish_rate_hz: 0.2     # 全局地图仅供可视化，降低带宽
     localization_rate_hz: 10.0   # 定位更新频率（Hz）
     tf_publish_rate_hz: 50.0    # map->odom TF 发布频率（tf2 自行插值，50Hz 足够）
     publish_tf: true             # 主定位模式：发布 map->odom TF
@@ -91,7 +95,7 @@
     global_search_xy_step: 2.0
     global_search_max_candidates: 2000000  # 候选硬上限：飞点/大图时自动加大步长防止 OOM
     global_search_yaw_step_deg: 30.0
-    global_search_max_map_odom_jump: 4.0
+    global_search_max_map_odom_jump: 1.0
     global_search_score_distance: 0.45
     global_search_score_stride: 4
     global_search_top_k: 6

@@ -1,0 +1,27 @@
+# 运行期权威 common；包内 launch/segmentation_params.yaml 仅作开发兜底。
+ground_segmentation:
+  ros__parameters:
+    n_threads: 2
+    r_min: 0.2
+    r_max: 10.0
+    n_bins: 120
+    n_segments: 360
+    max_dist_to_line: 0.1
+    # 唯一环境差异；launch 对同一参数做 real/sim 覆盖，见 reality/simulation/segmentation.yaml。
+    sensor_height: 0.49
+    sensor_height_frame: ""
+    base_to_ground_z: 0.0
+    min_slope: -0.4
+    max_slope: 0.4
+    max_fit_error: 0.05
+    long_threshold: 1.0
+    max_long_height: 0.1
+    max_start_height: 0.1
+    line_search_angle: 0.8
+    gravity_aligned_frame: "base_link"
+    processing_frame: "base_link"
+    latch: false
+    visualize: false
+    input_topic: "/livox/lidar_filtered/pointcloud"
+    obstacle_output_topic: "segmentation/obstacle"
+    ground_output_topic: "segmentation/ground"

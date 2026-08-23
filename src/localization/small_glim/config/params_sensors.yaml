@@ -1,3 +1,4 @@
+# 开发兜底（非运行期权威）：bringup 使用 config/common/small_glim_*.yaml + 环境覆盖。
 /**:
   ros__parameters:
     sensors:

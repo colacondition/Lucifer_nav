@@ -1,3 +1,5 @@
+# 开发兜底（非运行期权威）：bringup 使用 config/common/fast_location.yaml + 环境覆盖。
+# 独立调试 fast_location 包时才使用本文件。
 /**:
   ros__parameters:
     # ========== 地图与定位参数 ==========
@@ -8,6 +10,9 @@
     scan_accumulate_frames: 5     # 源点云坐标系下堆积帧数
     scan_min_range: 0.0           # 源点云最小距离过滤（米）
     scan_max_range: 0.0           # 源点云最大距离过滤（米，<=0关闭）
+    scan_odom_sync.enable: true
+    scan_odom_sync.max_delta: 0.03
+    scan_odom_sync.history_size: 32
     submap_voxel_size_first: 0.1 # 首次定位子图体素尺寸（米，建议=map_voxel_size）
     submap_voxel_size_track: 0.15 # 跟踪子图体素尺寸（米，建议>map_voxel_size）
     fov_far: 20.0                # 视场内最远距离（米）
@@ -44,7 +49,7 @@
     coarse_every: 3
 
     # ========== 话题配置 ==========
-    sub_scan_topic: "/Laser_map_dense"          # 订阅点云话题（small_glim 的定位稠密点云）
+    sub_scan_topic: "/small_glim/deskewed_cloud" # authoritative deskewed odom cloud
     sub_odom_topic: "/lio/robo/odom"            # 订阅里程计话题
     sub_init_pose_topic: "initialpose_3d"      # PoseStamped初始位姿话题
     sub_init_pose_covariance_topic: "/initialpose"  # RViz 2D Pose Estimate 初始位姿
@@ -74,7 +79,7 @@
     global_search_xy_step: 2.0
     global_search_max_candidates: 2000000  # 候选硬上限：飞点/大图时自动加大步长防止 OOM
     global_search_yaw_step_deg: 30.0
-    global_search_max_map_odom_jump: 4.0  # LOST 召回：map→odom XY 跳变上限；0=关门
+    global_search_max_map_odom_jump: 1.0  # LOST 召回：map→odom XY 跳变上限；0=关门
     global_search_score_distance: 0.45
     global_search_score_stride: 4
     global_search_top_k: 6

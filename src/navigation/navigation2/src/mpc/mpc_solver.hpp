@@ -24,7 +24,11 @@ struct MpcParams
   double max_speed = 2.0;
   double max_accel = 1.0;
   double turtle_max_speed = 1.0;
-  std::vector<double> Q{15.0, 15.0};   // 位置跟踪权重（x, y）
+  std::vector<double> Q{15.0, 15.0};   // 兼容模式的位置跟踪权重（世界 x, y）
+  bool path_frame_weighting = false;   // true: 按轨迹切/法向旋转位置权重
+  double tangential_weight = 6.0;
+  double lateral_weight = 24.0;
+  double min_tangent_speed = 0.05;
   std::vector<double> R{0.1, 0.1};     // 控制量大小权重（vx, vy）
   std::vector<double> Rd{1.0, 0.05};   // 控制平滑权重（dvx, dvy）
 };
@@ -36,6 +40,9 @@ inline bool paramsAreValid(const MpcParams & p)
 {
   return p.steps > 0 && p.dt > 0.0 && std::isfinite(p.dt) &&
          p.max_speed >= 0.0 && p.max_accel >= 0.0 && p.turtle_max_speed >= 0.0 &&
+         p.tangential_weight >= 0.0 && p.lateral_weight >= 0.0 &&
+         std::isfinite(p.tangential_weight) && std::isfinite(p.lateral_weight) &&
+         p.min_tangent_speed >= 0.0 && std::isfinite(p.min_tangent_speed) &&
          p.Q.size() >= 2 && p.R.size() >= 2 && p.Rd.size() >= 2;
 }
 
@@ -75,6 +82,8 @@ public:
     const int dimu = 2 * steps;
     const int nx = dimx + dimu;
 
+    buildPathFrameWeights(xref, uref);
+    updateStateHessian();                              // 路径切/法向 Q（结构固定，只改数值）
     buildGradient(xref, uref);                        // q
     buildBounds(x_init, turtle);                      // l, u
 
@@ -83,6 +92,9 @@ public:
         return {};
       }
     } else {
+      if (params_.path_frame_weighting) {
+        osqp_update_P(work_, P_x_.data(), nullptr, static_cast<c_int>(P_x_.size()));
+      }
       osqp_update_lin_cost(work_, q_.data());
       osqp_update_bounds(work_, l_.data(), u_.data());
     }
@@ -128,6 +140,10 @@ private:
     };
     for (int i = 1; i < steps; ++i) {          // 状态代价（i==0 由等式约束固定）
       add(2 * i, 2 * i, 2.0 * Q[0]);
+      // 路径坐标权重开启时预留 xy 非零结构；初值可为0，但结构必须在OSQP setup前存在。
+      if (params_.path_frame_weighting) {
+        add(2 * i, 2 * i + 1, 0.0);
+      }
       add(2 * i + 1, 2 * i + 1, 2.0 * Q[1]);
     }
     for (int i = 0; i < steps; ++i) {          // 控制代价 + 平滑项对角部分
@@ -148,6 +164,55 @@ private:
       std::sort(col.begin(), col.end());
     }
     toCsc(cols, nx, P_p_, P_i_, P_x_);
+    state_p_xx_.assign(steps, -1);
+    state_p_xy_.assign(steps, -1);
+    state_p_yy_.assign(steps, -1);
+    for (int col = 0; col < dimx; ++col) {
+      for (c_int k = P_p_[col]; k < P_p_[col + 1]; ++k) {
+        const int row = P_i_[k];
+        const int step = col / 2;
+        if (col == 2 * step && row == col) state_p_xx_[step] = k;
+        if (col == 2 * step + 1 && row == 2 * step) state_p_xy_[step] = k;
+        if (col == 2 * step + 1 && row == col) state_p_yy_[step] = k;
+      }
+    }
+  }
+
+  void buildPathFrameWeights(const Eigen::MatrixXd & xref, const Eigen::MatrixXd & uref)
+  {
+    const int steps = params_.steps;
+    if (state_weights_.size() != static_cast<std::size_t>(steps)) {
+      state_weights_.resize(steps, Eigen::Matrix2d::Zero());
+    }
+    Eigen::Vector2d last_tangent(1.0, 0.0);
+    for (int i = 0; i < steps; ++i) {
+      if (!params_.path_frame_weighting) {
+        state_weights_[i] = Eigen::Vector2d(params_.Q[0], params_.Q[1]).asDiagonal();
+        continue;
+      }
+      Eigen::Vector2d tangent = uref.col(i);
+      if (tangent.norm() < params_.min_tangent_speed) {
+        if (i + 1 < steps) tangent = xref.col(i + 1) - xref.col(i);
+        if (tangent.norm() < 1e-9 && i > 0) tangent = xref.col(i) - xref.col(i - 1);
+      }
+      if (tangent.norm() >= 1e-9 && tangent.allFinite()) {
+        last_tangent = tangent.normalized();
+      }
+      const Eigen::Vector2d normal(-last_tangent.y(), last_tangent.x());
+      state_weights_[i] =
+        params_.tangential_weight * (last_tangent * last_tangent.transpose()) +
+        params_.lateral_weight * (normal * normal.transpose());
+    }
+  }
+
+  void updateStateHessian()
+  {
+    for (int i = 1; i < params_.steps; ++i) {
+      const auto & weight = state_weights_[i];
+      if (state_p_xx_[i] >= 0) P_x_[state_p_xx_[i]] = 2.0 * weight(0, 0);
+      if (state_p_xy_[i] >= 0) P_x_[state_p_xy_[i]] = 2.0 * weight(0, 1);
+      if (state_p_yy_[i] >= 0) P_x_[state_p_yy_[i]] = 2.0 * weight(1, 1);
+    }
   }
 
   void buildGradient(const Eigen::MatrixXd & xref, const Eigen::MatrixXd & uref)
@@ -156,12 +221,12 @@ private:
     const int steps = params_.steps;
     const int dimx = 2 * steps;
     const int nx = dimx + 2 * steps;
-    const auto & Q = params_.Q;
     const auto & R = params_.R;
     q_.assign(nx, 0.0);
     for (int i = 0; i < steps; ++i) {
-      q_[2 * i] = -2.0 * Q[0] * xref(0, i);
-      q_[2 * i + 1] = -2.0 * Q[1] * xref(1, i);
+      const Eigen::Vector2d linear = -2.0 * state_weights_[i] * xref.col(i);
+      q_[2 * i] = linear.x();
+      q_[2 * i + 1] = linear.y();
     }
     for (int i = 0; i < steps; ++i) {
       const int ui = dimx + 2 * i;
@@ -344,6 +409,8 @@ private:
   // 预分配复用：避免每次 solve() 都分配临时 vector。
   std::vector<std::vector<std::pair<int, double>>> hessian_cols_cache_;
   std::vector<std::vector<std::pair<int, double>>> constraint_cols_cache_;
+  std::vector<Eigen::Matrix2d> state_weights_;
+  std::vector<c_int> state_p_xx_, state_p_xy_, state_p_yy_;
   std::vector<Eigen::Vector2d> output_cache_;
 };
 

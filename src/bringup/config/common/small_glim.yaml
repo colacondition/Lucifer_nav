@@ -1,0 +1,97 @@
+# small_glim 运行期完整 common：由包内五份 params_*.yaml 默认配置合并而成。
+# 包内文件仅作独立开发兜底；bringup 按本文件 + reality/simulation 覆盖加载。
+/**:
+  ros__parameters:
+    node:
+      debug: false
+      enable_mapping: true
+      enable_tf_publish: true
+      high_rate_odom_hz: 100.0
+      high_rate_smoothing_tau: 0.3
+      high_rate_smoothing_tau_z: 1.0
+      high_rate_max_window: 0.2
+      high_rate_max_imu_queue: 2000
+      imu_time_offset: 0.0
+      lidar_time_offset: 0.0
+      acc_scale: 1.0
+      imu_sub_topic: "/livox/imu"
+      lidar_sub_topic: "/livox/lidar/pointcloud"
+      odometry_pub_topic: "/Odometry"
+      robo_odometry_pub_topic: "/lio/robo/odom"
+      registered_cloud_pub_topic: "/Laser_map"
+      localization_cloud_pub_topic: "/small_glim/deskewed_cloud"
+      perception_cloud_frame_id: "odom"
+      ivox_cloud_pub_topic: "/small_glim/ivox_cloud"
+      base_frame_id: "base_link"
+      odometry_frame_id: "odom"
+      cloud_frame_id: "odom"
+    sensors:
+      imu_upright: true
+      imu_acc_noise: 0.05
+      imu_gyro_noise: 0.02
+      imu_int_noise: 0.001
+      imu_bias: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      imu_bias_noise: 0.00001
+      imu_acc_saturation_thresh: 235.0
+      imu_gyro_saturation_thresh: 34.5
+      imu_saturation_mult: 1.0
+      imu_max_integration_dt: 0.05
+      global_shutter_lidar: false
+      T_lidar_imu: [-0.09817, -0.01921, 0.10934, 0.99990, -0.00703, -0.00409, -0.01113]
+      intensity_field: "intensity"
+      ring_field: "line"
+      autoconf_perpoint_times: true
+      max_scan_duration: 0.2
+      max_frame_time_gap: 0.5
+      max_imu_time_gap: 0.1
+      max_invalid_time_ratio: 0.01
+    preprocess:
+      distance_near_thresh: 0.3
+      distance_far_thresh: 30.0
+      use_random_grid_downsampling: false
+      downsample_resolution: 0.05
+      localization_downsample_resolution: 0.05
+      random_downsample_target: 10000
+      random_downsample_rate: 0.1
+      enable_outlier_removal: false
+      outlier_removal_k: 10
+      outlier_std_mul_factor: 1.0
+      enable_cropbox_filter: false
+      k_correspondences: 10
+      num_threads: 2
+      min_points_after_filter: 100
+    odometry_estimation:
+      use_init_world_imu: false
+      init_pose_damping_scale: 1.0e+9
+      initialization_window_size: 1.0
+      naive_initialization: true
+      align_initial_odom_to_imu: true
+      smoother_lag: 3.0
+      use_isam2_dogleg: false
+      isam2_relinearize_skip: 1
+      isam2_relinearize_thresh: 0.01
+      fix_imu_bias: false
+      registration_type: "GICP"
+      lru_thresh: 100
+      target_downsampling_rate: 0.1
+      ivox_resolution: 0.5
+      ivox_min_dist: 0.1
+      ivox_update_delay: 0.5
+      ivox_impact_pause_duration: 0.5
+      max_imu_wait_time_gap: 0.3
+      max_imu_wait_wall_time: 1.0
+      max_internal_frame_queue: 20
+      num_threads: 2
+    mapping:
+      save_raw_mapping_frames: false
+      output_root: "~/mapping"
+      output_dir: ""
+      map_name: ""
+      cloud_range_min: 0.8
+      cloud_range_max: 20.0
+      enable_imu_refine: true
+      imu_refine_max_iterations: 5
+      keyframe_trans_thresh: 0.1
+      keyframe_rot_thresh: 5.0
+      downsample_every_n_keyframes: 1000
+      map_voxel_leaf_size: 0.05

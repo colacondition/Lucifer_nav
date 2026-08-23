@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/buffer.h>
@@ -14,6 +15,7 @@
 #include <small_glim/common/config.hpp>
 #include <small_glim/common/logger.hpp>
 #include <small_glim/common/ros_convert.hpp>
+#include <small_glim/preprocess/cloud_deskewing.hpp>
 #include <small_glim/preprocess/cloud_preprocessor.hpp>
 #include <small_glim/preprocess/time_keeper.hpp>
 #include <small_glim/odometry/async_odometry_estimation.hpp>
@@ -63,9 +65,12 @@ private:
     double acc_scale;
     bool enable_mapping;
     bool enable_tf_publish;
+    double localization_downsample_resolution{0.0};
+    double odometry_downsample_resolution{0.0};
+    bool odometry_has_extra_filters{false};
 
     std::string intensity_field, ring_field;
-    std::string base_frame_id, odometry_frame_id, cloud_frame_id;
+    std::string base_frame_id, odometry_frame_id, cloud_frame_id, perception_cloud_frame_id;
 
     rclcpp::TimerBase::SharedPtr timer;
     rclcpp::TimerBase::SharedPtr high_rate_timer;
@@ -107,10 +112,8 @@ private:
     double last_high_rate_stamp{0.0};
     bool have_last_high_rate_stamp{false};
 
-    // Latest denser localization cloud (LiDAR frame), produced alongside the odometry
-    // cloud and transformed by the odometry pose at publish time. Written in
-    // lidar_callback, read in timer_callback; both run on the executor's single thread.
-    PreprocessedFrame::ConstPtr latest_localization_frame;
+    // 稠密定位云挂在对应的主预处理帧上，随异步里程计队列一起流动。这样定位线程积压
+    // 时不会把“最新雷达帧的稠密云”错误配给“刚完成的旧估计位姿”。
 };
 
 }
@@ -156,10 +159,19 @@ SmallGlimNode::SmallGlimNode(const rclcpp::NodeOptions& options): Node("small_gl
     base_frame_id = config->param<std::string>("node.base_frame_id");
     odometry_frame_id = config->param<std::string>("node.odometry_frame_id");
     cloud_frame_id = config->param<std::string>("node.cloud_frame_id");
+    perception_cloud_frame_id = config->param<std::string>("node.perception_cloud_frame_id");
 
     // Preprocessing
     time_keeper = std::make_unique<TimeKeeper>(config);
     preprocessor = std::make_unique<CloudPreprocessor>(config);
+    // 这些是静态ROS参数；构造期缓存，避免10Hz雷达回调每帧反复走参数字典。
+    localization_downsample_resolution =
+        config->param<double>("preprocess.localization_downsample_resolution");
+    odometry_downsample_resolution = config->param<double>("preprocess.downsample_resolution");
+    odometry_has_extra_filters =
+        config->param<bool>("preprocess.enable_cropbox_filter") ||
+        config->param<bool>("preprocess.enable_outlier_removal") ||
+        config->param<bool>("preprocess.use_random_grid_downsampling");
 
     // Odometry estimation
     odometry_estimation = std::make_unique<AsyncOdometryEstimation>(config);
@@ -256,11 +268,13 @@ size_t SmallGlimNode::lidar_callback(const sensor_msgs::msg::PointCloud2::ConstS
         logger::warn("node", "failed to extract points from message: {}", e.what());
         return 0;
     }
-    raw_points->stamp += lidar_time_offset;
+    // 绝对逐点时间会让 TimeKeeper 用最小点时间重写 stamp，因此偏移必须在归一化后
+    // 施加一次；relative times 保持不变，整段 [stamp, scan_end] 一起平移。
     if (!time_keeper->process(raw_points)) {
         logger::warn("node", "skip invalid LiDAR frame (stamp={:.6f})", raw_points->stamp);
         return 0;
     }
+    raw_points->stamp += lidar_time_offset;
     auto preprocessed = preprocessor->preprocess(raw_points);
     if (!preprocessed) {
         logger::warn("node", "skip LiDAR frame rejected by preprocessing (stamp={:.6f})", raw_points->stamp);
@@ -272,18 +286,22 @@ size_t SmallGlimNode::lidar_callback(const sensor_msgs::msg::PointCloud2::ConstS
     // random-grid 过滤时，直接复用里程计的降采样结果：同一帧不再做第二次体素降采样
     // 和全量拷贝（deskew 是拷出新的，不会原地改 raw 点，复用安全）。只有配置了更细
     // 的 localization 分辨率或额外过滤时才单独算。
-    const double loc_res = config->param<double>("preprocess.localization_downsample_resolution");
-    const double odom_res = config->param<double>("preprocess.downsample_resolution");
-    const bool odom_has_extra_filters =
-      config->param<bool>("preprocess.enable_cropbox_filter") ||
-      config->param<bool>("preprocess.enable_outlier_removal") ||
-      config->param<bool>("preprocess.use_random_grid_downsampling");
+    const double loc_res = localization_downsample_resolution;
+    const double odom_res = odometry_downsample_resolution;
+    const bool odom_has_extra_filters = odometry_has_extra_filters;
+    PreprocessedFrame::ConstPtr localization_frame;
     if (loc_res <= 0.0) {
-        latest_localization_frame = nullptr;
+        localization_frame = nullptr;
     } else if (std::abs(loc_res - odom_res) < 1e-9 && !odom_has_extra_filters) {
-        latest_localization_frame = preprocessed;
+        localization_frame = preprocessed;
     } else {
-        latest_localization_frame = preprocessor->preprocess_for_localization(raw_points);
+        localization_frame = preprocessor->preprocess_for_localization(raw_points);
+    }
+    // 主帧持有同源稠密帧，随异步队列进入 EstimationFrame，保证完成顺序与时间戳严格
+    // 对齐。复用自身时不能形成 shared_ptr 自环，因此相同分辨率分支以 nullptr 表示
+    // “直接使用 raw_frame 本身”。
+    if (localization_frame && localization_frame.get() != preprocessed.get()) {
+        preprocessed->localization_frame = localization_frame;
     }
     odometry_estimation->insert_frame(preprocessed);
     const size_t workload = odometry_estimation->workload();
@@ -635,13 +653,81 @@ void SmallGlimNode::pub_localization_cloud(
     const EstimationFrame::ConstPtr frame,
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher
 ) {
-    const auto& dense = latest_localization_frame;
+    if (localization_downsample_resolution <= 0.0 ||
+        !frame || !frame->raw_frame || !frame->deskew_valid) {
+        return;
+    }
+    // 稠密云与该 EstimationFrame 同源：单独降采样时取挂载的子帧；分辨率相同的零拷贝
+    // 路径直接复用 raw_frame。不会再把节点收到的最新云配给异步线程刚完成的旧位姿。
+    const bool use_odometry_cloud = !frame->raw_frame->localization_frame;
+    const auto dense = use_odometry_cloud ? frame->raw_frame : frame->raw_frame->localization_frame;
     if (!dense || dense->points.empty()) {
         return;
     }
+
+    // 默认同分辨率路径直接复用里程计已经逐点 deskew 的 frame->frame，不做第二次
+    // IMU轨迹解析和N点变换。只有确实配置了独立更密的定位子帧时才执行下面的deskew。
+    const Eigen::Vector4d * deskewed_points = nullptr;
+    std::vector<Eigen::Vector4d> dense_deskewed;
+    if (use_odometry_cloud) {
+        if (!frame->frame || frame->frame->num_points != dense->points.size()) {
+            return;
+        }
+        deskewed_points = frame->frame->points;
+    } else {
+        if (frame->deskew_imu_saturated) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "Skip dense localization cloud: intra-scan IMU saturated");
+            return;
+        }
+
+        // 用里程计本帧已经计算并保存的 IMU-rate 轨迹对独立稠密云逐点 deskew。不新增
+        // 订阅、线程或 IMU 积分；只在 fast_location 订阅且配置独立密度时走这条 O(N)。
+        std::vector<double> imu_times;
+        std::vector<Eigen::Isometry3d> imu_poses;
+        const auto & trajectory = frame->imu_rate_trajectory;
+        imu_times.reserve(static_cast<std::size_t>(trajectory.cols()));
+        imu_poses.reserve(static_cast<std::size_t>(trajectory.cols()));
+        double previous_time = -std::numeric_limits<double>::infinity();
+        bool trajectory_valid = trajectory.cols() >= 2;
+        for (Eigen::Index i = 0; i < trajectory.cols() && trajectory_valid; ++i) {
+            const auto col = trajectory.col(i);
+            const double time = col(0);
+            Eigen::Quaterniond q(col(7), col(4), col(5), col(6));
+            trajectory_valid = std::isfinite(time) && time > previous_time &&
+                col.segment<3>(1).allFinite() && q.coeffs().allFinite() && q.norm() >= 1e-9;
+            if (!trajectory_valid) break;
+            previous_time = time;
+            q.normalize();
+            Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+            pose.translation() = col.segment<3>(1);
+            pose.linear() = q.toRotationMatrix();
+            imu_times.push_back(time);
+            imu_poses.push_back(pose);
+        }
+        trajectory_valid = trajectory_valid && !imu_times.empty() &&
+            imu_times.front() <= dense->stamp + 1e-6 &&
+            imu_times.back() + 1e-6 >= dense->scan_end_time;
+        if (!trajectory_valid) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "Skip dense localization cloud: invalid/incomplete IMU trajectory");
+            return;
+        }
+        CloudDeskewing deskewing;
+        dense_deskewed = deskewing.deskew(
+            frame->T_lidar_imu.inverse(), imu_times, imu_poses, dense->stamp,
+            dense->times, dense->points);
+        if (dense_deskewed.size() != dense->points.size()) {
+            return;
+        }
+        deskewed_points = dense_deskewed.data();
+    }
+
     const size_t num_points = dense->points.size();
     sensor_msgs::msg::PointCloud2 msg;
-    msg.header.frame_id = cloud_frame_id;
+    msg.header.frame_id = perception_cloud_frame_id;
     msg.header.stamp = rclcpp::Time(static_cast<int64_t>(frame->stamp * 1e9));
     msg.height = 1;
     msg.width = static_cast<uint32_t>(num_points);
@@ -670,16 +756,20 @@ void SmallGlimNode::pub_localization_cloud(
     field_intensity.count = 1;
     msg.fields = {field_x, field_y, field_z, field_intensity};
     msg.data.resize(msg.row_step * msg.height);
-    // Localization cloud is kept in the LiDAR frame; transform with the (smoothed) odometry
-    // pose. No per-point deskew here: fast_location voxel-downsamples to 0.2 m and stacks
-    // several frames, so the whole-frame approximation (a "global shutter" cloud) is well
-    // within its tolerance at nav speeds.
+    // 所有点已统一到扫描起点的 LiDAR 姿态，再用该时刻的校正位姿变换到 odom；
+    // fast_location 收到的是同一时刻、同一坐标系的“全局快门”稠密云。
     const Eigen::Isometry3f T_world_lidar = frame->T_world_lidar.cast<float>();
-    const bool has_intensity = !dense->intensities.empty();
+    const Eigen::Isometry3f T_world_imu = frame->T_world_imu.cast<float>();
+    const bool has_intensity = use_odometry_cloud ?
+        frame->frame->has_intensities() : !dense->intensities.empty();
     for (size_t i = 0; i < num_points; i++) {
-        Eigen::Vector3f pt = dense->points[i].head<3>().cast<float>();
-        pt = T_world_lidar * pt;
-        const float intensity = has_intensity ? static_cast<float>(dense->intensities[i]) : 0.0f;
+        // 零拷贝复用分支的 frame->frame 点位于 scan-start IMU 系；独立 dense deskew
+        // 输出位于 scan-start LiDAR 系。分别使用对应世界位姿，不能混用外参。
+        Eigen::Vector3f pt = deskewed_points[i].head<3>().cast<float>();
+        pt = use_odometry_cloud ? (T_world_imu * pt) : (T_world_lidar * pt);
+        const float intensity = use_odometry_cloud ?
+            (has_intensity ? static_cast<float>(frame->frame->intensities[i]) : 0.0f) :
+            (has_intensity ? static_cast<float>(dense->intensities[i]) : 0.0f);
         std::memcpy(msg.data.data() + i * 16, pt.data(), sizeof(pt));
         std::memcpy(msg.data.data() + i * 16 + 12, &intensity, sizeof(intensity));
     }

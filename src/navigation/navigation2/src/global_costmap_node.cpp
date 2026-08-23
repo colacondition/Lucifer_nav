@@ -190,7 +190,7 @@ private:
     }
 
     const auto age = (now() - rclcpp::Time(stamp, get_clock()->get_clock_type())).seconds();
-    return age <= observation_timeout_;
+    return std::isfinite(age) && age >= 0.0 && age <= observation_timeout_;
   }
 
   bool getRobotTransform(geometry_msgs::msg::TransformStamped & transform)

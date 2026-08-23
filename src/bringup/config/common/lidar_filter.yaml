@@ -1,0 +1,7 @@
+/**:
+  ros__parameters:
+    input_topic: "/small_glim/deskewed_cloud"
+    output_topic: "/livox/lidar_filtered/pointcloud"
+    navigation_frame: "base_link"
+    navigation_range: 10.0
+    leaf_size: 0.06

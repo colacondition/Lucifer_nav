@@ -1,12 +1,12 @@
 # fast_location
 
-点云对先验 PCD 的主定位。吃 small_glim 的 `/Laser_map_dense`（世界系定位稠密点云）和
+点云对先验 PCD 的主定位。吃 small_glim 的 `/small_glim/deskewed_cloud`（scan-start 去畸变、odom 系权威云）和
 `/lio/robo/odom`（10Hz 里程计），用 **FastGICP 多尺度级联**把当前扫描配准到先验
 点云图，输出 **`map→odom` TF**。本工作空间里它是**唯一的 map→odom 来源**：
 navigation2 代价地图、RViz 的定位都靠它把 odom 树和 map 树连起来。
 
 ```text
-/Laser_map_dense ──┐               ┌──► map→odom TF (50Hz timer, EMA only)
+/small_glim/deskewed_cloud ──┐       ┌──► map→odom TF (50Hz timer, EMA only)
               ├─► FastGICP 级联 ──┤
 /lio/robo/odom┘   3.0→2.0→1.5→1.0  └──► 退化/平滑后修正 map→odom
 ```
@@ -74,7 +74,7 @@ RMUL 对面角约 11m，锁过去会被拒绝；只有远角胜出来时停在 `
 
 | Topic | 方向 | 类型 | 说明 |
 | :- | :- | :- | :- |
-| `/Laser_map_dense` | 订阅 | `PointCloud2` | small_glim 世界系定位稠密点云（launch 把 `sub_scan_topic` 覆盖到这条） |
+| `/small_glim/deskewed_cloud` | 订阅 | `PointCloud2` | small_glim 唯一权威的 scan-start 去畸变 odom 云；fast_location 与实时感知共同消费 |
 | `/lio/robo/odom` | 订阅 | `Odometry` | small_glim 里程计，提供位姿初猜与帧对齐 |
 | `initialpose_3d` / `/initialpose` | 订阅 | `PoseStamped` / `PoseWithCovarianceStamped` | 手动/外部播种初始位姿 |
 | `pc_in_map` | 发布 | `PointCloud2` | 匹配到 map 后的当前扫描 |
@@ -120,7 +120,10 @@ Humble 下 `transient_local` 与 intra-process 不能同时开，见下「契约
 | `map_pcd_path` | `package://bringup/PCD/RMUL.pcd` | 先验图，launch 按 `world` 拼 `<world>.pcd` |
 | `map_voxel_size` / `scan_voxel_size` | 0.1 / 0.05 | 图/扫描体素滤波（实车 0.20） |
 | `scan_input_frame_mode` | `odom` | 扫描所在坐标系：`odom`/`base` |
-| `scan_accumulate_frames` | 5 | 堆积帧数 |
+| `scan_accumulate_frames` | 5 | 堆积帧数；仅 odom-frame 输入允许多帧，base 模式强制为 1 |
+| `scan_odom_sync.enable` | true | 扫描按 header stamp 绑定最近的 `/lio/robo/odom`，定位 timer 不再读取任意 latest odom |
+| `scan_odom_sync.max_delta` | 0.03 s | 最近 odom 超过该时间差则丢弃本扫描 |
+| `scan_odom_sync.history_size` | 32 | 固定容量 odom 历史；不新增线程、不深拷贝点云 |
 | `scan_min_range` / `scan_max_range` | 0.0 / 0.0 | 距离过滤（米，≤0 关闭）。近场点 <1m 多为
   近地/车身，远场 >100m 稀疏，都是坏对应；需要时配 `1.0`/`100.0` |
 | `fov_far` | 20.0（实车 12.0） | 视场最远距离 |
@@ -173,7 +176,7 @@ Humble 下 `transient_local` 与 intra-process 不能同时开，见下「契约
 `fast_location_main.yaml` → 覆盖字典：
 
 ```text
-sub_scan_topic: /Laser_map_dense
+sub_scan_topic: /small_glim/deskewed_cloud
 map_pcd_path:   package://bringup/PCD/<world>.pcd
 scan_voxel_size: 0.20          # 实车体素；仿真 launch 更细（0.10 / 0.20）
 submap_voxel_size_first/track: 0.20 / 0.35
@@ -184,7 +187,11 @@ fov_far: 12.0, localization_rate_hz: 10.0, gicp_num_threads: 2, map_publish_rate
 
 - **map→odom 唯一来源**：`publish_tf=true` 时由 **TF 定时器**发 `map`(父)→`odom`(子)，
   值是 EMA 后的 `T_pcd_to_odom_`。定位回调不再另发未平滑 TF。代价地图要的是
-  `map→odom→base_link` 全链可达；odom→base_link 由 small_glim 广播。
+  `map→odom→base_link` 全链可达；odom→base_link 由 small_glim 广播。首次定位成功后，
+  LOST/全局召回期间继续以当前时间广播最后接受的 map→odom，防止唯一 TF 边从缓存老化
+  消失；这不表示定位恢复，`localization_status` 仍保持 LOST，下游完整性门必须停车。
+- **扫描下采样缓存按源代次隔离**：体素滤波仍在锁外执行；若期间 SubScan 换了扫描，
+  旧计算结果只供当前调用使用，不回写新扫描的共享 cache，避免迟到结果污染下一帧。
 - **先验 PCD 必须与 small_glim 建图输出同坐标系**（odom 原点 z 锚在开机雷达平面）。
   换了图（`world` 参数）PCD 路径跟着换。
 - **退化时不是丢结果，是投影**：这是本工作区刻意的取舍，别改成整拍拒绝。

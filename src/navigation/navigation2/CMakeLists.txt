@@ -140,6 +140,31 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_speed_profile ${PROJECT_NAME})
 
+  ament_add_gtest(test_minco_time_allocation
+    test/test_minco_time_allocation.cpp
+  )
+  target_link_libraries(test_minco_time_allocation ${PROJECT_NAME})
+
+  ament_add_gtest(test_minco_optimizer
+    test/test_minco_optimizer.cpp
+  )
+  target_link_libraries(test_minco_optimizer ${PROJECT_NAME})
+
+  ament_add_gtest(test_distance_field_query
+    test/test_distance_field_query.cpp
+  )
+  target_link_libraries(test_distance_field_query ${PROJECT_NAME})
+
+  ament_add_gtest(test_distance_transform
+    test/test_distance_transform.cpp
+  )
+  target_link_libraries(test_distance_transform ${PROJECT_NAME})
+
+  ament_add_gtest(test_mpc_solver
+    test/test_mpc_solver.cpp
+  )
+  target_link_libraries(test_mpc_solver ${PROJECT_NAME})
+
   # ROS 级集成测试：启真节点、喂合成话题、断言 FSM 行为。
   # gtest 只能覆盖纯函数；FSM 状态转移、接近段开关时序、
   # last_published_speed 是否真的驱动 ProgressMonitor 这些必须在节点层验证 ——

@@ -1,10 +1,12 @@
 #include "grid_utils.hpp"
 #include "minco/minco_optimizer.hpp"
+#include "minco_time_allocation.hpp"
 #include "performance_monitor.hpp"
 #include "semantic_map_consumer.hpp"
 #include "shared_state.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <mutex>
 #include <string>
@@ -42,9 +44,23 @@ public:
     semantic_map_topic_ = declare_parameter<std::string>(
       "semantic_map_topic", "/map_server/semantic_map");
 
-    // 时间分配参数
+    // 固定时间分配参数。保持时间不进入 L-BFGS，避免扩大优化变量；在距离/速度基础上
+    // 根据转角给相邻段增加过渡时间，给急弯更合理的动力学初值。
     default_velocity_ = declare_parameter<double>("default_velocity", 1.0);
     min_segment_time_ = declare_parameter<double>("min_segment_time", 0.1);
+    turn_time_weight_ = declare_parameter<double>("turn_time_weight", 0.0);
+    first_stage_max_iterations_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("first_stage.max_iterations", 800)));
+    lbfgs_memory_size_ = static_cast<int>(std::clamp<int64_t>(
+      declare_parameter<int>("lbfgs.memory_size", 32), 4, 128));
+    two_stage_enable_ = declare_parameter<bool>("two_stage.enable", true);
+    two_stage_max_speed_ = declare_parameter<double>("two_stage.max_speed", default_velocity_);
+    two_stage_max_accel_ = declare_parameter<double>("two_stage.max_accel", 4.0);
+    two_stage_max_scale_ = declare_parameter<double>("two_stage.max_scale", 1.5);
+    two_stage_samples_per_piece_ = static_cast<int>(std::max<int64_t>(
+      3, declare_parameter<int>("two_stage.samples_per_piece", 5)));
+    two_stage_max_iterations_ = static_cast<int>(std::max<int64_t>(
+      1, declare_parameter<int>("two_stage.max_iterations", 300)));
 
     // 关断式性能观测：默认关。开 enable 后记录优化耗时 / 成功 / 失败原因到 CSV。
     {
@@ -65,6 +81,9 @@ public:
     params.tunnel_axis_weight = tunnel_axis_weight_;
     params.obstacle_weight = obstacle_weight_;
     params.safe_dist = safe_dist_;
+    params.obstacle_normal_only = false;
+    params.lbfgs_memory_size = lbfgs_memory_size_;
+    params.max_iterations = first_stage_max_iterations_;
     params.enable = enable_optimization_;
     minco_optimizer_->setParams(params);
 
@@ -121,14 +140,10 @@ private:
       waypoints.emplace_back(pose.pose.position.x, pose.pose.position.y);
     }
 
-    // 计算段时间（基于路径点间距离）
-    std::vector<double> segment_times;
-    segment_times.reserve(waypoints.size() - 1);
-    for (size_t i = 0; i + 1 < waypoints.size(); ++i) {
-      double dist = (waypoints[i + 1] - waypoints[i]).norm();
-      double time = std::max(dist / default_velocity_, min_segment_time_);
-      segment_times.push_back(time);
-    }
+    // 固定段时间：距离项保证直线速度尺度，转角项给急弯两侧增加过渡时间。该计算为
+    // O(N)，不新增优化变量、线程或逐周期缓存，保持现有 MINCO 热路径的规模。
+    std::vector<double> segment_times = allocateMincoSegmentTimes(
+      waypoints, default_velocity_, min_segment_time_, turn_time_weight_);
 
     // 障碍代价距离场：优化前读一次快照（shared_ptr 只读，跨节点 registry 有锁），
     // 优化回调里反复查同一快照，不在 L-BFGS 热循环里每点加锁。未就绪时障碍项失效。
@@ -138,13 +153,70 @@ private:
         if (!dist_field) {
           return false;
         }
-        return navigation2::DistanceFieldRegistry::query(*dist_field, pos, d, g);
+        return navigation2::DistanceFieldRegistry::queryQuadratic(*dist_field, pos, d, g);
       });
 
     // MINCO 优化
     auto start_time = now();
     auto pieces = minco_optimizer_->optimize(waypoints, segment_times);
     auto duration = (now() - start_time).seconds();
+
+    // 确定性第二阶段：第一阶段轨迹固定采样 v/a，只增加违反动力学段的时间，再以
+    // 原始路标点重跑一次较小迭代预算的 MINCO。第二阶段失败时保留第一阶段结果。
+    if (!pieces.empty() && two_stage_enable_ && pieces.size() == segment_times.size() &&
+      two_stage_max_speed_ > 0.0 && two_stage_max_accel_ > 0.0)
+    {
+      std::vector<double> scales(pieces.size(), 1.0);
+      bool needs_second_stage = false;
+      for (size_t i = 0; i < pieces.size(); ++i) {
+        const double piece_duration = pieces[i].getDuration();
+        double vmax = 0.0;
+        double amax = 0.0;
+        for (int sample = 0; sample < two_stage_samples_per_piece_; ++sample) {
+          const double ratio = static_cast<double>(sample) /
+            static_cast<double>(two_stage_samples_per_piece_ - 1);
+          const double t = ratio * piece_duration;
+          vmax = std::max(vmax, pieces[i].getVel(t).norm());
+          amax = std::max(amax, pieces[i].getAcc(t).norm());
+        }
+        scales[i] = std::clamp(
+          std::max({1.0, vmax / two_stage_max_speed_,
+            std::sqrt(amax / two_stage_max_accel_)}), 1.0, two_stage_max_scale_);
+        needs_second_stage = needs_second_stage || scales[i] > 1.001;
+      }
+      if (needs_second_stage) {
+        // 一次固定三点平滑，防止相邻段时间突跳；只增不减。
+        const auto raw_scales = scales;
+        for (size_t i = 0; i < scales.size(); ++i) {
+          const double left = raw_scales[i == 0 ? i : i - 1];
+          const double right = raw_scales[i + 1 < raw_scales.size() ? i + 1 : i];
+          scales[i] = std::clamp(
+            0.25 * left + 0.5 * raw_scales[i] + 0.25 * right,
+            1.0, two_stage_max_scale_);
+          segment_times[i] *= scales[i];
+        }
+        MincoOptimizer::Params fine_params;
+        fine_params.smooth_weight = smooth_weight_;
+        fine_params.data_weight = data_weight_;
+        fine_params.tunnel_axis_weight = tunnel_axis_weight_;
+        fine_params.obstacle_weight = obstacle_weight_;
+        fine_params.safe_dist = safe_dist_;
+        fine_params.obstacle_normal_only = true;
+        fine_params.lbfgs_memory_size = lbfgs_memory_size_;
+        fine_params.max_iterations = two_stage_max_iterations_;
+        fine_params.enable = enable_optimization_;
+        minco_optimizer_->setParams(fine_params);
+        auto fine_pieces = minco_optimizer_->optimize(waypoints, segment_times);
+        if (!fine_pieces.empty()) {
+          pieces = std::move(fine_pieces);
+        }
+        // 恢复第一阶段参数，下一条路径不会继承 fine 模式。
+        fine_params.obstacle_normal_only = false;
+        fine_params.max_iterations = first_stage_max_iterations_;
+        minco_optimizer_->setParams(fine_params);
+        duration = (now() - start_time).seconds();
+      }
+    }
 
     if (pieces.empty()) {
       RCLCPP_ERROR(get_logger(), "MINCO optimization failed, publishing original path");
@@ -285,6 +357,15 @@ private:
 
   double default_velocity_;
   double min_segment_time_;
+  double turn_time_weight_;
+  int first_stage_max_iterations_;
+  int lbfgs_memory_size_;
+  bool two_stage_enable_;
+  double two_stage_max_speed_;
+  double two_stage_max_accel_;
+  double two_stage_max_scale_;
+  int two_stage_samples_per_piece_;
+  int two_stage_max_iterations_;
 
   std::unique_ptr<MincoOptimizer> minco_optimizer_;
 

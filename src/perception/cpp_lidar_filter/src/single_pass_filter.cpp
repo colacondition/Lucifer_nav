@@ -129,8 +129,11 @@ bool filterSinglePass(
   const double range_squared = params.range * params.range;
   const double inv_leaf = 1.0 / params.leaf;
 
+  // 节点成员复用：clear() 保留 capacity。seen 使用 thread_local，组件固定单回调线程，
+  // 同尺寸帧只clear桶内容、不重新申请整张哈希表。
   output.reserve(point_count);
-  std::unordered_set<std::uint64_t> seen;
+  thread_local std::unordered_set<std::uint64_t> seen;
+  seen.clear();
   seen.reserve(point_count);
 
   // 旋转/平移分量拆开，避免逐点构造 Affine 乘法的开销。

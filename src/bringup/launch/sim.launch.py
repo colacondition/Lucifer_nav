@@ -1,4 +1,3 @@
-import glob
 import os
 import yaml
 
@@ -32,7 +31,6 @@ def generate_launch_description():
         get_package_share_directory('pb_rm_simulation'), 'launch')
     navigation2_launch_dir = os.path.join(
         get_package_share_directory('navigation2'), 'launch')
-    fast_location_dir = get_package_share_directory('fast_location')
 
     world = LaunchConfiguration('world')
     use_sim_time = LaunchConfiguration('use_sim_time')
@@ -44,6 +42,8 @@ def generate_launch_description():
     mode = LaunchConfiguration('mode')
     mapping_nav = LaunchConfiguration('mapping_nav')
     perception_threads = LaunchConfiguration('perception_threads')
+    sim_lidar_downsample = LaunchConfiguration('sim_lidar_downsample')
+    gazebo_clock_rate = LaunchConfiguration('gazebo_clock_rate')
 
     # 建图模式下可选再跑导航（SLAM-navigation）：map 帧与 /map 由 slam_toolbox 边扫边
     # 发，语义地图缺席（还没有 .msgpack 可读），隧道相关逻辑全部退化失效，仅作普通
@@ -70,19 +70,21 @@ def generate_launch_description():
         ' rpy:=', launch_params['base_link2livox_frame']['rpy'],
     ])
 
-    # 导航参数唯一真源在 navigation2 包的 params/navigation2.yaml（launch 默认值同源）。
-    navigation_params = os.path.join(
-        get_package_share_directory('navigation2'), 'params', 'navigation2.yaml')
-    fast_location_params = os.path.join(bringup_dir, 'config', 'fast_location_main.yaml')
-    seg_params = os.path.join(bringup_dir, 'config', 'simulation', 'segmentation_sim.yaml')
-    # slam_toolbox 建图参数，实车/仿真共用一份（HL 的 real/sim 两份 diff 为空）。
-    mapper_params = os.path.join(bringup_dir, 'config', 'mapper_params_online_async.yaml')
-    # small_glim 的参数分两层：包内 config/params_*.yaml 是全量默认值（glob 加载，
-    # 与上游 launch 的行为一致），bringup 的 small_glim_sim.yaml 只放仿真差异项。
-    small_glim_default_params = sorted(glob.glob(os.path.join(
-        get_package_share_directory('small_glim'), 'config', 'params_*.yaml')))
-    small_glim_params = os.path.join(
-        bringup_dir, 'config', 'simulation', 'small_glim_sim.yaml')
+    # 运行期参数唯一权威源：先加载 common，再加载 simulation 覆盖。
+    common_config_dir = os.path.join(bringup_dir, 'config', 'common')
+    simulation_config_dir = os.path.join(bringup_dir, 'config', 'simulation')
+    navigation_params = os.path.join(common_config_dir, 'navigation2.yaml')
+    fast_location_params = os.path.join(common_config_dir, 'fast_location.yaml')
+    fast_location_env_params = os.path.join(simulation_config_dir, 'fast_location.yaml')
+    seg_params = os.path.join(common_config_dir, 'segmentation.yaml')
+    seg_env_params = os.path.join(simulation_config_dir, 'segmentation.yaml')
+    mapper_params = os.path.join(common_config_dir, 'mapper.yaml')
+    lidar_filter_params = os.path.join(common_config_dir, 'lidar_filter.yaml')
+    cloud_to_scan_params = os.path.join(common_config_dir, 'pointcloud_to_laserscan.yaml')
+    waypoint_executor_params = os.path.join(common_config_dir, 'waypoint_executor.yaml')
+    simulated_gimbal_params = os.path.join(simulation_config_dir, 'simulated_gimbal.yaml')
+    small_glim_common_params = os.path.join(common_config_dir, 'small_glim.yaml')
+    small_glim_params = os.path.join(simulation_config_dir, 'small_glim_sim.yaml')
     # RViz 配置按 mode 选：navigation.rviz 的 Fixed Frame 是 map，而 map 只有
     # nav 模式下的 fast_location / map_server 才发；建图模式下用 mapping.rviz
     # （Fixed Frame=odom，带 /Laser_map 显示）。见 rviz/mapping.rviz 顶部说明。
@@ -125,6 +127,10 @@ def generate_launch_description():
     declare_perception_threads = DeclareLaunchArgument(
         'perception_threads', default_value='1',
         description='感知容器 executor 线程数（lidar_filter + ground_segmentation）')
+    declare_sim_lidar_downsample = DeclareLaunchArgument(
+        'sim_lidar_downsample', default_value='3')
+    declare_gazebo_clock_rate = DeclareLaunchArgument(
+        'gazebo_clock_rate', default_value='100.0')
     declare_waypoint_file = DeclareLaunchArgument(
         'waypoint_file', default_value='/tmp/navigation_waypoints.csv')
     declare_software_rendering = DeclareLaunchArgument(
@@ -155,24 +161,24 @@ def generate_launch_description():
             'world': world,
             'robot_description': robot_description,
             'gazebo_gui': gazebo_gui,
-            'sim_lidar_downsample': '3',
-            'gazebo_clock_rate': '100.0',
+            'sim_lidar_downsample': sim_lidar_downsample,
+            'gazebo_clock_rate': gazebo_clock_rate,
             'rviz': 'False',
             'log_level': log_level,
             'node_output': node_output,
         }.items())
 
     # ===== 2. small_glim (里程计 + 建图) =====
-    # 话题名（/Odometry、/lio/robo/odom、/Laser_map）直接在包内 params_node.yaml
-    # 里按本工作区契约配置，无需 remap。点云来自 Gazebo livox 插件的
-    # /livox/lidar/pointcloud（无逐点时间戳，small_glim 自动生成伪时间戳）。
-    # 参数顺序有意义：后面的覆盖前面的。
+    # small_glim 完整运行参数来自 bringup common，simulation 文件只覆盖仿真差异。
+    # Gazebo 点云无逐点时间戳时，common 中的 TimeKeeper 规则生成伪时间。
+    # 参数顺序有意义：后面的环境与动态 launch 值覆盖 common。
     lio_node = Node(
         respawn=True, respawn_delay=2.0,  # 与 real.launch 对齐：LIO 崩溃自愈
         package='small_glim',
         executable='small_glim_node',
         output='log',
-        parameters=small_glim_default_params + [
+        parameters=[
+            small_glim_common_params,
             small_glim_params,
             {
                 'use_sim_time': use_sim_time,
@@ -227,19 +233,12 @@ def generate_launch_description():
                 'cpp_lidar_filter::LidarFilterNode',
                 'lidar_filter',
                 'cpp_lidar_filter',
-                [{
-                    'use_sim_time': use_sim_time,
-                    'input_topic': '/livox/lidar/pointcloud',
-                    'output_topic': '/livox/lidar_filtered/pointcloud',
-                    'navigation_frame': 'base_link',
-                    'navigation_range': 10.0,
-                    'leaf_size': 0.06,
-                }]),
+                [lidar_filter_params, {'use_sim_time': use_sim_time}]),
             perception_component(
                 'linefit_ground_segmentation::SegmentationNode',
                 'ground_segmentation',
                 'linefit_ground_segmentation_ros',
-                [seg_params, {'use_sim_time': use_sim_time}]),
+                [seg_params, seg_env_params, {'use_sim_time': use_sim_time}]),
         ]
 
     # 容器每次退出（崩溃被 respawn 或正常退出）都重新调度组件加载。Humble 的
@@ -269,23 +268,7 @@ def generate_launch_description():
             ('cloud_in', '/segmentation/obstacle'),
             ('scan', '/scan'),
         ],
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            # 投影到底盘系：侧倾时仍输出重力对齐的 2D 扫描（同 HL 的做法）。
-            'target_frame': 'base_link',
-            'transform_tolerance': 0.05,
-            'min_height': 0.05,
-            'max_height': 1.2,
-            'angle_min': -3.14159,
-            'angle_max': 3.14159,
-            'angle_increment': 0.0043,
-            'scan_time': 0.3333,
-            'range_min': 0.45,
-            'range_max': 10.0,
-            'use_inf': True,
-            'inf_epsilon': 1.0,
-            'queue_size': 10,
-        }],
+        parameters=[cloud_to_scan_params, {'use_sim_time': use_sim_time}],
         arguments=common_log_arguments)
 
     slam_mapping_node = Node(
@@ -306,21 +289,10 @@ def generate_launch_description():
         name='robot_localization_node',
         output='screen',
         additional_env=system_libusb_env,
-        # 基线参数来自 config/fast_location_main.yaml；下面只覆盖仿真特有项。
-        # 顺序有意义：后面的条目覆盖前面的。
-        parameters=[fast_location_params, {
+        # common 完整参数后加载 simulation 覆盖；动态路径/时钟保留在 launch。
+        parameters=[fast_location_params, fast_location_env_params, {
             'use_sim_time': use_sim_time,
             'map_pcd_path': fast_location_pcd_path,
-            'sub_scan_topic': '/Laser_map_dense',
-            # 0.20 体素对 0.5m 车体太粗，GICP 单拍噪声会打进 map→odom，RViz 整车抖。
-            'scan_voxel_size': 0.10,
-            'submap_voxel_size_first': 0.10,
-            'submap_voxel_size_track': 0.20,
-            'fov_far': 12.0,
-            # 与 fast_location_main.yaml 保持一致：10Hz 雷达每帧都做一次 ICP。
-            'localization_rate_hz': 10.0,
-            'gicp_num_threads': 2,
-            'map_publish_rate_hz': 0.2,
         }],
         arguments=['--ros-args', '--log-level', 'info'])
 
@@ -363,10 +335,7 @@ def generate_launch_description():
         executable='simulated_gimbal_node',
         name='simulated_gimbal',
         output=node_output,
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            'action_delay': 0.5,
-        }],
+        parameters=[simulated_gimbal_params, {'use_sim_time': use_sim_time}],
         arguments=common_log_arguments)
 
     # ===== 7. 速度转换已并进 navigation2 容器（fake_vel_transform 组件）=====
@@ -378,12 +347,9 @@ def generate_launch_description():
         executable='waypoint_executor',
         name='waypoint_follow_executor',
         output=node_output,
-        parameters=[{
+        parameters=[waypoint_executor_params, {
             'use_sim_time': use_sim_time,
             'waypoint_file': waypoint_file,
-            'goal_topic': '/goal_pose',
-            'status_topic': '/navigation2/status',
-            'saved_waypoint_file_topic': '/waypoint_editor/saved_waypoint_file',
         }],
         arguments=common_log_arguments)
 
@@ -403,7 +369,8 @@ def generate_launch_description():
     for action in [
         declare_world, declare_mode, declare_mapping_nav, declare_use_sim_time,
         declare_nav_rviz, declare_gazebo_gui, declare_log_level, declare_node_output,
-        declare_perception_threads,
+        declare_perception_threads, declare_sim_lidar_downsample,
+        declare_gazebo_clock_rate,
         declare_software_rendering, declare_waypoint_file, declare_map_save_dir,
         enable_software_gl,
         start_simulation,

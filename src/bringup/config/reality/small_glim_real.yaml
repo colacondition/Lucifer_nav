@@ -1,10 +1,9 @@
 /**:
   ros__parameters:
-    # 实车覆盖项；话题名/frame 名已在包内 params_node.yaml 里按本工作区契约设好
+    # 实车覆盖项；话题名/frame 名已在 common/small_glim.yaml 里按本工作区契约设好
     # （/livox/lidar/pointcloud、/livox/imu、/Odometry、/lio/robo/odom、/Laser_map、odom/base_link）
     node:
       acc_scale: 9.7946        # Mid360 内置 IMU 输出 g 单位，乘实测重力（沿用 super_lio gravity_norm）
-      enable_tf_publish: true  # 广播动态 odom -> base_link
     sensors:
       # T_lidar_imu (xyz + qxyzw)。super_lio 的 lidar_imu 是 T_imu_lidar（R=I），取逆变号；
       # 与 Livox 手册 IMU 在点云系位置 (11.0, 23.29, -44.12) mm 交叉验证一致

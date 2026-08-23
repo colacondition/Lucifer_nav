@@ -29,6 +29,12 @@ public:
     // 为空时障碍项自动失效（等价于关闭），退回纯几何平滑。
     double obstacle_weight{0.0};
     double safe_dist{0.2};
+    // 精优化阶段只保留障碍梯度的轨迹法向分量，避免沿切向推拉路标点破坏时间分配。
+    bool obstacle_normal_only{false};
+    // L-BFGS 资源上限。history=32 时历史矩阵为 O(64*N)，远小于旧值256；迭代上限
+    // 分阶段配置，避免开启两阶段后把两个4000次预算简单相加。
+    int lbfgs_memory_size{32};
+    int max_iterations{800};
     bool enable{true};
   };
 

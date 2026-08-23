@@ -4,8 +4,8 @@
 #   - real.launch.py:44 把 xyz/rpy 传给 sentry_robot_real.xacro，生成静态 TF；
 #   - 代价地图的高度带是相对 base_link 的差值（obstacle_z_*_to_robo），
 #     所以它自动跟着这个外参走；
-#   - 地面分割的 sensor_height 由节点从这条 TF 查出来（sensor_height_frame:
-#     base_link），不再在 segmentation_real.yaml 里手填。
+#   - 地面分割的 sensor_height 由 common/segmentation.yaml + reality/segmentation.yaml
+#     管理，不再从动态 TF 猜测。
 # 改雷达安装位置只改这一行。
 #
 # 改动记录：原来 z 填 0.0（雷达和底盘重合），而 segmentation_real.yaml 写

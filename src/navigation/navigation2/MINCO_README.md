@@ -5,8 +5,9 @@
 
 ## 功能特性
 
-- **时空耦合优化**：同时优化路径和时间分配
-- **动力学约束**：最小化 jerk（加加速度），保证轨迹平滑
+- **固定时间、形状优化**：L-BFGS 只优化内部路标点 XY，段时间不作为优化变量
+- **转角感知时间初值**：距离/速度基础上为急弯两侧增加过渡时间
+- **动力学连续性**：最小化 jerk（加加速度），保证轨迹平滑
 - **L-BFGS 优化**：高效的非线性优化求解器
 
 ## 架构说明
@@ -35,7 +36,7 @@
 | **算法** | 梯度下降 + 二阶差分 | L-BFGS + 分段多项式 |
 | **优化目标** | 最小化曲率（近似） | 最小化 jerk（精确） |
 | **动力学** | 不考虑速度/加速度 | 考虑速度/加速度约束 |
-| **时间分配** | 无（路径固定） | 自动优化时间分配 |
+| **时间分配** | 无（路径固定） | 距离 + 转角的固定预分配（不进入 L-BFGS） |
 | **连续性** | C¹（速度连续） | C²（加速度连续） |
 | **求解时间** | ~5ms | ~20-100ms |
 
@@ -58,7 +59,9 @@ ros2 launch bringup real.launch.py
 ```yaml
 smooth_weight: 1.0        # 增大 → 轨迹更平滑，但可能偏离原路径
 data_weight: 10.0         # 数据保持项，拉回原始路径
-default_velocity: 1.0     # 影响时间分配（段距离 / 速度）
+default_velocity: 1.0     # 直线段基础时间 = 距离 / 速度
+min_segment_time: 0.1    # 防止极短段使 MINCO 数值退化
+turn_time_weight: 0.12   # 每弧度转角增加的过渡时间（分摊到相邻两段）
 ```
 
 ## 调试技巧
@@ -114,17 +117,23 @@ ros2 run navigation2 rm_minco_path_smoother_node --ros-args --log-level debug
 
 ### 时间分配策略
 
-当前使用简单的距离/速度公式：
+当前时间不作为 L-BFGS 变量，以保持优化维度、内存规模和收敛行为稳定。基础段时间为：
 
 ```cpp
-double dist = (waypoints[i+1] - waypoints[i]).norm();
-double time = std::max(dist / default_velocity_, min_segment_time_);
+double base = std::max(segment_distance / default_velocity, min_segment_time);
 ```
 
-未来可以改进为：
-- 考虑曲率（弯道减速）
-- 考虑障碍物密度（密集区域减速）
-- 自适应时间优化（MINCO 支持对时间求导）
+每个内部拐角再增加 `turn_time_weight * abs(turn_angle)` 秒，并按相邻段长度分摊到两侧。
+直线不受影响，急弯获得更大的速度/加速度过渡时间。这吸收了 RoboWalker 2025
+“路径长度 + 转角”前端时间度量的思路，但不增加节点或线程。
+
+可选 `two_stage.enable` 提供受限二阶段：第一阶段后固定采样每段最大速度/加速度，只将
+违反动力学阈值的段时间放大（带三点平滑和 `max_scale` 上限），再用较小迭代预算优化
+一次原路标点。精优化的障碍 soft 梯度仅保留轨迹法向分量，避免沿切向推拉时间分配；
+第二阶段失败会保留第一阶段结果。当前默认开启；objective 的固定尺寸 Eigen 工作区会按
+路标数预分配并在所有 line-search evaluation 和第二阶段间复用。L-BFGS history 从旧值
+256 收到 32，第一/第二阶段迭代上限分别为 800/300，避免把两个 4000 次预算相加。
+`performance.*` 可记录实车耗时，必要时 `two_stage.enable: false` 一键回退。
 
 ### 轨迹采样
 

@@ -216,6 +216,60 @@ public:
     return true;
   }
 
+  // 二次可分离插值查询，给轨迹优化热路径使用。以离查询点最近的格点为中心取 3x3
+  // 邻域，先沿 x 再沿 y 拟合二次函数，并解析求导。相比双线性插值，梯度跨 cell
+  // 边界更平滑，也能缓和对称窄通道中的梯度突变；仅需固定 3x3 标量读取，不分配内存。
+  // 地图边缘不足 3x3 时回退到 query()。
+  static bool queryQuadratic(
+    const DistanceFieldSnapshot & field, const Eigen::Vector2d & pos,
+    double & dist, Eigen::Vector2d & grad)
+  {
+    if (!field.valid || field.distance.empty() || field.width <= 0 || field.height <= 0 ||
+      !std::isfinite(field.resolution) || field.resolution <= 0.0)
+    {
+      return false;
+    }
+
+    const double gx = (pos.x() - field.origin_x) / field.resolution;
+    const double gy = (pos.y() - field.origin_y) / field.resolution;
+    const int cx = static_cast<int>(std::floor(gx + 0.5));
+    const int cy = static_cast<int>(std::floor(gy + 0.5));
+    if (cx - 1 < 0 || cy - 1 < 0 || cx + 1 >= field.width || cy + 1 >= field.height) {
+      return query(field, pos, dist, grad);
+    }
+
+    const double ux = gx - static_cast<double>(cx);
+    const double uy = gy - static_cast<double>(cy);
+    const auto & d = field.distance;
+    const auto idx = [&field](int x, int y) {
+        return static_cast<size_t>(y) * static_cast<size_t>(field.width) +
+               static_cast<size_t>(x);
+      };
+    const auto quadratic = [](double fm, double f0, double fp, double u) {
+        return f0 + 0.5 * u * (fp - fm) + 0.5 * u * u * (fp - 2.0 * f0 + fm);
+      };
+    const auto derivative = [](double fm, double f0, double fp, double u) {
+        return 0.5 * (fp - fm) + u * (fp - 2.0 * f0 + fm);
+      };
+
+    double row_value[3];
+    double row_dx[3];
+    for (int row = -1; row <= 1; ++row) {
+      const double fm = d[idx(cx - 1, cy + row)];
+      const double f0 = d[idx(cx, cy + row)];
+      const double fp = d[idx(cx + 1, cy + row)];
+      row_value[row + 1] = quadratic(fm, f0, fp, ux);
+      row_dx[row + 1] = derivative(fm, f0, fp, ux);
+    }
+
+    dist = quadratic(row_value[0], row_value[1], row_value[2], uy);
+    const double dx_grid = quadratic(row_dx[0], row_dx[1], row_dx[2], uy);
+    const double dy_grid = derivative(row_value[0], row_value[1], row_value[2], uy);
+    grad.x() = dx_grid / field.resolution;
+    grad.y() = dy_grid / field.resolution;
+    return std::isfinite(dist) && grad.allFinite();
+  }
+
 private:
   DistanceFieldRegistry() = default;
   mutable std::mutex mutex_;

@@ -254,10 +254,30 @@ PreprocessedFrame::Ptr CloudPreprocessor::preprocess_for_localization(const RawP
         return frame->times[lhs] < frame->times[rhs];
     });
     frame = gtsam_points::sample(frame, indices);
+    if (frame->size() == 0) {
+        return nullptr;
+    }
+    if (params->global_shutter) {
+        std::fill(frame->times, frame->times + frame->size(), 0.0);
+    }
+    const double min_time = frame->times[0];
+    const double max_time = frame->times[frame->size() - 1];
+    if (!std::isfinite(min_time) || !std::isfinite(max_time) || min_time < -1e-6 ||
+        max_time > params->max_scan_duration) {
+        logger::warn(
+            "cloud_preprocess", "drop localization cloud with invalid timestamp range min={:.6f} max={:.6f}",
+            min_time, max_time);
+        return nullptr;
+    }
 
     auto localized = std::make_shared<PreprocessedFrame>();
     localized->stamp = raw_points->stamp;
-    localized->scan_end_time = raw_points->stamp + frame->times[frame->size() - 1];
+    localized->scan_end_time = raw_points->stamp + max_time;
+    if (!std::isfinite(localized->stamp) || !std::isfinite(localized->scan_end_time) ||
+        localized->scan_end_time < localized->stamp ||
+        localized->scan_end_time - localized->stamp > params->max_scan_duration) {
+        return nullptr;
+    }
     localized->times.assign(frame->times, frame->times + frame->size());
     localized->points.assign(frame->points, frame->points + frame->size());
     if (frame->intensities) {
