@@ -21,6 +21,14 @@ AsyncOdometryEstimation::~AsyncOdometryEstimation() {
     join();
 }
 
+bool AsyncOdometryEstimation::latest_angular_velocity(Eigen::Vector3d* out) const {
+    return odometry_estimation->latest_angular_velocity(out);
+}
+
+bool AsyncOdometryEstimation::latest_imu_bias(Eigen::Matrix<double, 6, 1>* out) const {
+    return odometry_estimation->latest_imu_bias(out);
+}
+
 void AsyncOdometryEstimation::insert_imu(
     const double stamp,
     const Eigen::Vector3d& linear_acc,

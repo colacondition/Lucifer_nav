@@ -135,12 +135,19 @@ namespace mid360_driver {
         }
     }
 
+    // 重锚阈值：连续坏包达到该数即认为参考锚本身失效（雷达/主机时钟跳变、
+    // 重启换基准），把锚拨到当前包重新起步。取 ~2.5s 的包数——比任何一次
+    // 正常时钟扰动短，又足够长到不会把单帧毛刺当成新基准。
+    constexpr std::uint64_t kLidarReanchorAfterPackets = 25;  // 10Hz 帧 ≈ 2.5s
+    constexpr std::uint64_t kImuReanchorAfterPackets = 500;   // 200Hz 采样 ≈ 2.5s
+
     bool is_timestamp_plausible(
         std::unordered_map<asio::ip::address, double, IpAddressHasher> &last_timestamp_map,
+        std::unordered_map<asio::ip::address, std::uint64_t, IpAddressHasher> &implausible_streaks,
         const asio::ip::address &address,
         const double timestamp,
-        const double max_time_jump
-    ) {
+        const double max_time_jump,
+        const std::uint64_t reanchor_after) {
         if (!std::isfinite(timestamp) || timestamp <= 0.0) {
             return false;
         }
@@ -152,8 +159,16 @@ namespace mid360_driver {
 
         const double diff = timestamp - iter->second;
         if (diff < -1e-3 || diff > max_time_jump) {
+            // 连击计数而不是永远拒绝：这是旧实现「拒收即永久闩锁」的修复点。
+            const std::uint64_t streak = ++implausible_streaks[address];
+            if (streak >= reanchor_after) {
+                iter->second = timestamp;
+                implausible_streaks[address] = 0;
+                return true;
+            }
             return false;
         }
+        implausible_streaks[address] = 0;
         iter->second = timestamp;
         return true;
     }
@@ -295,7 +310,9 @@ namespace mid360_driver {
                     header_timestamp += iter->second;
                 }
             }
-            if (!is_timestamp_plausible(last_lidar_timestamp_map, sender_endpoint.address(), header_timestamp, robustness_config.max_packet_time_jump)) [[unlikely]] {
+            if (!is_timestamp_plausible(last_lidar_timestamp_map, lidar_implausible_streaks,
+                    sender_endpoint.address(), header_timestamp,
+                    robustness_config.max_packet_time_jump, kLidarReanchorAfterPackets)) [[unlikely]] {
                 log_packet_drop("lidar: implausible timestamp", robustness_config.min_drop_log_interval);
                 continue;
             }
@@ -399,7 +416,9 @@ namespace mid360_driver {
                     header_timestamp += iter->second;
                 }
             }
-            if (!is_timestamp_plausible(last_imu_timestamp_map, sender_endpoint.address(), header_timestamp, robustness_config.max_packet_time_jump)) [[unlikely]] {
+            if (!is_timestamp_plausible(last_imu_timestamp_map, imu_implausible_streaks,
+                    sender_endpoint.address(), header_timestamp,
+                    robustness_config.max_packet_time_jump, kImuReanchorAfterPackets)) [[unlikely]] {
                 log_packet_drop("imu: implausible timestamp", robustness_config.min_drop_log_interval);
                 continue;
             }

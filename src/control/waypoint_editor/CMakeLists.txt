@@ -134,4 +134,10 @@ install(TARGETS waypoint_executor
   DESTINATION lib/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  find_package(launch_testing_ament_cmake REQUIRED)
+  # 执行语义的图级集成测试（executor 类私有于 TU，gtest 无法覆盖）。
+  add_launch_test(test/test_waypoint_executor_follow.py TIMEOUT 90)
+endif()
+
 ament_package()

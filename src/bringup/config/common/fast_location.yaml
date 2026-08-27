@@ -96,6 +96,15 @@
     global_search_max_candidates: 2000000  # 候选硬上限：飞点/大图时自动加大步长防止 OOM
     global_search_yaw_step_deg: 30.0
     global_search_max_map_odom_jump: 1.0
+    # LOST 渐进放宽（绑架/搬场逃生通道）。默认关闭，行为与历史完全一致；
+    # 开启后：持续 LOST 超过 grace_sec 才开始放宽，每过一个 grace 周期
+    # 门限 ×grow_factor，直到 max_jump_m。max=8.0 仍低于 RMUL 对面角 ~11m，
+    # 不会重新打开「错锁对面角」的门；/initialpose 远端种子同受此门管辖，
+    # 搬场后 grace 期满即可用 initialpose 拉回。
+    lost_escape.enable: false
+    lost_escape.grace_sec: 20.0
+    lost_escape.grow_factor: 2.0
+    lost_escape.max_jump_m: 8.0
     global_search_score_distance: 0.45
     global_search_score_stride: 4
     global_search_top_k: 6

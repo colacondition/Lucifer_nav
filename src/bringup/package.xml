@@ -39,10 +39,11 @@
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>
 
-  <!-- 故意不声明 decision：decision 已经 exec_depend 了 bringup（它的路点 CSV
-       存在 bringup/config/waypoints 下），反向再声明会形成 colcon 无法拓扑排序
-       的环。real.launch.py 用 FindPackageShare 延迟解析 decision 的路径，
-       并由 use_decision 开关控制，未装 decision 时不会影响导航链启动。 -->
+    <!-- 航点 CSV 已拆到 sentry_waypoints 数据包：decision 不再 depend 本包，
+       这里恢复正常的 <exec_depend>decision</exec_depend>。 -->
+
+  <exec_depend>decision</exec_depend>
+  <exec_depend>sentry_waypoints</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -30,7 +30,7 @@
   <exec_depend>rclcpp_action</exec_depend>
   <exec_depend>tf2</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
-  <exec_depend>bringup</exec_depend>
+  <exec_depend>sentry_waypoints</exec_depend>
   <exec_depend>waypoint_editor</exec_depend>
 
   <export>

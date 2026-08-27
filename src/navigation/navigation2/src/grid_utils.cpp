@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+
+#include "distance_transform.hpp"
 #include <queue>
 #include <vector>
 
@@ -272,6 +274,116 @@ void applyInflationCostGradient(
   grid.data = std::move(inflated);
 }
 
+// —— EDT 膨胀：与上面两个卷积版本逐字节等价 ——
+//
+// 等价性论证（为什么不担心回归）：
+//   卷积版的代价只依赖格间距的欧氏距离 d(n, seed)（lattice hypot × 分辨率），
+//   且写的是 max 组合 ⇒ 逐格独立、与遍历顺序无关。EDT 给出的正是
+//   min_seed euclid(n, seed)，于是 cost(edt(n)) 与「所有 seed 往 n 写后取
+//   max」在数学上恒等；直写障碍/未知跳过、逐格半径上限这些旁路条件按原样
+//   搬进来即可。等价性由 test_edt_inflation 在随机栅格上做逐字节断言兜底。
+namespace
+{
+
+// 与 getInflationKernel 的公式保持同一语义（1 + 98·e^(−k·d) 夹到 [1,99]）。
+inline int8_t edtInflationCost(double distance_m, double cost_scaling_factor)
+{
+  const double normalized = std::exp(
+    -std::max(0.0, cost_scaling_factor) * std::max(0.0, distance_m));
+  const int cost = std::clamp(
+    static_cast<int>(std::round(1.0 + normalized * 98.0)), 1, 99);
+  return static_cast<int8_t>(cost);
+}
+
+}  // namespace
+
+void inflateOccupancyGridEDT(
+  nav_msgs::msg::OccupancyGrid & grid, double inflation_radius, int occupied_threshold)
+{
+  if (inflation_radius <= 0.0 || grid.info.resolution <= 0.0F || grid.data.empty()) {
+    return;
+  }
+
+  // 卷积版的有效边界是 ceil(半径/分辨率) 整格数（kernel 按格距离截断），
+  // 而不是物理米数 —— 复刻同一语义才逐字节等价。
+  const int radius_cells =
+    static_cast<int>(std::ceil(inflation_radius / static_cast<double>(grid.info.resolution)));
+  if (radius_cells <= 0) {
+    return;
+  }
+  const double reach_m = radius_cells * static_cast<double>(grid.info.resolution);
+
+  // Felzenszwalb EDT 的种子是 uint8 非零：≥threshold 记种子。unknown(-1)
+  // 不能当种子，先复制一份清零再喂。
+  std::vector<std::uint8_t> seeds(grid.data.size());
+  for (std::size_t i = 0; i < grid.data.size(); ++i) {
+    seeds[i] = (grid.data[i] >= occupied_threshold && grid.data[i] <= 100) ? 1 : 0;
+  }
+
+  DistanceTransformWorkspace workspace;
+  std::vector<double> distances;
+  exactDistanceTransform(seeds,
+    static_cast<int>(grid.info.width), static_cast<int>(grid.info.height),
+    workspace, distances);
+
+  for (std::size_t i = 0; i < grid.data.size(); ++i) {
+    if (grid.data[i] >= occupied_threshold || grid.data[i] < 0) {
+      continue;  // 障碍保持自身值、unknown 不动 —— 与卷积版一致。
+    }
+    // exactDistanceTransform 输出以「格」为单位（代价换算/上限比较时才乘分辨率，
+    // 与 local_costmap 的 DistanceFieldRegistry::query 同一口径）。
+    if (distances[i] <= static_cast<double>(radius_cells)) {
+      grid.data[i] = 100;
+    }
+  }
+}
+
+void applyInflationCostGradientEDT(
+  nav_msgs::msg::OccupancyGrid & grid, double inflation_radius, int occupied_threshold,
+  double cost_scaling_factor, const std::vector<float> & radius_limit)
+{
+  if (inflation_radius <= 0.0 || grid.info.resolution <= 0.0F || grid.data.empty()) {
+    return;
+  }
+
+  const bool use_limit = radius_limit.size() == grid.data.size();
+
+  // 与 inflateOccupancyGridEDT 相同的整格化半径（卷积版语义）。
+  const int radius_cells =
+    static_cast<int>(std::ceil(inflation_radius / static_cast<double>(grid.info.resolution)));
+  if (radius_cells <= 0) {
+    return;
+  }
+  const double reach_m = radius_cells * static_cast<double>(grid.info.resolution);
+
+  std::vector<std::uint8_t> seeds(grid.data.size());
+  for (std::size_t i = 0; i < grid.data.size(); ++i) {
+    seeds[i] = (grid.data[i] >= occupied_threshold && grid.data[i] <= 100) ? 1 : 0;
+  }
+
+  DistanceTransformWorkspace workspace;
+  std::vector<double> distances;
+  exactDistanceTransform(seeds,
+    static_cast<int>(grid.info.width), static_cast<int>(grid.info.height),
+    workspace, distances);
+
+  for (std::size_t i = 0; i < grid.data.size(); ++i) {
+    if (grid.data[i] >= occupied_threshold || grid.data[i] < 0) {
+      continue;  // 壁面/未知不覆盖。
+    }
+    const double dist_m = distances[i] * grid.info.resolution;
+    if (dist_m > reach_m) {
+      continue;
+    }
+    // 上限挂在「被膨胀到的格」上而不是障碍格上（隧道格只接受近处障碍的代价，
+    // 洞外的墙不该把洞里涂满）——条件与卷积版逐字一致。
+    if (use_limit && static_cast<float>(dist_m) > radius_limit[i]) {
+      continue;
+    }
+    grid.data[i] = std::max(grid.data[i], edtInflationCost(dist_m, cost_scaling_factor));
+  }
+}
+
 std::vector<GridCell> raytraceLine(int x0, int y0, int x1, int y1)
 {
   std::vector<GridCell> cells;
@@ -312,6 +424,31 @@ geometry_msgs::msg::Point transformPoint(
   out.x = point.x();
   out.y = point.y();
   out.z = point.z();
+  return out;
+}
+
+PlanarFrame makePlanarFrame(const geometry_msgs::msg::TransformStamped & transform)
+{
+  tf2::Transform tf_transform;
+  tf2::fromMsg(transform.transform, tf_transform);
+  const tf2::Matrix3x3 & R = tf_transform.getBasis();
+  PlanarFrame f;
+  f.tx = transform.transform.translation.x;
+  f.ty = transform.transform.translation.y;
+  f.tz = transform.transform.translation.z;
+  f.m20 = R[2][0]; f.m21 = R[2][1]; f.m22 = R[2][2];
+  // 平面投影只需要 yaw 行：R[0]/R[1] 的前两列合成 cos/sin。
+  f.cos_yaw = R[0][0];
+  f.sin_yaw = R[1][0];
+  return f;
+}
+
+geometry_msgs::msg::Point applyPlanarFrame(const PlanarFrame & f, double x, double y, double z)
+{
+  geometry_msgs::msg::Point out;
+  out.x = f.cos_yaw * x - f.sin_yaw * y + f.tx;
+  out.y = f.sin_yaw * x + f.cos_yaw * y + f.ty;
+  out.z = f.m20 * x + f.m21 * y + f.m22 * z + f.tz;
   return out;
 }
 

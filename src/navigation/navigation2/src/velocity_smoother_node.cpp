@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -53,7 +54,10 @@ public:
     cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       input_topic_, rclcpp::QoS(1),
       [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
-        last_cmd_time_ = now();
+        // steady clock 而不是 now()：超时判定不能依赖 ROS/sim 时钟。
+        // use_sim_time 下 /clock 起步为 0、可跳变回拨，会把「刚收到指令」
+        // 误判成「早已超时」而插发零速；单调钟不受影响。
+        last_cmd_time_ = std::chrono::steady_clock::now();
         current_cmd_ = arrayToTwist(limitAxes(twistToArray(*msg)));
         cmd_pub_->publish(current_cmd_);
       },
@@ -112,9 +116,9 @@ private:
   void update()
   {
     // 超时就把指令归零。有新输入时已经在订阅回调里转发过，这里不改写时间剖面。
-    const auto stamp = now();
-    if (last_cmd_time_.nanoseconds() != 0 &&
-      (stamp - last_cmd_time_).seconds() <= velocity_timeout_)
+    if (last_cmd_time_ != std::chrono::steady_clock::time_point{} &&
+      std::chrono::steady_clock::now() - last_cmd_time_ <=
+      std::chrono::duration<double>(velocity_timeout_))
     {
       return;
     }
@@ -131,7 +135,7 @@ private:
   std::array<double, 3> deadband_velocity_{0.0, 0.0, 0.0};
 
   geometry_msgs::msg::Twist current_cmd_;
-  rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
+  std::chrono::steady_clock::time_point last_cmd_time_{};
 
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
   rclcpp::CallbackGroup::SharedPtr cb_group_;

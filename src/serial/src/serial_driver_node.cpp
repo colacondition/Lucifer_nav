@@ -160,17 +160,38 @@ int SerialDriverNode::transmit()
 
     if (bytes_written != static_cast<int>(packet_size)) {
       failed_send_count_.fetch_add(1, std::memory_order_relaxed);
+      const int write_errno = port_->lastError();
       RCLCPP_ERROR(
         get_logger(),
-        "Serial write failed. expected=%zu actual=%d device=%s vel_x=%.3f vel_y=%.3f vel_w=%.3f "
-        "crc16=0x%04X raw=[%s]",
-        packet_size, bytes_written, config_->devname.c_str(), packet.vel_x, packet.vel_y,
+        "Serial write failed. expected=%zu actual=%d errno=%d(%s) device=%s vel_x=%.3f vel_y=%.3f "
+        "vel_w=%.3f crc16=0x%04X raw=[%s]",
+        packet_size, bytes_written, write_errno, strerror(write_errno),
+        config_->devname.c_str(), packet.vel_x, packet.vel_y,
         packet.vel_w, static_cast<unsigned int>(packet.crc16), packetToHex(packet).c_str());
-      reopenPort("Write failure");
+
+      // 旧实现任何写失败一律 close→sleep(1s)→open：非阻塞 fd 的瞬时
+      // EAGAIN（内核发送缓冲满）也会触发全重连，把已排队指令抖掉、云台帧
+      // 节奏打断，代价远大于「本帧丢弃」。现在分级：
+      //   * fd 级致命错误（EBADF/ENODEV/EINVAL）→ 立即 reopen；
+      //   * EAGAIN/其他瞬时错 → 保留端口、丢本帧，连续失败达到阈值才
+      //     reopen 兜底；成功一帧即清零连击。
+      constexpr int kFatalWriteErrnos[] = {EBADF, ENODEV, EINVAL};
+      const bool fatal = std::find(
+        std::begin(kFatalWriteErrnos),
+        std::end(kFatalWriteErrnos), write_errno) != std::end(kFatalWriteErrnos);
+      const int streak = write_fail_streak_.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (fatal || streak >= write_fail_reopen_threshold_) {
+        reopenPort("Write failure");
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *this->get_clock(), 2000,
+          "Serial write degraded (streak=%d), keeping port open", streak);
+      }
       return bytes_written;
     }
 
     sent_packet_count_.fetch_add(1, std::memory_order_relaxed);
+    write_fail_streak_.store(0, std::memory_order_relaxed);
     // 日志移至 DEBUG 级别，降低 1kHz 循环 CPU 占用
     RCLCPP_DEBUG(
       get_logger(),
@@ -337,7 +358,7 @@ void SerialDriverNode::ChassisCmdCallback(const geometry_msgs::msg::Twist::Share
       // 重连后一股脑灌给底盘，保留最新才是安全语义。
       constexpr std::size_t kMaxQueuedChassisBytes = sizeof(ChassisCommandPacket) * 10;
       while (transmit_buffer.size() + sizeof(packet) > kMaxQueuedChassisBytes &&
-             !transmit_buffer.empty())
+        !transmit_buffer.empty())
       {
         if (transmit_buffer.size() < sizeof(ChassisCommandPacket)) {
           transmit_buffer.clear();
@@ -559,6 +580,11 @@ void SerialDriverNode::getParam()
     chassis_vel_x_scale_ = declare_parameter<double>("chassis_vel_x_scale", -1.0);
     chassis_vel_y_scale_ = declare_parameter<double>("chassis_vel_y_scale", -1.0);
     chassis_vel_w_scale_ = declare_parameter<double>("chassis_vel_w_scale", 1.0);
+    // 指定设备打不开时是否允许扫 ttyACM{0..2} 兜底。多 CDC 设备的实车请
+    // 显式设 false，避免静默绑错串口（串口层回退时也会大声告警）。
+    allow_fallback_ = declare_parameter<bool>("allow_device_fallback", true);
+    write_fail_reopen_threshold_ =
+      declare_parameter<int>("write_fail_reopen_threshold", 20);
   } catch (const rclcpp::ParameterTypeException & ex) {
     RCLCPP_ERROR(get_logger(), "Invalid serial parameter type: %s", ex.what());
     throw;
@@ -602,6 +628,7 @@ void SerialDriverNode::getParam()
 
   config_ = std::make_shared<SerialConfig>(
     baud_rate, 8, flowcontrol, stop_bits, parity, device_name_);
+  config_->allow_fallback = allow_fallback_;
 }
 
 }  // namespace serial_driver

@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sentry_waypoints</name>
+  <version>1.0.0</version>
+  <description>
+    哨兵航点数据单一真源（纯数据包）。决策、执行器与 bringup 都从这里取
+    航点文件 —— 拆出来是为了解 decision→bringup 的反向依赖环：此前 decision
+    exec_depend bringup 只为拿 config/waypoints 的绝对路径。
+  </description>
+  <maintainer email="cola@example.com">cola</maintainer>
+  <license>MIT</license>
+</package>

@@ -127,6 +127,26 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     enable_global_search_ = this->get_parameter("enable_global_search").as_bool();
     global_search_max_map_odom_jump_ = static_cast<float>(std::max(
         0.0, this->get_parameter("global_search_max_map_odom_jump").as_double()));
+    // LOST 渐进放宽：绑架/搬场后 1m 门永远卡住召回，连 /initialpose 远端
+    // 种子都会被 far_prior 吃掉。默认关闭；开启后在持续 LOST 超过 grace
+    // 后按倍数逐级放宽到 max。max 默认 8m 仍低于对称场地「对面角 ~11m」，
+    // 不破坏原有防错锁设计意图。
+    lost_escape_enable_ = this->declare_parameter<bool>("lost_escape.enable", false);
+    lost_escape_grace_sec_ = std::max(
+        1.0, this->declare_parameter<double>("lost_escape.grace_sec", 20.0));
+    lost_escape_grow_factor_ = std::max(
+        1.0f, static_cast<float>(this->declare_parameter<double>("lost_escape.grow_factor", 2.0)));
+    lost_escape_max_jump_m_ = static_cast<float>(std::max(
+        0.0, this->declare_parameter<double>("lost_escape.max_jump_m", 8.0)));
+    // 契约自检：放宽上限仍须显著小于场地尺度的一半对角线，否则渐进放宽
+    // 会重新打开「错锁对称角」的门（RMUL 对面角 ~11m）。
+    if (lost_escape_enable_ && lost_escape_max_jump_m_ > 4.0f) {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "lost_escape.max_jump_m=%.1f exceeds the symmetric-venue safe band (<=4m); "
+            "verify against your arena's diagonal before enabling.",
+            lost_escape_max_jump_m_);
+    }
     global_search_config_.xy_step = std::max(
         0.1, this->get_parameter("global_search_xy_step").as_double());
     global_search_config_.max_candidates = static_cast<std::size_t>(std::max<int64_t>(
@@ -656,10 +676,11 @@ bool RobotLocalizationNode::performGlobalSearch()
     Eigen::Matrix4f best_result = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f best_guess = selected.front().pcd_from_odom;
     Eigen::Matrix4f previous_map_odom = Eigen::Matrix4f::Identity();
+    const float jump_limit = effectiveGlobalSearchJumpLimit();
     bool gate_map_odom_jump = false;
     {
         std::lock_guard<std::mutex> lock(tf_mutex_);
-        if (had_accepted_pose_ && global_search_max_map_odom_jump_ > 0.0f) {
+        if (had_accepted_pose_ && jump_limit > 0.0f) {
             previous_map_odom = T_pcd_to_odom_;
             gate_map_odom_jump = true;
         }
@@ -693,7 +714,7 @@ bool RobotLocalizationNode::performGlobalSearch()
             1.0f, gicp_max_iterations_first_, fitness);
         if (gate_map_odom_jump &&
             fast_location::mapOdomJumpExceeds(
-                previous_map_odom, refined, global_search_max_map_odom_jump_))
+                previous_map_odom, refined, jump_limit))
         {
             ++skipped_jump;
             if (fitness > best_jumped_fitness) {
@@ -703,7 +724,7 @@ bool RobotLocalizationNode::performGlobalSearch()
                 this->get_logger(),
                 "Global search skip: map→odom jump %.2f m > %.2f m (fitness=%.3f).",
                 fast_location::mapOdomXyJump(previous_map_odom, refined),
-                global_search_max_map_odom_jump_, fitness);
+                jump_limit, fitness);
             continue;
         }
         if (fitness > best_fitness) {
@@ -971,6 +992,7 @@ bool RobotLocalizationNode::acceptLocalizationResult(
     Eigen::Matrix4f published_T = result;
     bool jump_rejected = false;
     float rejected_jump = 0.0f;
+    const float gs_jump_limit = effectiveGlobalSearchJumpLimit();
     {
         std::lock_guard<std::mutex> lock(tf_mutex_);
         if (reloc_generation_ != loc_tick_epoch_) {
@@ -982,7 +1004,7 @@ bool RobotLocalizationNode::acceptLocalizationResult(
         // 不限全局搜索：/initialpose 局部 ICP 锁对面角也是一次 map→odom 大跳。
         if (had_accepted_pose_ &&
             fast_location::mapOdomJumpExceeds(
-                T_pcd_to_odom_, result, global_search_max_map_odom_jump_))
+                T_pcd_to_odom_, result, gs_jump_limit))
         {
             rejected_jump = fast_location::mapOdomXyJump(T_pcd_to_odom_, result);
             jump_rejected = true;
@@ -1004,18 +1026,36 @@ bool RobotLocalizationNode::acceptLocalizationResult(
             ema_transform_.block<3,1>(0,3) =
                 alpha * result.block<3,1>(0,3) +
                 (1.0f - alpha) * ema_transform_.block<3,1>(0,3);
-            // 旋转插值：提取各自的 yaw，最短路径插值
-            const double yaw_new = std::atan2(result(1, 0), result(0, 0));
-            const double yaw_old = std::atan2(ema_transform_(1, 0), ema_transform_(0, 0));
-            double dyaw = yaw_new - yaw_old;
+            // 旋转插值（Rz·Ry·Rx 欧拉域）：yaw 最短路径 EMA；roll/pitch 同样
+            // EMA 而不是永久冻结。旧实现只用 yaw 重建 2x2 子块，导致 result
+            // 里的 roll/pitch 每拍被抹掉 —— 坡道/颠簸下的真实姿态分量永远
+            // 进不了平滑状态。
+            const auto euler = [](const Eigen::Matrix4f& T) {
+                Eigen::Vector3d e;
+                e.x() = std::atan2(T(2, 1), T(2, 2));                    // roll
+                e.y() = std::atan2(-T(2, 0),
+                        std::hypot(T(2, 1), T(2, 2)));                   // pitch
+                e.z() = std::atan2(T(1, 0), T(0, 0));                    // yaw
+                return e;
+            };
+            const Eigen::Vector3d e_new = euler(result);
+            const Eigen::Vector3d e_old = euler(ema_transform_);
+            double dyaw = e_new.z() - e_old.z();
             while (dyaw > M_PI) { dyaw -= 2.0 * M_PI; }
             while (dyaw < -M_PI) { dyaw += 2.0 * M_PI; }
-            const double yaw_smoothed = yaw_old + alpha * dyaw;
-            // 重建旋转部分（只改 z 轴旋转，保留原来的 roll/pitch）
-            const float cy = static_cast<float>(std::cos(yaw_smoothed));
-            const float sy = static_cast<float>(std::sin(yaw_smoothed));
-            ema_transform_(0, 0) = cy; ema_transform_(0, 1) = -sy;
-            ema_transform_(1, 0) = sy; ema_transform_(1, 1) =  cy;
+            const double roll_s  = e_old.x() + alpha * (e_new.x() - e_old.x());
+            const double pitch_s = e_old.y() + alpha * (e_new.y() - e_old.y());
+            const double yaw_s   = e_old.z() + alpha * dyaw;
+            const double cr  = std::cos(roll_s);
+            const double sr  = std::sin(roll_s);
+            const double cp  = std::cos(pitch_s);
+            const double sp  = std::sin(pitch_s);
+            const double cy  = std::cos(yaw_s);
+            const double sy  = std::sin(yaw_s);
+            ema_transform_.block<3,3>(0,0) <<
+                cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr,
+                sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr,
+                -sp,           cp*sr,           cp*cr;
         }
         T_pcd_to_odom_ = ema_transform_;
         tf_ready_ = true;
@@ -1028,11 +1068,13 @@ bool RobotLocalizationNode::acceptLocalizationResult(
         RCLCPP_WARN(
             this->get_logger(),
             "Localization result discarded: map→odom jump %.2f m > %.2f m.",
-            rejected_jump, global_search_max_map_odom_jump_);
+            rejected_jump, gs_jump_limit);
         enterLost("map_odom_jump");
         return false;
     }
     tracking_recovery_.recordSuccess();
+    // 回到 OK：LOST 渐进放宽计时器复位，下次进 LOST 从基础门重新开始。
+    lost_since_valid_ = false;
     publishIntegrityState(
         fast_location::IntegrityState::OK,
         last_degenerate_ ? "projected" : "accepted");
@@ -1157,12 +1199,43 @@ PointCloudXYZI::Ptr RobotLocalizationNode::cachedOrDownsample(
     return filtered;
 }
 
+// LOST 渐进放宽后的有效跳变门。只在 lost_escape.enable 开启且确已进入
+// LOST 并超过 grace 后逐级放大；其余时刻与基础门完全一致。
+// 放宽只作用于召回门，不改变 EMA/锚点更新逻辑：接受仍需过 ICP 精化与时序校验。
+float RobotLocalizationNode::effectiveGlobalSearchJumpLimit()
+{
+    const float base = global_search_max_map_odom_jump_;
+    if (!lost_escape_enable_ || base <= 0.0f || !lost_since_valid_) {
+        return base;
+    }
+    const double lost_sec = (this->now() - lost_since_).seconds();
+    if (lost_sec < lost_escape_grace_sec_) {
+        return base;
+    }
+    const int stages =
+        static_cast<int>((lost_sec - lost_escape_grace_sec_) / lost_escape_grace_sec_) + 1;
+    float widened = base;
+    for (int i = 0; i < stages; ++i) {
+        widened = std::min(widened * lost_escape_grow_factor_, lost_escape_max_jump_m_);
+        if (widened >= lost_escape_max_jump_m_) {
+            break;
+        }
+    }
+    return widened;
+}
+
 void RobotLocalizationNode::enterLost(const char * reason)
 {
     initialized_ = false;
     first_localization_ = true;
     nis_conflict_streak_ = 0;
     frontend_diverged_streak_ = 0;
+    // LOST 计时器：只在「非 LOST → LOST」边沿启动，重复 enterLost 不重置，
+    // 否则连续拒帧会把渐进放宽永远摁在第一阶段。
+    if (!lost_since_valid_) {
+        lost_since_valid_ = true;
+        lost_since_ = this->now();
+    }
     {
         std::lock_guard<std::mutex> lock(tf_mutex_);
         ++reloc_generation_;
@@ -1766,6 +1839,8 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
     }
     bool far_prior = false;
     float prior_jump = 0.0f;
+    // 在函数作用域声明：锁块外的告警日志也要用它。
+    float prior_limit = global_search_max_map_odom_jump_;
     {
         std::lock_guard<std::mutex> lock(tf_mutex_);
         ++reloc_generation_;
@@ -1776,9 +1851,12 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
         tf_ready_ = had_accepted_pose_;
         ema_initialized_ = false;
         pending_global_result_valid_ = false;
+        // LOST 渐进放宽同样作用于 /initialpose 种子门：搬场后远端种子在
+        // grace 期满后才能被接受——这正是逃生通道要开的那扇门。
+        prior_limit = effectiveGlobalSearchJumpLimit();
         far_prior = had_accepted_pose_ &&
             fast_location::mapOdomJumpExceeds(
-                T_pcd_to_odom_, pcd_from_odom, global_search_max_map_odom_jump_);
+                T_pcd_to_odom_, pcd_from_odom, prior_limit);
         if (far_prior) {
             prior_jump = fast_location::mapOdomXyJump(T_pcd_to_odom_, pcd_from_odom);
         }
@@ -1793,7 +1871,7 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
         RCLCPP_WARN(
             this->get_logger(),
             "Initial pose map→odom jump %.2f m > %.2f m; ignoring seed and entering LOST recall.",
-            prior_jump, global_search_max_map_odom_jump_);
+            prior_jump, prior_limit);
         enterLost("pose_prior_jump");
         return;
     }

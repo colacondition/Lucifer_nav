@@ -1,6 +1,9 @@
 import os
 import yaml
 
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nav_common
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -197,60 +200,20 @@ def generate_launch_description():
     # Humble 的 intra-process 只接受 volatile + keep_last(depth>0) 的 QoS，
     # 传感器点云 topic 用的正是 SensorDataQoS（volatile + best_effort），所以
     # 可以安全打开；与导航容器不同，这里没有 transient_local 限制。
-    perception_container = ComposableNodeContainer(
-        name='perception_container',
-        namespace='',
-        respawn=True, respawn_delay=2.0,  # 容器崩溃自愈（两节点均可从参数重建）
-        package='cpp_lidar_filter',
-        # 固定线程数容器：不用 Humble 自带的 component_container_mt，后者线程数
-        # 恒为 hardware_concurrency()（本机 24）。默认 1 个 executor 线程；
-        # linefit 内部用 OpenMP 做分片，不必再给 executor 超订。
-        executable='perception_container_mt',
-        arguments=[perception_threads] + common_log_arguments,
+    # 感知栈三件套（容器/组件加载/崩溃重载）单一真源：nav_common.py。
+    # 两 launch 不再各自复制 55 行，行为差异只可能来自参数。
+    perception_stack = nav_common.build_perception_stack(
+        threads_arg=perception_threads,
+        log_args=common_log_arguments,
         output=node_output,
-        additional_env=system_libusb_env)
-
-    def perception_component(plugin, name, package, parameters):
-        return LoadComposableNodes(
-            target_container=perception_container,
-            composable_node_descriptions=[
-                ComposableNode(
-                    package=package,
-                    plugin=plugin,
-                    name=name,
-                    parameters=parameters,
-                    # Humble 的 component_container 默认不会给加载的组件打开
-                    # intra-process，必须逐个组件显式传入。
-                    extra_arguments=[{'use_intra_process_comms': True}],
-                )
-            ],
-        )
-
-    def make_perception_load_actions():
-        return [
-            perception_component(
-                'cpp_lidar_filter::LidarFilterNode',
-                'lidar_filter',
-                'cpp_lidar_filter',
-                [lidar_filter_params, {'use_sim_time': use_sim_time}]),
-            perception_component(
-                'linefit_ground_segmentation::SegmentationNode',
-                'ground_segmentation',
-                'linefit_ground_segmentation_ros',
-                [seg_params, seg_env_params, {'use_sim_time': use_sim_time}]),
-        ]
-
-    # 容器每次退出（崩溃被 respawn 或正常退出）都重新调度组件加载。Humble 的
-    # LoadComposableNodes 只执行一次，respawn 只会拉起空容器；与 navigation2
-    # 容器同一套补救逻辑：等 4s 让 rclpy 图缓存里的旧 load_node 服务过期。
-    def reload_perception_on_exit(event, context):
-        cmd = getattr(event, 'cmd', None)
-        if cmd and any('perception_container_mt' in str(part) for part in cmd):
-            return [TimerAction(period=4.0, actions=make_perception_load_actions())]
-        return None
-
-    reload_perception_components = RegisterEventHandler(
-        OnProcessExit(on_exit=reload_perception_on_exit))
+        additional_env=system_libusb_env,
+        use_sim_time=use_sim_time,
+        lidar_filter_params=lidar_filter_params,
+        seg_params=seg_params,
+        seg_env_params=seg_env_params)
+    perception_container = perception_stack['container']
+    make_perception_load_actions = perception_stack['make_load_actions']
+    reload_perception_components = perception_stack['reload_handler']
 
     # ===== 4.5 建图链：点云转激光 + slam_toolbox（仅 mode:=mapping）=====
     # 为什么不用 PCD 直转的高度切片出图：实测 RMUL.pcd 地面起伏 ~0.4 m，
@@ -329,12 +292,16 @@ def generate_launch_description():
     # ===== 7. 速度转换已并进 navigation2 容器（fake_vel_transform 组件）=====
 
     # ===== 8. 航点执行器（单一 waypoint_executor，默认 follow）=====
+    # respawn 与底层节点对齐：executor 是 follow 链路唯一执行者，崩了没人拉起
+    # 就是整车静默趴窝（decision 侧只会等到 result 超时守卫兜底，见 A7）。
     waypoint_follow_executor = Node(
         condition=LaunchConfigurationEquals('mode', 'nav'),
         package='waypoint_editor',
         executable='waypoint_executor',
         name='waypoint_follow_executor',
         output=node_output,
+        respawn=True,
+        respawn_delay=2.0,
         parameters=[waypoint_executor_params, {
             'use_sim_time': use_sim_time,
             'waypoint_file': waypoint_file,
@@ -359,9 +326,11 @@ def generate_launch_description():
     # decision 的完整静态参数由 bringup common 提供；未安装 decision 时条件为 false，
     # Node 动作不会启动。
     # decision 的完整静态参数在 bringup common；路径按运行 world 动态覆盖。
+    # 航点单一真源：sentry_waypoints 数据包（解除 decision→bringup 依赖环）。
+    waypoints_share = get_package_share_directory('sentry_waypoints')
     decision_waypoint_files = {
         f'targets.{target}_waypoint_file': PathJoinSubstitution(
-            [bringup_dir, 'config', 'waypoints', 'RMUL', f'{target}.csv'])
+            [waypoints_share, 'waypoints', 'RMUL', f'{target}.csv'])
         for target in (
             'patrol', 'center', 'wait_center', 'home', 'wait_home', 'wait_hp')
     }
@@ -371,6 +340,9 @@ def generate_launch_description():
         executable='bt_action_replacement_node',
         name='bt_action_replacement',
         output=node_output,
+        # 同第 8 节：决策是目标下发的唯一生产者，崩溃必须自愈。
+        respawn=True,
+        respawn_delay=2.0,
         # yaml 的根键是 bt_action_replacement，必须与上面的 name 一致才生效。
         parameters=[
             decision_params,

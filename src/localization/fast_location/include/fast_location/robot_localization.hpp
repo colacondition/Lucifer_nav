@@ -79,6 +79,8 @@ private:
         bool global_search_result);
     void handleTrackingFailure();
     void enterLost(const char * reason);
+    // 当前生效的全局搜索 map→odom 跳变门（lost_escape.* 放宽后的值）。
+    float effectiveGlobalSearchJumpLimit();
     void abandonPendingGlobalResult();
     void clearDownsampleCaches();
     PointCloudXYZI::Ptr cachedOrDownsample(
@@ -230,6 +232,14 @@ private:
     // 但用上一拍 T_pcd_to_odom_ 限制 map→odom 跳变；开机没有这个位姿，走出生点局部 ICP。
     bool had_accepted_pose_{false};
     float global_search_max_map_odom_jump_{4.0f};
+    // LOST 渐进放宽（lost_escape.*）。lost_since_valid_/lost_since_ 只在
+    // loc 回调组与 enterLost/OK 路径访问，与 jump 门同拍使用，无跨组并发。
+    bool lost_escape_enable_{false};
+    double lost_escape_grace_sec_{20.0};
+    float lost_escape_grow_factor_{2.0f};
+    float lost_escape_max_jump_m_{8.0f};
+    bool lost_since_valid_{false};
+    rclcpp::Time lost_since_{0, 0, RCL_ROS_TIME};
     std::string scan_input_frame_mode_ = "odom"; // 源点云所在坐标系: odom/base
     int scan_accumulate_frames_ = 1;   // 源点云堆积帧数
     float scan_min_range_ = 0.0f;   // 源点云最小距离（米）

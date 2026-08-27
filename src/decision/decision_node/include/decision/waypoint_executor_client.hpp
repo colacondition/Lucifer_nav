@@ -77,6 +77,12 @@ public:
     const std::optional<Pose> & robot_pose,
     const std::optional<Pose> & target_pose,
     double now_sec);
+  // 结果超时守卫：goal 已下发但 last_goal_progress_sec_ 起算超过
+  // config_.executor_result_timeout_sec（>0 时启用）仍无任何动作事件，
+  // 就合成一次 Aborted 终态（必要时触发 result_callback_）并放行重发。
+  // 返回 true 表示本拍合成了一次超时失败。executor 崩溃重生后 rclcpp_action
+  // 客户端不会收到任何回调，没有这条守卫 running_target 会永久占位。
+  bool checkGoalTimeout(double now_sec);
   bool stepExecutorTarget(
     TargetName target,
     TargetMode mode,
@@ -84,6 +90,14 @@ public:
     const std::vector<Pose> & waypoints,
     bool immediate_preempt,
     double now_sec);
+
+  // —— 测试钩子（仅单元测试使用）——
+  // 把客户端置入「goal 已下发、等待首个动作事件」的悬挂态。
+  void markGoalInFlightForTest(double now_sec)
+  {
+    goal_in_flight_ = true;
+    last_goal_progress_sec_ = now_sec;
+  }
 
 private:
   nav_msgs::msg::Path buildPathMessage(const std::vector<Pose> & waypoints) const;
@@ -104,6 +118,8 @@ private:
   std::shared_ptr<GoalHandleFollowWaypoints> active_goal_handle_;
   std::function<void(TargetName, bool)> result_callback_;
   bool goal_in_flight_{false};
+  // 最近一次动作事件（send / goal 接受 / result）的时刻，超时守卫的基准。
+  double last_goal_progress_sec_{-1.0e9};
   std::optional<TargetName> maintain_target_;
   double maintain_drift_start_sec_{-1.0e9};
 };

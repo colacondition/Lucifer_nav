@@ -241,8 +241,6 @@ private:
     snap_origin_to_grid_ = declare_parameter<bool>("snap_origin_to_grid", true);
     use_observation_stamp_for_origin_ =
       declare_parameter<bool>("use_observation_stamp_for_origin", false);
-    publish_on_observation_update_ =
-      declare_parameter<bool>("publish_on_observation_update", false);
     use_latest_sensor_transform_ =
       declare_parameter<bool>("use_latest_sensor_transform", false);
     fallback_to_latest_sensor_transform_ =
@@ -568,23 +566,6 @@ private:
     return elapsed + 1e-6 >= 1.0 / std::max(0.1, publish_frequency_);
   }
 
-  void publishCachedCostmap(const rclcpp::Time & stamp)
-  {
-    if (!previous_raw_grid_ || !previous_inflated_grid_ || !shouldPublish(stamp)) {
-      return;
-    }
-
-    auto raw_grid = *previous_raw_grid_;
-    raw_grid.header.stamp = stamp;
-    if (raw_costmap_pub_->get_subscription_count() > 0) {
-      raw_costmap_pub_->publish(raw_grid);
-    }
-
-    auto inflated_grid = *previous_inflated_grid_;
-    inflated_grid.header.stamp = stamp;
-    costmap_pub_->publish(inflated_grid);
-    last_publish_time_ = stamp;
-  }
 
   void publishCurrentFootprint()
   {
@@ -880,14 +861,8 @@ private:
   // 之间赌 —— 而净高够不够、姿态收没收是电控的职责，导航只负责把车沿轴线送进
   // 洞。能不能进完全由静态地图的壁面致命格决定。
   //
-  // 判定用影响区而不是只认本体格：门楣/顶板前沿的点云 xy 落在本体格边界外一到
-  // 两格，只认本体格时这排点被原样标成致命格，横在洞口上把洞封死。语义与
-  // global_costmap_node.cpp 的同名函数一致，两边必须一起改 —— 只在一边放行会让
-  // 全局规划出的路在局部层被判为撞墙。
-  bool inTunnelRegion(double world_x, double world_y) const
-  {
-    return tunnel_region_.specNearPoint(world_x, world_y) != nullptr;
-  }
+  // 影响区内的放行判据由 TunnelRegionGrid::pointOutsideCorridor 统一给出
+  // （PCA 轴走廊：走廊内先验放行、走廊外恢复多帧确认），局部/全局两层共用。
 
   void processPointCloud(
     nav_msgs::msg::OccupancyGrid & grid,
@@ -913,6 +888,7 @@ private:
       return;
     }
 
+    const navigation2::PlanarFrame cloud_frame_ = navigation2::makePlanarFrame(cloud_to_global);
     try {
       sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
       sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
@@ -926,7 +902,7 @@ private:
           continue;
         }
 
-        const auto point = transformPoint(cloud_to_global, *iter_x, *iter_y, *iter_z);
+        const auto point = applyPlanarFrame(cloud_frame_, *iter_x, *iter_y, *iter_z);
         // 高度判定必须是「相对机器人底盘」的差值，两种绝对判法都会让 20cm 高台
         // 从代价地图上静默消失，没有任何报错：
         // 1) 在 transformPoint 之前拿点云原始 z 比。点云 frame 是 livox_frame，
@@ -942,7 +918,15 @@ private:
         {
           continue;
         }
-        if (inTunnelRegion(point.x, point.y)) {
+        const bool in_tunnel_region =
+          tunnel_region_.specNearPoint(point.x, point.y) != nullptr;
+        if (in_tunnel_region && !tunnel_region_.pointOutsideCorridor(point.x, point.y)) {
+          // 走廊内的点维持先验放行（与旧一刀切一致）：顶板/门楣投影和侧壁基
+          // clutter 不能封死通道，测试 test_costmap_tunnel_roof 钉死的正是这一条。
+          //
+          // 走廊外的点恢复普通多帧确认 —— 这是「洞内遇敌可见化」的开口：
+          // 影响区里但不在行进走廊上的真实实体，不再被无差别丢弃。
+          // 判据仍是几何的、与高度无关；轴退化时保守退回整片放行。
           continue;
         }
         int map_x = 0;
@@ -1254,7 +1238,8 @@ private:
     // 逐格膨胀上限走缓存：origin 每帧整数格平移，只平移缓存 + 补边，不再逐格
     // mapToWorld + 查语义格。传影响区版本：洞口格（本体外一小圈）同样吃 clearance
     // 上限，不再被两侧墙的全量膨胀涂满。无隧道时返回空 = 无逐格上限。
-    applyInflationCostGradient(
+    // EDT 膨胀：与卷积版逐字节等价，O(格数)，滚动窗口高频刷新的固定开销项。
+    applyInflationCostGradientEDT(
       inflated_grid, inflation_radius_, 50, inflation_cost_scaling_factor_,
       inflationLimit(raw_grid));
     markRobotFootprintFree(inflated_grid, robot_transform);
@@ -1287,10 +1272,10 @@ private:
   double publish_frequency_{10.0};
   double width_m_{5.0};
   double height_m_{5.0};
-  double resolution_{0.02};
+  double resolution_{0.05};
   double robot_radius_{0.25};
-  double inflation_radius_{0.6};
-  double inflation_cost_scaling_factor_{5.0};
+  double inflation_radius_{0.35};
+  double inflation_cost_scaling_factor_{15.0};
   double raytrace_max_range_{6.0};
   double obstacle_min_range_{0.1};
   double obstacle_max_range_{6.0};
@@ -1301,7 +1286,6 @@ private:
   double observation_timeout_{0.5};
   bool snap_origin_to_grid_{true};
   bool use_observation_stamp_for_origin_{false};
-  bool publish_on_observation_update_{false};
   bool use_latest_sensor_transform_{false};
   bool fallback_to_latest_sensor_transform_{false};
   bool update_on_new_observation_only_{false};

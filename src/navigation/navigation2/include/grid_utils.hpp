@@ -62,10 +62,37 @@ void applyInflationCostGradient(
   nav_msgs::msg::OccupancyGrid & grid, double inflation_radius, int occupied_threshold = 50,
   double cost_scaling_factor = 8.0, const std::vector<float> & radius_limit = {});
 
+// —— 下列 *_EDT 变体与上方两个函数输出逐字节等价，复杂度从
+// O(障碍格 × 核体积) 降到 O(格数)（Felzenszwalb 精确距离变换，无堆），
+// 大图高频膨胀时不再随障碍数量线性爆炸。调用方无脑切换即可。——
+
+void inflateOccupancyGridEDT(
+  nav_msgs::msg::OccupancyGrid & grid, double inflation_radius, int occupied_threshold = 50);
+
+void applyInflationCostGradientEDT(
+  nav_msgs::msg::OccupancyGrid & grid, double inflation_radius, int occupied_threshold = 50,
+  double cost_scaling_factor = 8.0, const std::vector<float> & radius_limit = {});
+
 std::vector<GridCell> raytraceLine(int x0, int y0, int x1, int y1);
 
 geometry_msgs::msg::Point transformPoint(
   const geometry_msgs::msg::TransformStamped & transform, double x, double y, double z);
+
+// 每帧一次预计算（点云→全局平面变换的展开形式）：点级热路径不再反复
+// 构造 tf2::Transform / 做四元数到矩阵。仅使用平移+yaw 分量（栅格/高度
+// 判定均只关心平面投影与 z 线性分量；z 变换 = R22*z + tz 对固定横滚成立，
+// 本仓 TF 树不引入横滚）。
+struct PlanarFrame
+{
+  double cos_yaw{1.0}, sin_yaw{0.0};
+  double tx{0.0}, ty{0.0}, tz{0.0};
+  // R33 与 R31/R32 由 yaw+roll/pitch 决定；这里用完整矩阵的 (2,*) 行。
+  double m20{1.0}, m21{0.0}, m22{1.0};
+};
+
+PlanarFrame makePlanarFrame(const geometry_msgs::msg::TransformStamped & transform);
+
+geometry_msgs::msg::Point applyPlanarFrame(const PlanarFrame & f, double x, double y, double z);
 
 geometry_msgs::msg::Point transformPointPlanar(
   const geometry_msgs::msg::TransformStamped & transform, double x, double y, double z);

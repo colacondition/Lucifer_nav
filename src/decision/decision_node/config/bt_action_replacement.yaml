@@ -2,6 +2,10 @@ bt_action_replacement:
   ros__parameters:
     loop_hz: 30.0
     retry_interval_sec: 0.2
+    # 目标下发超时守卫：超时无任何 action 事件则合成 Aborted 并重发。
+    # 必须大于最长合法航点段执行时间；0 关闭。executor 崩溃重生后
+    # rclcpp_action 不会有任何回调，这条是「静默挂死」的唯一出口。
+    executor_result_timeout_sec: 60.0
     goal_frame_id: map
 
     topics:
@@ -31,12 +35,12 @@ bt_action_replacement:
       high_threshold: 400
 
     targets:
-      patrol_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/patrol.csv"
-      center_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/center.csv"
-      wait_center_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/wait_center.csv"
-      home_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/home.csv"
-      wait_home_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/wait_home.csv"
-      wait_hp_waypoint_file: "src/HL_bringup/config/waypoints/RMUL/wait_hp.csv"
+      patrol_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/patrol.csv"
+      center_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/center.csv"
+      wait_center_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/wait_center.csv"
+      home_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/home.csv"
+      wait_home_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/wait_home.csv"
+      wait_hp_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/wait_hp.csv"
 
     waypoint:
       switch_distance: 0.6

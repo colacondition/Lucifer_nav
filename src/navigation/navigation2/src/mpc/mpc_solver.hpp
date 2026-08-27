@@ -8,6 +8,7 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -31,6 +32,10 @@ struct MpcParams
   double min_tangent_speed = 0.05;
   std::vector<double> R{0.1, 0.1};     // 控制量大小权重（vx, vy）
   std::vector<double> Rd{1.0, 0.05};   // 控制平滑权重（dvx, dvy）
+  // OSQP 单次求解时限（秒）。0 = 不限（默认，行为与历史一致）。
+  // 设正值可封住病态 QP 最坏耗时，但可能拿到 SOLVED_INACCURATE 解；
+  // 是否接受由调用方看 inaccurateSolves() 计数自行取舍。
+  double time_limit = 0.0;
 };
 
 // 参数合法性检查。MPC 的稀疏结构与工作区尺寸都由这些值决定，非法值会在
@@ -43,7 +48,8 @@ inline bool paramsAreValid(const MpcParams & p)
          p.tangential_weight >= 0.0 && p.lateral_weight >= 0.0 &&
          std::isfinite(p.tangential_weight) && std::isfinite(p.lateral_weight) &&
          p.min_tangent_speed >= 0.0 && std::isfinite(p.min_tangent_speed) &&
-         p.Q.size() >= 2 && p.R.size() >= 2 && p.Rd.size() >= 2;
+         p.Q.size() >= 2 && p.R.size() >= 2 && p.Rd.size() >= 2 &&
+         p.time_limit >= 0.0 && std::isfinite(p.time_limit);
 }
 
 class MpcSolver
@@ -69,14 +75,16 @@ public:
     buildConstraintMatrix();                          // A、ncon_
   }
 
-  // 输入参考轨迹，输出每步的速度序列。
-  std::vector<Eigen::Vector2d> solve(
+  // 输入参考轨迹，输出每步的速度序列。返回成员缓冲区的只读引用：
+  // 失败时缓冲区被清空（empty 即失败），成功时直接复用，热路径零拷贝。
+  const std::vector<Eigen::Vector2d> & solve(
     const Eigen::MatrixXd & xref, const Eigen::MatrixXd & uref,
     const Eigen::Vector2d & x_init, bool turtle)
   {
     const int steps = params_.steps;
     if (steps <= 0) {
-      return {};
+      output_cache_.clear();
+      return output_cache_;
     }
     const int dimx = 2 * steps;
     const int dimu = 2 * steps;
@@ -89,7 +97,8 @@ public:
 
     if (!setup_done_) {
       if (!setup(nx)) {
-        return {};
+        output_cache_.clear();
+        return output_cache_;
       }
     } else {
       if (params_.path_frame_weighting) {
@@ -99,8 +108,17 @@ public:
       osqp_update_bounds(work_, l_.data(), u_.data());
     }
 
-    if (osqp_solve(work_) != 0 || work_->info->status_val <= 0) {
-      return {};
+    const int solve_ret = osqp_solve(work_);
+    const c_int status_val =
+      (work_ != nullptr && work_->info != nullptr) ? work_->info->status_val : -1;
+    if (solve_ret != 0 || status_val <= 0) {
+      output_cache_.clear();
+      return output_cache_;
+    }
+    // OSQP_SOLVED_INACCURATE 也是可用解：丢弃会让控制突然断拍，故沿用。
+    // 但必须留痕——跟踪质量劣化排查时这是唯一线索。
+    if (status_val == 2 /* OSQP_SOLVED_INACCURATE */) {
+      ++inaccurate_solves_;
     }
 
     // 复用输出缓冲区（避免每次分配）。
@@ -113,6 +131,10 @@ public:
     }
     return output_cache_;
   }
+
+  // SOLVED_INACCURATE 累计次数。非零即说明 QP 在数值上吃紧，
+  // 结合 PerformanceMonitor 的耗时一起看是否需要调权重或开 time_limit。
+  uint64_t inaccurateSolves() const { return inaccurate_solves_; }
 
 private:
   void buildHessian()
@@ -344,9 +366,15 @@ private:
     osqp_set_default_settings(settings_);
     settings_->warm_start = 1;
     settings_->verbose = 0;
-    settings_->max_iter = 2000;
-    settings_->eps_abs = 1e-4;
-    settings_->eps_rel = 1e-4;
+    // 求解质量上调（用户授权用空闲 CPU 换解的最优性）：实测整机 busy<8%，
+    // 30Hz QP 有的是余量。inaccurateSolves() 观察器与 PerformanceMonitor
+    // 兜底，退化可观测、可回退。
+    settings_->max_iter = 6000;
+    settings_->eps_abs = 3e-5;
+    settings_->eps_rel = 3e-5;
+    if (params_.time_limit > 0.0) {
+      settings_->time_limit = static_cast<c_float>(params_.time_limit);
+    }
 
     if (osqp_setup(&work_, data_, settings_) != 0) {
       // osqp_setup 失败：OSQP 自行清理半成品 workspace，但 data_/settings_ 和
@@ -412,6 +440,7 @@ private:
   std::vector<Eigen::Matrix2d> state_weights_;
   std::vector<c_int> state_p_xx_, state_p_xy_, state_p_yy_;
   std::vector<Eigen::Vector2d> output_cache_;
+  uint64_t inaccurate_solves_ = 0;
 };
 
 }  // namespace navigation2::mpc

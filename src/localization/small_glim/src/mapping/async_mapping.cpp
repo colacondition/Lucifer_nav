@@ -368,8 +368,19 @@ bool AsyncMapping::is_keyframe(const EstimationFrame& frame) const {
 
 void AsyncMapping::accept_keyframe(const EstimationFrame& frame, const pcl::PointCloud<pcl::PointXYZ>& keyframe_cloud_imu) {
     if (frame.frame_type != FrameType::IMU) {
-        logger::fatal("mapping", "only IMU frames are supported for mapping; skip frame_id={}", frame.id);
-        std::exit(EXIT_FAILURE);
+        // 曾经 std::exit：在组件容器里会跳过全部析构——mapping worker 是唯一
+        // 落盘方，exit 即把整张 run 下来的图陪葬。改为丢弃该关键帧并存活；
+        // 已写盘的 raw 帧与已合并进图的点云不受影响。本函数只在 mapping
+        // worker 线程被调，static 计数无并发问题。
+        static uint64_t skipped_non_imu_keyframes = 0;
+        ++skipped_non_imu_keyframes;
+        logger::fatal(
+            "mapping",
+            "only IMU frames are supported for mapping; skip frame_id={} (type={}, total_skipped={})",
+            frame.id,
+            static_cast<int>(frame.frame_type),
+            skipped_non_imu_keyframes);
+        return;
     }
 
     const Eigen::Isometry3d T_world_imu = frame.T_world_imu;

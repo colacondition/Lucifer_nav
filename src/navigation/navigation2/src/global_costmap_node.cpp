@@ -305,14 +305,8 @@ private:
   // 之间赌 —— 而净高够不够、姿态收没收是电控的职责，导航只负责把车沿轴线送进
   // 洞。能不能进完全由静态地图的壁面致命格决定。
   //
-  // 判定用影响区而不是只认本体格：门楣/顶板前沿的点云 xy 落在本体格边界外一到
-  // 两格，只认本体格时这排点被原样标成致命格，横在洞口上把洞封死。语义与
-  // local_costmap_node.cpp 的同名函数一致，两边必须一起改 —— 只在一边放行会让
-  // 全局规划出的路在局部层被判为撞墙。
-  bool inTunnelRegion(double world_x, double world_y) const
-  {
-    return tunnel_region_.specNearPoint(world_x, world_y) != nullptr;
-  }
+  // 影响区内的放行判据由 TunnelRegionGrid::pointOutsideCorridor 统一给出，
+  // 与 local_costmap_node.cpp 共用同一实现。
 
   void processPointCloud(
     nav_msgs::msg::OccupancyGrid & grid,
@@ -347,6 +341,7 @@ private:
       return;
     }
 
+    const navigation2::PlanarFrame cloud_frame_ = navigation2::makePlanarFrame(cloud_to_global);
     try {
       sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
       sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
@@ -361,7 +356,7 @@ private:
           continue;
         }
 
-        const auto point = transformPoint(cloud_to_global, *iter_x, *iter_y, *iter_z);
+        const auto point = applyPlanarFrame(cloud_frame_, *iter_x, *iter_y, *iter_z);
         // 高度判定取「相对机器人底盘」的差值。map 系的 z=0 是雷达平面不是地面
         // （Super-LIO 的 odom 原点锚在开机瞬间的雷达位姿上），拿绝对 z 比常数会让
         // 20cm 高台静默消失。做差之后雷达平面偏移和定位 z 漂移都被抵消。
@@ -372,7 +367,15 @@ private:
         {
           continue;
         }
-        if (inTunnelRegion(point.x, point.y)) {
+        const bool in_tunnel_region =
+          tunnel_region_.specNearPoint(point.x, point.y) != nullptr;
+        if (in_tunnel_region && !tunnel_region_.pointOutsideCorridor(point.x, point.y)) {
+          // 走廊内的点维持先验放行（与旧一刀切一致）：顶板/门楣投影和侧壁基
+          // clutter 不能封死通道，测试 test_costmap_tunnel_roof 钉死的正是这一条。
+          //
+          // 走廊外的点恢复普通多帧确认 —— 这是「洞内遇敌可见化」的开口：
+          // 影响区里但不在行进走廊上的真实实体，不再被无差别丢弃。
+          // 判据仍是几何的、与高度无关；轴退化时保守退回整片放行。
           continue;
         }
 
@@ -446,12 +449,15 @@ private:
     return cloud;
   }
 
-  // 逐格膨胀半径上限，按需算一次就缓存：全局栅格是静态的（origin/尺寸跟 /map 一样
-  // 不动），只有换地图时才需要重算，而换地图会清掉缓存。
+  // 逐格膨胀半径上限，按需算一次就缓存。缓存键 = 尺寸 + origin：reload 同尺寸
+  // 但 origin 平移的新图时，仅比尺寸会拿旧表的格号去查新图的隧道世界坐标，
+  // 洞口上限静默错位。
   const std::vector<float> & inflationRadiusLimit(const nav_msgs::msg::OccupancyGrid & grid)
   {
     if (!inflation_radius_limit_.empty() &&
-      inflation_radius_limit_.size() == grid.data.size())
+      inflation_radius_limit_.size() == grid.data.size() &&
+      cached_limit_origin_x_ == grid.info.origin.position.x &&
+      cached_limit_origin_y_ == grid.info.origin.position.y)
     {
       return inflation_radius_limit_;
     }
@@ -459,6 +465,8 @@ private:
     // 全量膨胀涂满。
     inflation_radius_limit_ = makeInflationRadiusLimit(
       grid, receiver_.map(), inflation_radius_, robot_radius_, tunnel_region_);
+    cached_limit_origin_x_ = grid.info.origin.position.x;
+    cached_limit_origin_y_ = grid.info.origin.position.y;
     return inflation_radius_limit_;
   }
 
@@ -509,7 +517,8 @@ private:
     }
 
     auto inflated_grid = raw_grid;
-    applyInflationCostGradient(
+    // EDT 膨胀：与卷积版逐字节等价，O(格数) 无堆，全局图 8Hz 不再随障碍数爆炸。
+    applyInflationCostGradientEDT(
       inflated_grid, inflation_radius_, occupied_threshold_, inflation_cost_scaling_factor_,
       inflationRadiusLimit(raw_grid));
     inflated_grid.header.stamp = now_time;
@@ -555,6 +564,9 @@ private:
   // specNearPoint 恒返回 nullptr，与「没有隧道」等价。
   TunnelRegionGrid tunnel_region_;
   std::vector<float> inflation_radius_limit_;
+  // 缓存键的一部分：建表时的 /map origin。origin 变了表必须重算。
+  double cached_limit_origin_x_{std::numeric_limits<double>::quiet_NaN()};
+  double cached_limit_origin_y_{std::numeric_limits<double>::quiet_NaN()};
 
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
   rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;

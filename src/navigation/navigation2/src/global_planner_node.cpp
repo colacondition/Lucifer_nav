@@ -888,14 +888,17 @@ private:
       return;
     }
 
+    // 先捕获代次快照、再规划：发布前核对，代次变了说明规划期间目标或重
+    // 规划事件发生过，本次结果作废。当前所有回调同在一个 MutuallyExclusive
+    // 回调组里，即使容器是 mt 也不会并发进入，校验今天恒通过；保留它的
+    // 意义是把「正确性依赖的时序」写对位置——将来谁把 A* 挪进独立回调组/
+    // 后台线程，这条护栏立即开始真实生效。（旧实现把 load 放在规划完成
+    // 之后，校验永远洗白不了规划期间的变更，注释还声称有防护。）
+    const uint64_t my_gen = plan_gen_.load(std::memory_order_acquire);
     auto path = tryStitchedReplan(*map_, start);
     if (!path) {
       path = planPath(*map_, start, goal);
     }
-    // A* 完成前先捕获代次快照，发布前再次确认目标没有改变。
-    // 当节点运行在 component_container_mt 时，不同线程的回调（goal_sub、
-    // replan_sub）可能在 A* 运行期间改变 plan_gen_；代次不匹配则丢弃。
-    const uint64_t my_gen = plan_gen_.load(std::memory_order_acquire);
     if (!path || path->poses.empty()) {
       // 规划失败：记录时间和目标，进入冷却期。
       if (plan_failure_cooldown_ > 0.0) {
@@ -940,8 +943,8 @@ private:
       }
     }
 
-    // 代次校验：A* 运行期间如果目标改变（component_container_mt 下并发回调），
-    // plan_gen_ 已自增，此次结果不应发布。
+    // 代次校验：见函数开头的快照时机说明。今天恒通过（互斥组串行化），
+    // 线程模型变化后自动变成真防护。
     if (plan_gen_.load(std::memory_order_acquire) != my_gen) {
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1000,

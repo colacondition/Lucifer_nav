@@ -217,6 +217,9 @@ def generate_launch_description():
                     arguments=[
                         '-entity', 'robot',
                         '-topic', 'robot_description',
+                        # 默认 30s：software_rendering/无 GPU 下首载大世界经常超时，
+                        # spawn 一死机器人就永远不在场，雷达全链路空等。
+                        '-timeout', '300',
                         '-x', world_config['x'],
                         '-y', world_config['y'],
                         '-z', world_config['z'],

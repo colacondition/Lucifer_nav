@@ -398,6 +398,21 @@ void SmallGlimNode::pub_odometry_impl(
     odom.header.stamp = stamp;
     utils::convert(T_odom_lidar, odom.pose.pose);
     utils::convert(v_body, odom.twist.twist.linear);
+    // twist.angular 此前恒零（假数据）。用最新陀螺 z 分量扣除估计偏置：
+    // child 是平面运动的 base/lidar，yaw rate 量级正确即满足下游语义；
+    // 无 IMU/无帧时保持 0。
+    {
+        Eigen::Vector3d w = Eigen::Vector3d::Zero();
+        Eigen::Matrix<double, 6, 1> bias;
+        const bool have_gyro =
+            odometry_estimation && odometry_estimation->latest_angular_velocity(&w);
+        const bool have_bias =
+            odometry_estimation && odometry_estimation->latest_imu_bias(&bias);
+        if (have_gyro) {
+            odom.twist.twist.angular.z =
+                (have_bias ? w.z() - bias(2) : w.z());
+        }
+    }
     if (publish_primary_odom) {
         odometry_pub->publish(odom);
     }

@@ -62,6 +62,16 @@ public:
     two_stage_max_iterations_ = static_cast<int>(std::max<int64_t>(
       1, declare_parameter<int>("two_stage.max_iterations", 300)));
 
+    // 轨迹快照/兼容 Path 的等时采样步长。MPC 用它做前馈查表，太小徒增消息
+    // 尺寸、太大丢弯道细节；非正数或非有限值回退默认，避免除零。
+    trajectory_sample_dt_ = declare_parameter<double>("trajectory_sample_dt", 0.05);
+    if (!std::isfinite(trajectory_sample_dt_) || trajectory_sample_dt_ <= 0.0) {
+      RCLCPP_WARN(
+        get_logger(), "Invalid trajectory_sample_dt %.4f s, falling back to 0.05",
+        trajectory_sample_dt_);
+      trajectory_sample_dt_ = 0.05;
+    }
+
     // 关断式性能观测：默认关。开 enable 后记录优化耗时 / 成功 / 失败原因到 CSV。
     {
       navigation2::PerformanceMonitor::Config cfg;
@@ -237,7 +247,7 @@ private:
     nav_msgs::msg::Path output_path;
     output_path.header = input_path.header;
 
-    const double sample_dt = 0.05;  // 每 0.05 秒采样一次，给 MPC 更平滑的参考
+    const double sample_dt = trajectory_sample_dt_;
     double total_duration = 0.0;
     for (const auto & piece : pieces) {
       total_duration += piece.getDuration();
@@ -366,6 +376,7 @@ private:
   double two_stage_max_scale_;
   int two_stage_samples_per_piece_;
   int two_stage_max_iterations_;
+  double trajectory_sample_dt_{0.05};
 
   std::unique_ptr<MincoOptimizer> minco_optimizer_;
 

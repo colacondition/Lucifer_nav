@@ -6,6 +6,8 @@
 #include <gtsam_points/types/point_cloud_cpu.hpp>
 #include <gtsam_points/util/parallelism.hpp>
 
+#include <stdexcept>
+
 namespace small_glim {
 
 CloudPreprocessorParams::CloudPreprocessorParams(const Config::Ptr config) {
@@ -33,8 +35,10 @@ CloudPreprocessorParams::CloudPreprocessorParams(const Config::Ptr config) {
         } else if (crop_bbox_frame_str == "imu") {
             crop_bbox_frame = CropBBoxFrame::IMU;
         } else {
+            // 参数构造期错误改抛异常：从组件容器的工厂函数抛出会被加载器
+            // 捕获并按「组件加载失败」处理，不再 exit 杀掉整个容器进程。
             logger::fatal("cloud_preprocess", "Unsupported crop bbox frame: {}", crop_bbox_frame_str);
-            std::exit(EXIT_FAILURE);
+            throw std::invalid_argument("cloud_preprocess: unsupported preprocess.crop_bbox_frame: " + crop_bbox_frame_str);
         }
         if ((crop_bbox_min.array() > crop_bbox_max.array()).any()) {
             logger::fatal(
@@ -43,7 +47,7 @@ CloudPreprocessorParams::CloudPreprocessorParams(const Config::Ptr config) {
                 convert_to_string(crop_bbox_min),
                 convert_to_string(crop_bbox_max)
             );
-            std::exit(EXIT_FAILURE);
+            throw std::invalid_argument("cloud_preprocess: misconfigured crop bbox (min > max), see fatal log");
         }
     }
 

@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -16,6 +18,7 @@
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <tf2/utils.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
@@ -26,6 +29,7 @@
 #include <decision_interfaces/msg/gimbal_posture_state.hpp>
 #include <decision_interfaces/msg/semantic_map.hpp>
 
+#include "grid_utils.hpp"
 #include "local_path_safety.hpp"
 #include "performance_monitor.hpp"
 #include "semantic_map_consumer.hpp"
@@ -77,16 +81,7 @@ std::vector<Eigen::Vector2d> pathPoints(const nav_msgs::msg::Path & path)
   return points;
 }
 
-double normalizeAngle(double angle)
-{
-  while (angle > M_PI) {
-    angle -= 2.0 * M_PI;
-  }
-  while (angle < -M_PI) {
-    angle += 2.0 * M_PI;
-  }
-  return angle;
-}
+// normalizeAngle 用 grid_utils.hpp 的版本，本文件不再复制一份。
 
 // fast_location 的 localization_status 是 "<STATE> <reason>"，例如 "LOST waiting"、"OK accepted"。
 // 只认第一个 token。没收到过消息时门是开的：mapping_nav 不起 fast_location，
@@ -112,6 +107,17 @@ enum class NavState
   HazardRecovery,  // 采样安全点并驶入，保持一段时间。
   Failed,          // 恢复用尽，停车报错，等新目标。
 };
+
+const char * navStateName(NavState state)
+{
+  switch (state) {
+    case NavState::Follow: return "Follow";
+    case NavState::StuckReverse: return "StuckReverse";
+    case NavState::HazardRecovery: return "HazardRecovery";
+    case NavState::Failed: return "Failed";
+  }
+  return "Unknown";
+}
 
 }  // namespace
 
@@ -170,9 +176,28 @@ public:
     safety_policy_.unknown_is_obstacle = declare_parameter<bool>(
       "local_safety.unknown_is_obstacle", true);
     local_costmap_timeout_ = declare_parameter<double>("local_safety.costmap_timeout", 0.5);
+    // 数据时效上限：header.stamp 是观测（点云）时间戳，10Hz 分割多跳链
+    // 端到端延迟实测 1~2s（全局代价地图 yaml 注释同源），0.5s 的门控若拿
+    // 它算 age 会把正常行驶判成「图旧」。这里把上限单独拉出来并对齐 2.0；
+    // costmap_timeout 回归它本来的语义——「本节点多久没收到新图」。
+    max_observation_age_sec_ = declare_parameter<double>(
+      "local_safety.max_observation_age_sec", 2.0);
     safety_policy_.check_steps = declare_parameter<int>("local_safety.check_steps", 10);
     replan_topic_ = declare_parameter<std::string>(
       "local_safety.replan_topic", "/navigation2/replan_request");
+    // 横向偏差软重规划阈值：无进展兜底(MaxTrackError)之前的早期通道。
+    soft_replan_track_error_ = declare_parameter<double>(
+      "local_safety.soft_replan_track_error", 0.35);
+    // —— 契约自检：把「要人肉评审才能发现的参数矛盾」变成开机报警。——
+    // 链路活性门必须窄于数据时效上限，否则活性层形同虚设；观测龄上限又
+    // 不应短于分割链固有延迟（sim/实车都有 0.1~0.2s 量级）。
+    if (local_costmap_timeout_ > max_observation_age_sec_) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Contract check: local_safety.costmap_timeout (%.2fs) > max_observation_age_sec "
+        "(%.2fs) — liveness gate looser than staleness cap; consider costmap_timeout <= "
+        "max_observation_age_sec.", local_costmap_timeout_, max_observation_age_sec_);
+    }
     replan_cooldown_ = declare_parameter<double>("local_safety.replan_cooldown", 0.5);
 
     // 卡住检测喂本节点上一拍下发的速率。平滑器只限幅，不再反读 /cmd_vel
@@ -393,6 +418,9 @@ public:
       [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
         std::lock_guard<std::mutex> lk(mtx_);
         local_costmap_ = std::move(msg);
+        // 收到新图即刷新链路活性基准（steady clock，与 header.stamp 语义无关，
+        // 见 costmapFresh 的两层新鲜度说明）。消费侧在同一回调组里读。
+        last_costmap_rx_time_ = std::chrono::steady_clock::now();
       });
 
     // 云台收放的请求与实测。两条都订：请求告诉我们「要不要等」，实测告诉我们「等到了没」。
@@ -458,6 +486,23 @@ public:
     // 收到任何值，集成测试里 approach_enabled 列表始终为空。
     setApproachEnabled(true);
 
+    // 人工复位服务（运维命令通道，不是数据流：不违反单生产者纪律）。
+    // FAILED 只能被「终点位移 >0.3m 的新目标」解除——防规划器定频重发把
+    // FAILED 冲掉是对的，但副作用是近距重发（微调航点/RViz 点同一点附近）
+    // 会永久卡死在 FAILED。这是操作手的显式出口；不调用时行为不变。
+    reset_state_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/reset_nav_state",
+      [this](
+        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        const NavState previous = nav_state_;
+        resetToFollow();
+        response->success = true;
+        response->message = std::string("reset from ") + navStateName(previous);
+        RCLCPP_WARN(
+          get_logger(), "Nav state manually reset: %s -> Follow", navStateName(previous));
+      });
+
     const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, control_fps_));
     timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(period), [this]() { control(); });
@@ -487,9 +532,20 @@ private:
         // 退回里程计原始位姿意味着定位链断了，必须可见。节流到 2 s。
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
-          "TF %s->%s unavailable, falling back to raw odom pose: %s",
+          "TF %s->%s unavailable, considering raw odom pose fallback: %s",
           target_frame_.c_str(), robot_base_frame_.c_str(), ex.what());
       }
+    }
+    // 回退只允许在 odom 位姿本来就表达在目标系里时进行（如无 TF 的
+    // 简化/仿真链路）。map 与 odom 之间有 fast_location 的漂移修正分量，
+    // 坐标系不同还照用，tracker 进度、安全否决和下发速度全会被错误基准
+    // 带偏——宁可停车等定位恢复。调用方拿到 false 必须安全停车。
+    if (odom.header.frame_id != target_frame_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Refusing raw-odom fallback: odom frame '%s' != target frame '%s'",
+        odom.header.frame_id.c_str(), target_frame_.c_str());
+      return false;
     }
     geometry_msgs::msg::Pose pose = odom.pose.pose;
     if (use_delay_comp_) {
@@ -498,6 +554,19 @@ private:
     pos = Eigen::Vector2d(pose.position.x, pose.position.y);
     yaw = tf2::getYaw(pose.orientation);
     return true;
+  }
+
+  // 回到 FOLLOW：清恢复预算/过程状态并重新启用接近段。goal_changed 解除
+  // FAILED 与人工复位服务共用同一条路径，保证两者语义不会漂移。
+  void resetToFollow()
+  {
+    nav_state_ = NavState::Follow;
+    recovery_attempts_ = 0;
+    recovery_elapsed_ = 0.0;
+    recovery_dwell_ = 0.0;
+    safe_point_.reset();
+    setApproachEnabled(true);
+    progress_monitor_.reset();
   }
 
   void control()
@@ -556,13 +625,7 @@ private:
     // FAILED 只由「真的换了目标」解除，而不是由「收到 Path 消息」解除：
     // 规划器会以 planning_frequency 原样重发，用后者会让 FAILED 立刻被清掉。
     if (goal_changed && nav_state_ == NavState::Failed) {
-      nav_state_ = NavState::Follow;
-      recovery_attempts_ = 0;
-      recovery_elapsed_ = 0.0;
-      recovery_dwell_ = 0.0;
-      safe_point_.reset();
-      setApproachEnabled(true);
-      progress_monitor_.reset();
+      resetToFollow();
     }
 
     if (!ready) {
@@ -610,7 +673,23 @@ private:
 
     Eigen::Vector2d pos;
     double yaw;
-    currentState(odom, pos, yaw);
+    if (!currentState(odom, pos, yaw)) {
+      // TF 断 + odom 系不等于目标系：没有任何可信位姿可用。拿着旧值或错
+      // 基准继续跑只会开向错误方向，安全停车等链路恢复（integrity gate
+      // 只看 LOST 状态流，感知不到 TF 单边抖动，这里就是补的那道门）。
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "No usable robot state (TF down and odom frame '%s' != '%s'); holding position",
+        odom.header.frame_id.c_str(), target_frame_.c_str());
+      publishStop();
+      {
+        navigation2::PerformanceMonitor::Sample sample;
+        sample.success = false;
+        sample.failure_reason = "no_robot_state";
+        perf_monitor_.stop(perf_start, sample);
+      }
+      return;
+    }
 
     // ---- 恢复链 FSM 调度。恢复态优先于一切正常跟踪逻辑：卡住就是卡住，
     // 离目标多近都不改变这个事实。----
@@ -703,9 +782,17 @@ private:
       return;
     }
 
-    // 生成参考窗口，太近的点跳过。弧长域采样：s = s_now + speed * dt * i。
-    Eigen::MatrixXd xref(2, steps_);
-    Eigen::MatrixXd uref(2, steps_);
+    // 弧长域采样。推进步长用速度剖面在当前弧长处的值积分（而不是名义速度
+    // 等步长）：否则曲率限速段的位置参考按 full-speed 前伸、速度前馈却是
+    // 减速值，QP 同时看到「追不上的前方点」和「慢前馈」，产生系统性切向
+    // 跟踪偏差，恰好抵消速度剖面「让参考可跟踪」的设计目的。
+    // 成员缓冲复用：steps_ configure 后恒定，热路径零分配。
+    if (xref_buf_.cols() != steps_) {
+      xref_buf_.resize(2, steps_);
+      uref_buf_.resize(2, steps_);
+    }
+    Eigen::MatrixXd & xref = xref_buf_;
+    Eigen::MatrixXd & uref = uref_buf_;
     const double total_s = ref.total_length();
     const double speed_nominal = ref.expected_speed();
     const double ds = speed_nominal * predict_dt_;
@@ -770,10 +857,13 @@ private:
           ? Eigen::Vector2d(ref.tangent_by_arc(s_clamped) * v_ref)
           : Eigen::Vector2d::Zero();
       }
+      // 推进步长 = 当前参考点处剖面允许的速度 × dt；剖面失效/未启用时
+      // v_ref 就是名义速度，等价于旧的等步长行为。
       if (s <= total_s && (rp - pos).norm() < blind_radius_) {
-        // s 单调递增（ds > 0 已在循环前保证），越过 total_s 后本分支不再成立，
-        // 因此不会死循环。这里不能 break：那样会留下未初始化的 xref/uref 列。
-        s += ds;
+        // s 单调不减（v_ref ≥ 0 且 ds>0 的守卫仍在），越过 total_s 后本分支
+        // 不再成立，因此不会死循环。这里不能 break：那样会留下未初始化的
+        // xref/uref 列。
+        s += std::max(v_ref, 0.0) * predict_dt_;
         --i;
         continue;
       }
@@ -781,10 +871,22 @@ private:
       xref(1, i) = rp.y();
       uref(0, i) = rv.x();
       uref(1, i) = rv.y();
-      s += ds;
+      s += std::max(v_ref, 0.0) * predict_dt_;
     }
 
-    auto vseq = solver_.solve(xref, uref, pos, /*turtle=*/false);
+    // 大横向偏差的软重规划触发：早于 noProgress/veto 的硬恢复链。出现一次
+    // 就请求；频率由 requestReplan 的冷却统一节流，不额外加参数面。
+    if (ref.total_length() > 0.0 && nav_state_ == NavState::Follow) {
+      const double lateral_now =
+        (route_tracker_.arc_length() > 0.0)
+        ? (pos - ref.pos_by_arc(route_tracker_.arc_length())).norm()
+        : 0.0;
+      if (lateral_now > soft_replan_track_error_) {
+        requestReplan();
+      }
+    }
+
+    const auto & vseq = solver_.solve(xref, uref, pos, /*turtle=*/false);
     if (vseq.empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "MPC solve failed");
       {
@@ -795,6 +897,15 @@ private:
       }
       handleVeto(local_costmap, pos, dt, "MPC solve failed");
       return;
+    }
+    // OSQP 偶发给出 inaccurate 解时（status=2，被沿用不丢弃），这里只留痕
+    // 不打断控制：连续出现说明 QP 数值吃紧，需要看权重或开 time_limit。
+    if (solver_.inaccurateSolves() != last_inaccurate_solves_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "MPC got SOLVED_INACCURATE (%llu total)",
+        static_cast<unsigned long long>(solver_.inaccurateSolves()));
+      last_inaccurate_solves_ = solver_.inaccurateSolves();
     }
 
     // 复用预分配缓冲区，避免 30Hz 分配。
@@ -912,8 +1023,16 @@ private:
   // 会把倒车指令吃掉。
   void enterRecovery(NavState state, const Eigen::Vector2d & pos, const char * reason)
   {
+    // 只有从 FOLLOW 进入恢复才消耗尝试预算：恢复态之间的升级（倒车不够 →
+    // 采安全点）是同一次脱困事件，不重复计数。旧实现每次 enterRecovery 都
+    // ++，一次「贴墙事件」就能烧掉 2/3 预算，max_attempts 的名义语义和现场
+    // 日志的 attempt N/M 全部落不到真实事件上。
+    const bool fresh_recovery_event = (nav_state_ == NavState::Follow);
+    if (fresh_recovery_event) {
+      reversed_this_event_ = false;
+      ++recovery_attempts_;
+    }
     nav_state_ = state;
-    ++recovery_attempts_;
     recovery_elapsed_ = 0.0;
     recovery_dwell_ = 0.0;
     safe_point_.reset();
@@ -1047,8 +1166,12 @@ private:
       return;
     }
 
-    reverse_travelled_ += (pos - reverse_last_pos_).norm();
+    reverse_travelled_ +=
+      std::max((pos - reverse_last_pos_).dot(reverse_direction_), 0.0);
     reverse_last_pos_ = pos;
+    // 本事件里确实起步倒过车了（供 HazardRecovery 找不到安全点时判断
+    // 是否还有倒车兜底可用）。
+    reversed_this_event_ = true;
 
     const bool hazardous = mpc::isHazardous(*costmap, pos, hazard_policy_);
 
@@ -1084,7 +1207,14 @@ private:
       safe_point_ = mpc::findSafePoint(*costmap, pos, hazard_policy_, safe_point_params_);
       if (!safe_point_) {
         publishStop();
-        failRecovery("no reachable safe point around robot");
+        // 一次都还没倒过车时先别急着 FAILED：StuckReverse 不需要安全点，
+        // 可能倒开一步危险区就没了。本事件内已试过倒车仍无路，才是真死局。
+        if (!reversed_this_event_) {
+          enterRecovery(
+            NavState::StuckReverse, pos, "no reachable safe point, falling back to reverse");
+        } else {
+          failRecovery("no reachable safe point around robot");
+        }
         return;
       }
     }
@@ -1114,14 +1244,28 @@ private:
     }
   }
 
-  bool costmapFresh(const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap) const
+  bool costmapFresh(const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap)
   {
-    if (!costmap) {
+    if (!costmap || costmap->data.empty()) {
       return false;
     }
+
+    // 链路活性：本节点实际收到新图的单调钟间隔。/clock 无关、不受观测戳
+    // 的链路延迟污染——这是「分割链还在不在发图」的真判据。
+    const auto now_steady = std::chrono::steady_clock::now();
+    if (last_costmap_rx_time_ == std::chrono::steady_clock::time_point{} ||
+      now_steady - last_costmap_rx_time_ >
+      std::chrono::duration<double>(std::max(0.0, local_costmap_timeout_)))
+    {
+      return false;
+    }
+
+    // 数据时效：观测戳过老说明上游在重放积压旧数据（发布没停但数据是旧的），
+    // 上限与 rm_global_costmap 的 observation_timeout 对齐（默认 2.0s）。
     const rclcpp::Time stamp(costmap->header.stamp, get_clock()->get_clock_type());
     const double age = (now() - stamp).seconds();
-    return std::isfinite(age) && age >= 0.0 && age <= std::max(0.0, local_costmap_timeout_);
+    return std::isfinite(age) && age >= 0.0 &&
+           age <= std::max(0.0, max_observation_age_sec_);
   }
 
   void requestReplan()
@@ -1237,6 +1381,15 @@ private:
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   double delay_comp_max_dt_;
   double local_costmap_timeout_, replan_cooldown_;
+  double soft_replan_track_error_{0.35};
+  // 参考窗口输出缓冲（configure 后尺寸不变）。
+  Eigen::MatrixXd xref_buf_;
+  Eigen::MatrixXd uref_buf_;
+  // 观测戳允许的最大年龄（数据时效层），与链路活性门控分开配置。
+  double max_observation_age_sec_{2.0};
+  // 最近一次收到局部代价图的单调钟时刻（订阅回调写、control() 读）；
+  // 回调组互斥串行 + mtx_ 双保险，见既有共享成员注释。
+  std::chrono::steady_clock::time_point last_costmap_rx_time_{};
   LocalPathSafetyPolicy safety_policy_;
 
   // 关断式性能观测。control() 在定时器回调里跑（单一回调组），无需加锁；tick/stop
@@ -1279,6 +1432,7 @@ private:
   std::string localization_status_payload_;
 
   mpc::MpcSolver solver_;
+  uint64_t last_inaccurate_solves_{0};
   // 进度跟踪与失效检测只在控制线程里用，不需要加锁。
   mpc::RouteTracker route_tracker_;
   mpc::ProgressMonitor progress_monitor_;
@@ -1297,7 +1451,6 @@ private:
   // 三条失效路径（跟踪丢失/求解失败/安全否决）的连续否决时长。
   double veto_streak_{0.0};
   double veto_recovery_time_{1.5};
-  double veto_before_recovery_{1.5};
 
   double recovery_reverse_speed_{0.3};
   double recovery_reverse_distance_{0.4};
@@ -1318,6 +1471,9 @@ private:
   double recovery_dwell_{0.0};
   double recovery_elapsed_{0.0};
   int recovery_attempts_{0};
+  // 本次脱困事件内是否已经走过 StuckReverse。用于 HazardRecovery 找不到
+  // 安全点时决定「回退试倒车」还是直接 FAILED。
+  bool reversed_this_event_{false};
   double last_published_speed_{0.0};
   std::optional<rclcpp::Time> last_control_time_;
   // 预分配缓冲区，避免 30Hz 控制循环中重复分配。
@@ -1342,6 +1498,7 @@ private:
   std::string approach_enabled_topic_;
   std::optional<rclcpp::Time> last_replan_request_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_state_srv_;
 };
 
 }  // namespace navigation2

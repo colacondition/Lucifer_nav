@@ -92,6 +92,11 @@ private:
   std::atomic<uint64_t> queued_packet_count_{0};
   std::atomic<uint64_t> sent_packet_count_{0};
   std::atomic<uint64_t> failed_send_count_{0};
+  // 连续写失败计数：区分「瞬时 EAGAIN 丢帧重试」与「持续故障阈值 reopen」，
+  // 见底盘下发路径的分级处理。仅单写线程访问。
+  std::atomic<int> write_fail_streak_{0};
+  bool allow_fallback_{true};
+  int write_fail_reopen_threshold_{20};
   std::atomic<uint64_t> received_decision_count_{0};
   std::atomic<int> last_write_size_{0};
 

@@ -41,7 +41,7 @@ uint16_t Get_CRC16_Check_Sum(const uint8_t * pchMessage, uint32_t dwLength, uint
 {
   uint8_t ch_data;
 
-  if (pchMessage == nullptr) return 0xFFFF;
+  if (pchMessage == nullptr) {return 0xFFFF;}
   while (dwLength--) {
     ch_data = *pchMessage++;
     (wCRC) =
@@ -61,12 +61,12 @@ uint32_t Verify_CRC16_Check_Sum(const uint8_t * pchMessage, uint32_t dwLength)
 {
   uint16_t w_expected = 0;
 
-  if ((pchMessage == nullptr) || (dwLength <= 2)) return false;
+  if ((pchMessage == nullptr) || (dwLength <= 2)) {return false;}
 
   w_expected = Get_CRC16_Check_Sum(pchMessage, dwLength - 2, CRC16_INIT);
-  return (
+  return
     (w_expected & 0xff) == pchMessage[dwLength - 2] &&
-    ((w_expected >> 8) & 0xff) == pchMessage[dwLength - 1]);
+    ((w_expected >> 8) & 0xff) == pchMessage[dwLength - 1];
 }
 
 /**
@@ -79,7 +79,7 @@ void Append_CRC16_Check_Sum(uint8_t * pchMessage, uint32_t dwLength)
 {
   uint16_t w_crc = 0;
 
-  if ((pchMessage == nullptr) || (dwLength <= 2)) return;
+  if ((pchMessage == nullptr) || (dwLength <= 2)) {return;}
 
   w_crc = Get_CRC16_Check_Sum(reinterpret_cast<uint8_t *>(pchMessage), dwLength - 2, CRC16_INIT);
 

@@ -1,0 +1,1736 @@
+diff --git a/src/bringup/config/common/decision.yaml b/src/bringup/config/common/decision.yaml
+index 7fd7a03..1b2ac7b 100644
+--- a/src/bringup/config/common/decision.yaml
++++ b/src/bringup/config/common/decision.yaml
+@@ -3,6 +3,10 @@ bt_action_replacement:
+   ros__parameters:
+     loop_hz: 30.0
+     retry_interval_sec: 0.2
++    # 目标下发超时守卫：超时无任何 action 事件则合成 Aborted 并重发。
++    # 必须大于最长合法航点段执行时间；0 关闭。executor 崩溃重生后
++    # rclcpp_action 不会有任何回调，这条是「静默挂死」的唯一出口。
++    executor_result_timeout_sec: 60.0
+     goal_frame_id: "map"
+     topics:
+       robot_status: "robot_status"
+diff --git a/src/bringup/config/common/fast_location.yaml b/src/bringup/config/common/fast_location.yaml
+index 19406f6..1a7e7c4 100644
+--- a/src/bringup/config/common/fast_location.yaml
++++ b/src/bringup/config/common/fast_location.yaml
+@@ -96,6 +96,15 @@
+     global_search_max_candidates: 2000000  # 候选硬上限：飞点/大图时自动加大步长防止 OOM
+     global_search_yaw_step_deg: 30.0
+     global_search_max_map_odom_jump: 1.0
++    # LOST 渐进放宽（绑架/搬场逃生通道）。默认关闭，行为与历史完全一致；
++    # 开启后：持续 LOST 超过 grace_sec 才开始放宽，每过一个 grace 周期
++    # 门限 ×grow_factor，直到 max_jump_m。max=8.0 仍低于 RMUL 对面角 ~11m，
++    # 不会重新打开「错锁对面角」的门；/initialpose 远端种子同受此门管辖，
++    # 搬场后 grace 期满即可用 initialpose 拉回。
++    lost_escape.enable: false
++    lost_escape.grace_sec: 20.0
++    lost_escape.grow_factor: 2.0
++    lost_escape.max_jump_m: 8.0
+     global_search_score_distance: 0.45
+     global_search_score_stride: 4
+     global_search_top_k: 6
+diff --git a/src/bringup/config/common/navigation2.yaml b/src/bringup/config/common/navigation2.yaml
+index 6324efc..d847f5e 100644
+--- a/src/bringup/config/common/navigation2.yaml
++++ b/src/bringup/config/common/navigation2.yaml
+@@ -332,7 +332,13 @@ rm_mpc_controller:
+     local_safety.obstacle_threshold: 90
+     local_safety.unknown_is_obstacle: true
+     local_safety.costmap_timeout: 0.5
+-    # Check 1.0 s ahead; the 5 m rolling map cannot contain the full 3.0 s horizon at max speed.
++    # 「多久没收到新图」判链路活性（steady clock，与 header.stamp 无关）。
++    # 局部图 header.stamp 是观测（点云）时间戳，10Hz 分割链端到端延迟实测
++    # 1~2s，数据时效改由下面 max_observation_age_sec 单独约束——两者分开
++    # 后，正常延迟不再被误判成「图旧」而拖进恢复链。
++    local_safety.max_observation_age_sec: 2.0
++    # 检查预测序列的前 check_steps 个端点（点数而非秒数）：端点间距 =
++    # predict_dt × 名义速度。改 predict_dt 时这条注释不再隐含换算耦合。
+     local_safety.check_steps: 10
+     local_safety.replan_topic: /navigation2/replan_request
+     local_safety.replan_cooldown: 0.5
+diff --git a/src/bringup/launch/real.launch.py b/src/bringup/launch/real.launch.py
+index 7b546a2..3738e8a 100644
+--- a/src/bringup/launch/real.launch.py
++++ b/src/bringup/launch/real.launch.py
+@@ -329,12 +329,16 @@ def generate_launch_description():
+     # ===== 7. 速度转换已并进 navigation2 容器（fake_vel_transform 组件）=====
+ 
+     # ===== 8. 航点执行器（单一 waypoint_executor，默认 follow）=====
++    # respawn 与底层节点对齐：executor 是 follow 链路唯一执行者，崩了没人拉起
++    # 就是整车静默趴窝（decision 侧只会等到 result 超时守卫兜底，见 A7）。
+     waypoint_follow_executor = Node(
+         condition=LaunchConfigurationEquals('mode', 'nav'),
+         package='waypoint_editor',
+         executable='waypoint_executor',
+         name='waypoint_follow_executor',
+         output=node_output,
++        respawn=True,
++        respawn_delay=2.0,
+         parameters=[waypoint_executor_params, {
+             'use_sim_time': use_sim_time,
+             'waypoint_file': waypoint_file,
+@@ -371,6 +375,9 @@ def generate_launch_description():
+         executable='bt_action_replacement_node',
+         name='bt_action_replacement',
+         output=node_output,
++        # 同第 8 节：决策是目标下发的唯一生产者，崩溃必须自愈。
++        respawn=True,
++        respawn_delay=2.0,
+         # yaml 的根键是 bt_action_replacement，必须与上面的 name 一致才生效。
+         parameters=[
+             decision_params,
+diff --git a/src/bringup/launch/sim.launch.py b/src/bringup/launch/sim.launch.py
+index 6af4226..17ce84b 100644
+--- a/src/bringup/launch/sim.launch.py
++++ b/src/bringup/launch/sim.launch.py
+@@ -341,12 +341,15 @@ def generate_launch_description():
+     # ===== 7. 速度转换已并进 navigation2 容器（fake_vel_transform 组件）=====
+ 
+     # ===== 8. 航点执行器（单一 waypoint_executor，默认 follow）=====
++    # respawn 与 real.launch.py 同步：executor 崩溃自愈，仿真/实车行为一致。
+     waypoint_follow_executor = Node(
+         condition=LaunchConfigurationEquals('mode', 'nav'),
+         package='waypoint_editor',
+         executable='waypoint_executor',
+         name='waypoint_follow_executor',
+         output=node_output,
++        respawn=True,
++        respawn_delay=2.0,
+         parameters=[waypoint_executor_params, {
+             'use_sim_time': use_sim_time,
+             'waypoint_file': waypoint_file,
+diff --git a/src/decision/decision_node/config/bt_action_replacement.yaml b/src/decision/decision_node/config/bt_action_replacement.yaml
+index 15c5f2b..393472f 100644
+--- a/src/decision/decision_node/config/bt_action_replacement.yaml
++++ b/src/decision/decision_node/config/bt_action_replacement.yaml
+@@ -2,6 +2,10 @@ bt_action_replacement:
+   ros__parameters:
+     loop_hz: 30.0
+     retry_interval_sec: 0.2
++    # 目标下发超时守卫：超时无任何 action 事件则合成 Aborted 并重发。
++    # 必须大于最长合法航点段执行时间；0 关闭。executor 崩溃重生后
++    # rclcpp_action 不会有任何回调，这条是「静默挂死」的唯一出口。
++    executor_result_timeout_sec: 60.0
+     goal_frame_id: map
+ 
+     topics:
+diff --git a/src/decision/decision_node/include/decision/decision_config.hpp b/src/decision/decision_node/include/decision/decision_config.hpp
+index a10df68..a0ee52b 100644
+--- a/src/decision/decision_node/include/decision/decision_config.hpp
++++ b/src/decision/decision_node/include/decision/decision_config.hpp
+@@ -98,6 +98,11 @@ struct DecisionConfig
+ {
+   double loop_hz{10.0};
+   double retry_interval_sec{1.0};
++  // 目标下发后在此时限内收不到任何动作事件（goal 接受 / 结果返回）时，
++  // 合成一次 Aborted 终态并放行重发——兜住 executor 崩溃重生后旧 action
++  // 永不回结果、decision 永不重发的静默挂死。0 = 关闭（时限必须大于
++  // 最长合法航点段的执行时间，按赛场实测给值；见 bringup decision.yaml）。
++  double executor_result_timeout_sec{0.0};
+   std::string goal_frame_id{"map"};
+   TopicConfig topics;
+   IntegrityGateConfig integrity_gate;
+diff --git a/src/decision/decision_node/include/decision/waypoint_executor_client.hpp b/src/decision/decision_node/include/decision/waypoint_executor_client.hpp
+index 22efd6a..e2c397a 100644
+--- a/src/decision/decision_node/include/decision/waypoint_executor_client.hpp
++++ b/src/decision/decision_node/include/decision/waypoint_executor_client.hpp
+@@ -77,6 +77,12 @@ public:
+     const std::optional<Pose> & robot_pose,
+     const std::optional<Pose> & target_pose,
+     double now_sec);
++  // 结果超时守卫：goal 已下发但 last_goal_progress_sec_ 起算超过
++  // config_.executor_result_timeout_sec（>0 时启用）仍无任何动作事件，
++  // 就合成一次 Aborted 终态（必要时触发 result_callback_）并放行重发。
++  // 返回 true 表示本拍合成了一次超时失败。executor 崩溃重生后 rclcpp_action
++  // 客户端不会收到任何回调，没有这条守卫 running_target 会永久占位。
++  bool checkGoalTimeout(double now_sec);
+   bool stepExecutorTarget(
+     TargetName target,
+     TargetMode mode,
+@@ -85,6 +91,14 @@ public:
+     bool immediate_preempt,
+     double now_sec);
+ 
++  // —— 测试钩子（仅单元测试使用）——
++  // 把客户端置入「goal 已下发、等待首个动作事件」的悬挂态。
++  void markGoalInFlightForTest(double now_sec)
++  {
++    goal_in_flight_ = true;
++    last_goal_progress_sec_ = now_sec;
++  }
++
+ private:
+   nav_msgs::msg::Path buildPathMessage(const std::vector<Pose> & waypoints) const;
+   geometry_msgs::msg::PoseStamped buildPoseStamped(const Pose & pose) const;
+@@ -104,6 +118,8 @@ private:
+   std::shared_ptr<GoalHandleFollowWaypoints> active_goal_handle_;
+   std::function<void(TargetName, bool)> result_callback_;
+   bool goal_in_flight_{false};
++  // 最近一次动作事件（send / goal 接受 / result）的时刻，超时守卫的基准。
++  double last_goal_progress_sec_{-1.0e9};
+   std::optional<TargetName> maintain_target_;
+   double maintain_drift_start_sec_{-1.0e9};
+ };
+diff --git a/src/decision/decision_node/src/decision_config.cpp b/src/decision/decision_node/src/decision_config.cpp
+index 6dc8eb5..a2943fd 100644
+--- a/src/decision/decision_node/src/decision_config.cpp
++++ b/src/decision/decision_node/src/decision_config.cpp
+@@ -21,6 +21,7 @@ void declareDecisionParameters(rclcpp::Node & node)
+ 
+   declareParameter(node, "loop_hz", defaults.loop_hz);
+   declareParameter(node, "retry_interval_sec", defaults.retry_interval_sec);
++  declareParameter(node, "executor_result_timeout_sec", defaults.executor_result_timeout_sec);
+   declareParameter(node, "goal_frame_id", defaults.goal_frame_id);
+ 
+   declareParameter(node, "topics.robot_status", defaults.topics.robot_status);
+@@ -79,6 +80,7 @@ DecisionConfig loadDecisionConfig(rclcpp::Node & node)
+ 
+   node.get_parameter("loop_hz", config.loop_hz);
+   node.get_parameter("retry_interval_sec", config.retry_interval_sec);
++  node.get_parameter("executor_result_timeout_sec", config.executor_result_timeout_sec);
+   node.get_parameter("goal_frame_id", config.goal_frame_id);
+ 
+   node.get_parameter("topics.robot_status", config.topics.robot_status);
+@@ -135,6 +137,8 @@ void validateDecisionConfig(DecisionConfig & config)
+ {
+   config.loop_hz = std::max(config.loop_hz, 0.1);
+   config.retry_interval_sec = std::max(config.retry_interval_sec, 0.1);
++  // 负值视为关闭：比抛配置错误更宽容，语义也明确。
++  config.executor_result_timeout_sec = std::max(config.executor_result_timeout_sec, 0.0);
+   config.waypoint.switch_distance = std::max(config.waypoint.switch_distance, 0.05);
+   config.waypoint.final_goal_tolerance = std::max(config.waypoint.final_goal_tolerance, 0.05);
+   config.maintain_goal.xy_tolerance = std::max(config.maintain_goal.xy_tolerance, 0.05);
+diff --git a/src/decision/decision_node/src/decision_node.cpp b/src/decision/decision_node/src/decision_node.cpp
+index 228a005..e141aa3 100644
+--- a/src/decision/decision_node/src/decision_node.cpp
++++ b/src/decision/decision_node/src/decision_node.cpp
+@@ -137,6 +137,11 @@ private:
+   void onTimer()
+   {
+     const double now_sec = nowSec();
++    // 超时守卫先于状态机取事件：合成 Aborted 触发的 result 回调产生的
++    // executor_event 要在本拍就被 exchange 进 inputs，不能等一拍。
++    if (waypoint_executor_ && waypoint_executor_->checkGoalTimeout(now_sec)) {
++      RCLCPP_INFO(get_logger(), "Executor goal timeout guard fired; target will be re-requested");
++    }
+     decision::DecisionInputs inputs;
+     inputs.game_active = gameActive();
+     inputs.current_hp = context_.effectiveCurrentHp();
+diff --git a/src/decision/decision_node/src/waypoint_executor_client.cpp b/src/decision/decision_node/src/waypoint_executor_client.cpp
+index a398de4..7cd93fe 100644
+--- a/src/decision/decision_node/src/waypoint_executor_client.cpp
++++ b/src/decision/decision_node/src/waypoint_executor_client.cpp
+@@ -119,6 +119,47 @@ bool WaypointExecutorClient::needMaintainReissue(
+   return true;
+ }
+ 
++bool WaypointExecutorClient::checkGoalTimeout(double now_sec)
++{
++  if (config_.executor_result_timeout_sec <= 0.0) {
++    return false;
++  }
++  if (!goal_in_flight_) {
++    return false;
++  }
++  const double elapsed = now_sec - last_goal_progress_sec_;
++  if (elapsed < config_.executor_result_timeout_sec) {
++    return false;
++  }
++
++  RCLCPP_WARN(
++    rclcpp::get_logger("decision"),
++    "FollowWaypoints goal produced no event for %.1fs (timeout %.1fs); "
++    "synthesizing abort so the target can be re-requested",
++    elapsed, config_.executor_result_timeout_sec);
++
++  // 收尾在途状态。此后 shouldRequestTarget 对同目标重新放行：
++  // running 已清（或 status 已非 Succeeded），retry_interval 的防抖
++  // 由 stepExecutorTarget 自带的 last_send_time 判断兜住节奏。
++  goal_in_flight_ = false;
++  active_goal_handle_.reset();
++
++  if (state_.running_target.has_value() && state_.running_mode.has_value()) {
++    const auto target = *state_.running_target;
++    const auto mode = *state_.running_mode;
++    applyExecutorResult(target, mode, /*success=*/false, now_sec);
++    if (result_callback_) {
++      result_callback_(target, false);
++    }
++  } else {
++    // 还没走到 goal_response：running 未设，把挂起态标记为失败即可。
++    if (state_.result_status == ExecutorResultStatus::None) {
++      state_.result_status = ExecutorResultStatus::Aborted;
++    }
++  }
++  return true;
++}
++
+ bool WaypointExecutorClient::shouldRequestTarget(
+   TargetName target,
+   TargetMode mode,
+@@ -200,6 +241,7 @@ bool WaypointExecutorClient::stepExecutorTarget(
+   state_.last_send_time_sec = now_sec;
+   state_.active_target = target;
+   state_.result_status = ExecutorResultStatus::None;
++  last_goal_progress_sec_ = now_sec;
+ 
+   auto goal = FollowWaypoints::Goal();
+   goal.waypoints = path_msg;
+@@ -218,6 +260,8 @@ bool WaypointExecutorClient::stepExecutorTarget(
+       }
+       active_goal_handle_ = goal_handle;
+       setRunningTarget(target, mode, now_sec);
++      // goal 被接受也算一次进展：重置超时基准。
++      last_goal_progress_sec_ = now_sec;
+       } catch (const std::exception & ex) {
+         RCLCPP_ERROR(
+           rclcpp::get_logger("decision"), "goal_response_callback threw: %s", ex.what());
+@@ -236,6 +280,9 @@ bool WaypointExecutorClient::stepExecutorTarget(
+       }
+       goal_in_flight_ = false;
+       active_goal_handle_.reset();
++      // 终态结果是最强的「有进展」信号。
++      last_goal_progress_sec_ =
++        rclcpp::Clock(RCL_SYSTEM_TIME).now().seconds();
+       const bool success = wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
+         wrapped.result && wrapped.result->success;
+       // 只把「确实应用到当前目标」的结果喂给状态机：被抢占的旧目标晚到的
+diff --git a/src/decision/decision_node/test/test_waypoint_executor_client.cpp b/src/decision/decision_node/test/test_waypoint_executor_client.cpp
+index f6c8fdd..ba9d74a 100644
+--- a/src/decision/decision_node/test/test_waypoint_executor_client.cpp
++++ b/src/decision/decision_node/test/test_waypoint_executor_client.cpp
+@@ -416,3 +416,51 @@ TEST(WaypointExecutorClient, ResultCallbackHookNotifiesTerminalOutcome)
+   EXPECT_EQ(notified->first, decision::TargetName::Patrol);
+   EXPECT_FALSE(notified->second);
+ }
++
++TEST(WaypointExecutorClient, TimeoutGuardDisabledByDefault)
++{
++  decision::DecisionConfig config;
++  ASSERT_DOUBLE_EQ(config.executor_result_timeout_sec, 0.0);
++  decision::WaypointExecutorClient client(config);
++
++  client.setRunningTarget(decision::TargetName::Patrol, decision::TargetMode::ExecutorFollow, 10.0);
++  // 超时关闭时，任意时钟前进都不得合成失败。
++  EXPECT_FALSE(client.checkGoalTimeout(1.0e6));
++  EXPECT_EQ(client.state().running_target, decision::TargetName::Patrol);
++}
++
++// goal 下发后长时间无任何动作事件（executor 崩溃重生的典型后果）：
++// 守卫在超过时限后合成 Aborted 并触发 result 回调，状态放行重发。
++TEST(WaypointExecutorClient, TimeoutGuardSynthesizesAbortAndAllowsRetry)
++{
++  decision::DecisionConfig config;
++  config.executor_result_timeout_sec = 5.0;
++  decision::WaypointExecutorClient client(config);
++
++  std::optional<std::pair<decision::TargetName, bool>> notified;
++  client.setResultCallback(
++    [&notified](decision::TargetName target, bool success) {
++      notified = std::make_pair(target, success);
++    });
++
++  // 用 setRunningTarget 直接入「已接受执行」态（绕开 action server 搭建，
++  // 该路径的收尾逻辑与真实 result 回调完全一致）。
++  client.setRunningTarget(decision::TargetName::Center, decision::TargetMode::ExecutorFollow, 100.0);
++  client.markGoalInFlightForTest(100.0);
++
++  EXPECT_FALSE(client.checkGoalTimeout(104.0));   // 未超时：不动状态。
++  EXPECT_TRUE(client.state().running_target.has_value());
++
++  EXPECT_TRUE(client.checkGoalTimeout(106.0));    // 超 grace：合成 abort。
++  EXPECT_FALSE(client.state().running_target.has_value());
++  EXPECT_EQ(client.state().result_status, decision::ExecutorResultStatus::Aborted);
++  ASSERT_TRUE(notified.has_value());
++  EXPECT_EQ(notified->first, decision::TargetName::Center);
++  EXPECT_FALSE(notified->second);
++
++  // 合成终态后 shouldRequestTarget 对同目标重新放行（这正是修复点）。
++  EXPECT_TRUE(
++    client.shouldRequestTarget(
++      decision::TargetName::Center, decision::TargetMode::ExecutorFollow,
++      std::nullopt, std::nullopt, 106.0));
++}
+diff --git a/src/driver/mid360_driver/include/mid360_driver/mid360_driver.hpp b/src/driver/mid360_driver/include/mid360_driver/mid360_driver.hpp
+index 189ceba..5423493 100644
+--- a/src/driver/mid360_driver/include/mid360_driver/mid360_driver.hpp
++++ b/src/driver/mid360_driver/include/mid360_driver/mid360_driver.hpp
+@@ -12,6 +12,7 @@
+ #include <utility>
+ #include <asio.hpp>
+ #include <atomic>
++#include <cstdint>
+ #include <functional>
+ #include <unordered_map>
+ #include <vector>
+@@ -58,6 +59,12 @@ namespace mid360_driver {
+         std::unordered_map<asio::ip::address, double, IpAddressHasher> delta_time_map;
+         std::unordered_map<asio::ip::address, double, IpAddressHasher> last_lidar_timestamp_map;
+         std::unordered_map<asio::ip::address, double, IpAddressHasher> last_imu_timestamp_map;
++        // 连续被判 implausible 的包数（按流、按源地址计）。旧实现里参考时间戳
++        // 只在收包成功时更新，一旦某包 diff 越界，参考值就永久冻结在旧时刻：
++        // 雷达 PTP 重同步 / NTP 步进 / 雷达重启换基准后，后续每个包都越界，
++        // 点云+IMU 无声全灭直到进程重启。现在坏包连击到阈值后把锚重置到当前包。
++        std::unordered_map<asio::ip::address, std::uint64_t, IpAddressHasher> lidar_implausible_streaks;
++        std::unordered_map<asio::ip::address, std::uint64_t, IpAddressHasher> imu_implausible_streaks;
+         std::function<void(const asio::ip::address &lidar_ip, const std::vector<Point> &points)> on_receive_pointcloud;
+         std::function<void(const asio::ip::address &lidar_ip, const ImuMsg &imu_msg)> on_receive_imu;
+ 
+diff --git a/src/driver/mid360_driver/src/mid360_driver.cpp b/src/driver/mid360_driver/src/mid360_driver.cpp
+index f86308a..3cc8948 100644
+--- a/src/driver/mid360_driver/src/mid360_driver.cpp
++++ b/src/driver/mid360_driver/src/mid360_driver.cpp
+@@ -135,12 +135,19 @@ namespace mid360_driver {
+         }
+     }
+ 
++    // 重锚阈值：连续坏包达到该数即认为参考锚本身失效（雷达/主机时钟跳变、
++    // 重启换基准），把锚拨到当前包重新起步。取 ~2.5s 的包数——比任何一次
++    // 正常时钟扰动短，又足够长到不会把单帧毛刺当成新基准。
++    constexpr std::uint64_t kLidarReanchorAfterPackets = 25;  // 10Hz 帧 ≈ 2.5s
++    constexpr std::uint64_t kImuReanchorAfterPackets = 500;   // 200Hz 采样 ≈ 2.5s
++
+     bool is_timestamp_plausible(
+         std::unordered_map<asio::ip::address, double, IpAddressHasher> &last_timestamp_map,
++        std::unordered_map<asio::ip::address, std::uint64_t, IpAddressHasher> &implausible_streaks,
+         const asio::ip::address &address,
+         const double timestamp,
+-        const double max_time_jump
+-    ) {
++        const double max_time_jump,
++        const std::uint64_t reanchor_after) {
+         if (!std::isfinite(timestamp) || timestamp <= 0.0) {
+             return false;
+         }
+@@ -152,8 +159,16 @@ namespace mid360_driver {
+ 
+         const double diff = timestamp - iter->second;
+         if (diff < -1e-3 || diff > max_time_jump) {
++            // 连击计数而不是永远拒绝：这是旧实现「拒收即永久闩锁」的修复点。
++            const std::uint64_t streak = ++implausible_streaks[address];
++            if (streak >= reanchor_after) {
++                iter->second = timestamp;
++                implausible_streaks[address] = 0;
++                return true;
++            }
+             return false;
+         }
++        implausible_streaks[address] = 0;
+         iter->second = timestamp;
+         return true;
+     }
+@@ -295,7 +310,9 @@ namespace mid360_driver {
+                     header_timestamp += iter->second;
+                 }
+             }
+-            if (!is_timestamp_plausible(last_lidar_timestamp_map, sender_endpoint.address(), header_timestamp, robustness_config.max_packet_time_jump)) [[unlikely]] {
++            if (!is_timestamp_plausible(last_lidar_timestamp_map, lidar_implausible_streaks,
++                    sender_endpoint.address(), header_timestamp,
++                    robustness_config.max_packet_time_jump, kLidarReanchorAfterPackets)) [[unlikely]] {
+                 log_packet_drop("lidar: implausible timestamp", robustness_config.min_drop_log_interval);
+                 continue;
+             }
+@@ -399,7 +416,9 @@ namespace mid360_driver {
+                     header_timestamp += iter->second;
+                 }
+             }
+-            if (!is_timestamp_plausible(last_imu_timestamp_map, sender_endpoint.address(), header_timestamp, robustness_config.max_packet_time_jump)) [[unlikely]] {
++            if (!is_timestamp_plausible(last_imu_timestamp_map, imu_implausible_streaks,
++                    sender_endpoint.address(), header_timestamp,
++                    robustness_config.max_packet_time_jump, kImuReanchorAfterPackets)) [[unlikely]] {
+                 log_packet_drop("imu: implausible timestamp", robustness_config.min_drop_log_interval);
+                 continue;
+             }
+diff --git a/src/localization/fast_location/include/fast_location/robot_localization.hpp b/src/localization/fast_location/include/fast_location/robot_localization.hpp
+index 6b3fa41..cfd942e 100644
+--- a/src/localization/fast_location/include/fast_location/robot_localization.hpp
++++ b/src/localization/fast_location/include/fast_location/robot_localization.hpp
+@@ -79,6 +79,8 @@ private:
+         bool global_search_result);
+     void handleTrackingFailure();
+     void enterLost(const char * reason);
++    // 当前生效的全局搜索 map→odom 跳变门（lost_escape.* 放宽后的值）。
++    float effectiveGlobalSearchJumpLimit();
+     void abandonPendingGlobalResult();
+     void clearDownsampleCaches();
+     PointCloudXYZI::Ptr cachedOrDownsample(
+@@ -230,6 +232,14 @@ private:
+     // 但用上一拍 T_pcd_to_odom_ 限制 map→odom 跳变；开机没有这个位姿，走出生点局部 ICP。
+     bool had_accepted_pose_{false};
+     float global_search_max_map_odom_jump_{4.0f};
++    // LOST 渐进放宽（lost_escape.*）。lost_since_valid_/lost_since_ 只在
++    // loc 回调组与 enterLost/OK 路径访问，与 jump 门同拍使用，无跨组并发。
++    bool lost_escape_enable_{false};
++    double lost_escape_grace_sec_{20.0};
++    float lost_escape_grow_factor_{2.0f};
++    float lost_escape_max_jump_m_{8.0f};
++    bool lost_since_valid_{false};
++    rclcpp::Time lost_since_{0, 0, RCL_ROS_TIME};
+     std::string scan_input_frame_mode_ = "odom"; // 源点云所在坐标系: odom/base
+     int scan_accumulate_frames_ = 1;   // 源点云堆积帧数
+     float scan_min_range_ = 0.0f;   // 源点云最小距离（米）
+diff --git a/src/localization/fast_location/src/robot_localization.cpp b/src/localization/fast_location/src/robot_localization.cpp
+index f92b424..94f3008 100644
+--- a/src/localization/fast_location/src/robot_localization.cpp
++++ b/src/localization/fast_location/src/robot_localization.cpp
+@@ -127,6 +127,17 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
+     enable_global_search_ = this->get_parameter("enable_global_search").as_bool();
+     global_search_max_map_odom_jump_ = static_cast<float>(std::max(
+         0.0, this->get_parameter("global_search_max_map_odom_jump").as_double()));
++    // LOST 渐进放宽：绑架/搬场后 1m 门永远卡住召回，连 /initialpose 远端
++    // 种子都会被 far_prior 吃掉。默认关闭；开启后在持续 LOST 超过 grace
++    // 后按倍数逐级放宽到 max。max 默认 8m 仍低于对称场地「对面角 ~11m」，
++    // 不破坏原有防错锁设计意图。
++    lost_escape_enable_ = this->declare_parameter<bool>("lost_escape.enable", false);
++    lost_escape_grace_sec_ = std::max(
++        1.0, this->declare_parameter<double>("lost_escape.grace_sec", 20.0));
++    lost_escape_grow_factor_ = std::max(
++        1.0f, static_cast<float>(this->declare_parameter<double>("lost_escape.grow_factor", 2.0)));
++    lost_escape_max_jump_m_ = static_cast<float>(std::max(
++        0.0, this->declare_parameter<double>("lost_escape.max_jump_m", 8.0)));
+     global_search_config_.xy_step = std::max(
+         0.1, this->get_parameter("global_search_xy_step").as_double());
+     global_search_config_.max_candidates = static_cast<std::size_t>(std::max<int64_t>(
+@@ -656,10 +667,11 @@ bool RobotLocalizationNode::performGlobalSearch()
+     Eigen::Matrix4f best_result = Eigen::Matrix4f::Identity();
+     Eigen::Matrix4f best_guess = selected.front().pcd_from_odom;
+     Eigen::Matrix4f previous_map_odom = Eigen::Matrix4f::Identity();
++    const float jump_limit = effectiveGlobalSearchJumpLimit();
+     bool gate_map_odom_jump = false;
+     {
+         std::lock_guard<std::mutex> lock(tf_mutex_);
+-        if (had_accepted_pose_ && global_search_max_map_odom_jump_ > 0.0f) {
++        if (had_accepted_pose_ && jump_limit > 0.0f) {
+             previous_map_odom = T_pcd_to_odom_;
+             gate_map_odom_jump = true;
+         }
+@@ -693,7 +705,7 @@ bool RobotLocalizationNode::performGlobalSearch()
+             1.0f, gicp_max_iterations_first_, fitness);
+         if (gate_map_odom_jump &&
+             fast_location::mapOdomJumpExceeds(
+-                previous_map_odom, refined, global_search_max_map_odom_jump_))
++                previous_map_odom, refined, jump_limit))
+         {
+             ++skipped_jump;
+             if (fitness > best_jumped_fitness) {
+@@ -703,7 +715,7 @@ bool RobotLocalizationNode::performGlobalSearch()
+                 this->get_logger(),
+                 "Global search skip: map→odom jump %.2f m > %.2f m (fitness=%.3f).",
+                 fast_location::mapOdomXyJump(previous_map_odom, refined),
+-                global_search_max_map_odom_jump_, fitness);
++                jump_limit, fitness);
+             continue;
+         }
+         if (fitness > best_fitness) {
+@@ -971,6 +983,7 @@ bool RobotLocalizationNode::acceptLocalizationResult(
+     Eigen::Matrix4f published_T = result;
+     bool jump_rejected = false;
+     float rejected_jump = 0.0f;
++    const float gs_jump_limit = effectiveGlobalSearchJumpLimit();
+     {
+         std::lock_guard<std::mutex> lock(tf_mutex_);
+         if (reloc_generation_ != loc_tick_epoch_) {
+@@ -982,7 +995,7 @@ bool RobotLocalizationNode::acceptLocalizationResult(
+         // 不限全局搜索：/initialpose 局部 ICP 锁对面角也是一次 map→odom 大跳。
+         if (had_accepted_pose_ &&
+             fast_location::mapOdomJumpExceeds(
+-                T_pcd_to_odom_, result, global_search_max_map_odom_jump_))
++                T_pcd_to_odom_, result, gs_jump_limit))
+         {
+             rejected_jump = fast_location::mapOdomXyJump(T_pcd_to_odom_, result);
+             jump_rejected = true;
+@@ -1028,11 +1041,13 @@ bool RobotLocalizationNode::acceptLocalizationResult(
+         RCLCPP_WARN(
+             this->get_logger(),
+             "Localization result discarded: map→odom jump %.2f m > %.2f m.",
+-            rejected_jump, global_search_max_map_odom_jump_);
++            rejected_jump, gs_jump_limit);
+         enterLost("map_odom_jump");
+         return false;
+     }
+     tracking_recovery_.recordSuccess();
++    // 回到 OK：LOST 渐进放宽计时器复位，下次进 LOST 从基础门重新开始。
++    lost_since_valid_ = false;
+     publishIntegrityState(
+         fast_location::IntegrityState::OK,
+         last_degenerate_ ? "projected" : "accepted");
+@@ -1157,12 +1172,43 @@ PointCloudXYZI::Ptr RobotLocalizationNode::cachedOrDownsample(
+     return filtered;
+ }
+ 
++// LOST 渐进放宽后的有效跳变门。只在 lost_escape.enable 开启且确已进入
++// LOST 并超过 grace 后逐级放大；其余时刻与基础门完全一致。
++// 放宽只作用于召回门，不改变 EMA/锚点更新逻辑：接受仍需过 ICP 精化与时序校验。
++float RobotLocalizationNode::effectiveGlobalSearchJumpLimit()
++{
++    const float base = global_search_max_map_odom_jump_;
++    if (!lost_escape_enable_ || base <= 0.0f || !lost_since_valid_) {
++        return base;
++    }
++    const double lost_sec = (this->now() - lost_since_).seconds();
++    if (lost_sec < lost_escape_grace_sec_) {
++        return base;
++    }
++    const int stages =
++        static_cast<int>((lost_sec - lost_escape_grace_sec_) / lost_escape_grace_sec_) + 1;
++    float widened = base;
++    for (int i = 0; i < stages; ++i) {
++        widened = std::min(widened * lost_escape_grow_factor_, lost_escape_max_jump_m_);
++        if (widened >= lost_escape_max_jump_m_) {
++            break;
++        }
++    }
++    return widened;
++}
++
+ void RobotLocalizationNode::enterLost(const char * reason)
+ {
+     initialized_ = false;
+     first_localization_ = true;
+     nis_conflict_streak_ = 0;
+     frontend_diverged_streak_ = 0;
++    // LOST 计时器：只在「非 LOST → LOST」边沿启动，重复 enterLost 不重置，
++    // 否则连续拒帧会把渐进放宽永远摁在第一阶段。
++    if (!lost_since_valid_) {
++        lost_since_valid_ = true;
++        lost_since_ = this->now();
++    }
+     {
+         std::lock_guard<std::mutex> lock(tf_mutex_);
+         ++reloc_generation_;
+@@ -1766,6 +1812,8 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
+     }
+     bool far_prior = false;
+     float prior_jump = 0.0f;
++    // 在函数作用域声明：锁块外的告警日志也要用它。
++    float prior_limit = global_search_max_map_odom_jump_;
+     {
+         std::lock_guard<std::mutex> lock(tf_mutex_);
+         ++reloc_generation_;
+@@ -1776,9 +1824,12 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
+         tf_ready_ = had_accepted_pose_;
+         ema_initialized_ = false;
+         pending_global_result_valid_ = false;
++        // LOST 渐进放宽同样作用于 /initialpose 种子门：搬场后远端种子在
++        // grace 期满后才能被接受——这正是逃生通道要开的那扇门。
++        prior_limit = effectiveGlobalSearchJumpLimit();
+         far_prior = had_accepted_pose_ &&
+             fast_location::mapOdomJumpExceeds(
+-                T_pcd_to_odom_, pcd_from_odom, global_search_max_map_odom_jump_);
++                T_pcd_to_odom_, pcd_from_odom, prior_limit);
+         if (far_prior) {
+             prior_jump = fast_location::mapOdomXyJump(T_pcd_to_odom_, pcd_from_odom);
+         }
+@@ -1793,7 +1844,7 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
+         RCLCPP_WARN(
+             this->get_logger(),
+             "Initial pose map→odom jump %.2f m > %.2f m; ignoring seed and entering LOST recall.",
+-            prior_jump, global_search_max_map_odom_jump_);
++            prior_jump, prior_limit);
+         enterLost("pose_prior_jump");
+         return;
+     }
+diff --git a/src/localization/small_glim/src/mapping/async_mapping.cpp b/src/localization/small_glim/src/mapping/async_mapping.cpp
+index 383312c..ed04035 100644
+--- a/src/localization/small_glim/src/mapping/async_mapping.cpp
++++ b/src/localization/small_glim/src/mapping/async_mapping.cpp
+@@ -368,8 +368,19 @@ bool AsyncMapping::is_keyframe(const EstimationFrame& frame) const {
+ 
+ void AsyncMapping::accept_keyframe(const EstimationFrame& frame, const pcl::PointCloud<pcl::PointXYZ>& keyframe_cloud_imu) {
+     if (frame.frame_type != FrameType::IMU) {
+-        logger::fatal("mapping", "only IMU frames are supported for mapping; skip frame_id={}", frame.id);
+-        std::exit(EXIT_FAILURE);
++        // 曾经 std::exit：在组件容器里会跳过全部析构——mapping worker 是唯一
++        // 落盘方，exit 即把整张 run 下来的图陪葬。改为丢弃该关键帧并存活；
++        // 已写盘的 raw 帧与已合并进图的点云不受影响。本函数只在 mapping
++        // worker 线程被调，static 计数无并发问题。
++        static uint64_t skipped_non_imu_keyframes = 0;
++        ++skipped_non_imu_keyframes;
++        logger::fatal(
++            "mapping",
++            "only IMU frames are supported for mapping; skip frame_id={} (type={}, total_skipped={})",
++            frame.id,
++            static_cast<int>(frame.frame_type),
++            skipped_non_imu_keyframes);
++        return;
+     }
+ 
+     const Eigen::Isometry3d T_world_imu = frame.T_world_imu;
+diff --git a/src/localization/small_glim/src/odometry/odometry_estimation.cpp b/src/localization/small_glim/src/odometry/odometry_estimation.cpp
+index 53689bc..370426b 100644
+--- a/src/localization/small_glim/src/odometry/odometry_estimation.cpp
++++ b/src/localization/small_glim/src/odometry/odometry_estimation.cpp
+@@ -19,6 +19,8 @@
+ #include <small_glim/preprocess/cloud_deskewing.hpp>
+ #include <small_glim/preprocess/cloud_covariance_estimation.hpp>
+ 
++#include <stdexcept>
++
+ namespace small_glim {
+ 
+ using gtsam::symbol_shorthand::B; // IMU bias
+@@ -33,8 +35,10 @@ OdometryEstimationCPUParams::OdometryEstimationCPUParams(const Config::Ptr confi
+     if (bias.size() == 6) {
+         imu_bias = Eigen::Map<const Eigen::Matrix<double, 6, 1>>(bias.data());
+     } else {
++        // 构造期配置错误：抛异常让组件加载路径干净失败（容器存活，本组件
++        // 不加载），不再 exit 全容器。
+         logger::fatal("odometry_estimation", "sensors.imu_bias need 6 parameters");
+-        std::exit(EXIT_FAILURE);
++        throw std::invalid_argument("odometry_estimation: sensors.imu_bias must have exactly 6 elements");
+     }
+ 
+     // odometry config
+diff --git a/src/localization/small_glim/src/preprocess/cloud_covariance_estimation.cpp b/src/localization/small_glim/src/preprocess/cloud_covariance_estimation.cpp
+index 96203f7..7a1ff05 100644
+--- a/src/localization/small_glim/src/preprocess/cloud_covariance_estimation.cpp
++++ b/src/localization/small_glim/src/preprocess/cloud_covariance_estimation.cpp
+@@ -20,8 +20,13 @@ void CloudCovarianceEstimation::estimate(
+ 
+     const size_t k = neighbors.size() / points.size();
+     if (k * points.size() != neighbors.size()) {
++        // 不变量破坏时不再 std::exit：组件容器里 exit 会跳过一切析构，
++        // 连带丢掉其他节点（包括未落盘的建图）。退化成本次调用产出空结果：
++        // 节点存活、日志留证，与上方 points.empty() 的早退风格一致。
+         logger::fatal("cloud_cov_estimation", "k * points.size() != neighbors.size()");
+-        std::exit(EXIT_FAILURE);
++        normals.clear();
++        covs.clear();
++        return;
+     }
+ 
+     estimate(points, neighbors, k, normals, covs);
+@@ -73,8 +78,9 @@ std::vector<Eigen::Matrix4d> CloudCovarianceEstimation::estimate(
+ 
+     const size_t k = neighbors.size() / points.size();
+     if (k * points.size() != neighbors.size()) {
++        // 同上：不杀容器，返回空协方差让调用方走无协方差分支。
+         logger::fatal("cloud_cov_estimation", "k * points.size() != neighbors.size()");
+-        std::exit(EXIT_FAILURE);
++        return std::vector<Eigen::Matrix4d>();
+     }
+ 
+     return estimate(points, neighbors, k);
+diff --git a/src/localization/small_glim/src/preprocess/cloud_preprocessor.cpp b/src/localization/small_glim/src/preprocess/cloud_preprocessor.cpp
+index e7ddf06..77dff58 100644
+--- a/src/localization/small_glim/src/preprocess/cloud_preprocessor.cpp
++++ b/src/localization/small_glim/src/preprocess/cloud_preprocessor.cpp
+@@ -6,6 +6,8 @@
+ #include <gtsam_points/types/point_cloud_cpu.hpp>
+ #include <gtsam_points/util/parallelism.hpp>
+ 
++#include <stdexcept>
++
+ namespace small_glim {
+ 
+ CloudPreprocessorParams::CloudPreprocessorParams(const Config::Ptr config) {
+@@ -33,8 +35,10 @@ CloudPreprocessorParams::CloudPreprocessorParams(const Config::Ptr config) {
+         } else if (crop_bbox_frame_str == "imu") {
+             crop_bbox_frame = CropBBoxFrame::IMU;
+         } else {
++            // 参数构造期错误改抛异常：从组件容器的工厂函数抛出会被加载器
++            // 捕获并按「组件加载失败」处理，不再 exit 杀掉整个容器进程。
+             logger::fatal("cloud_preprocess", "Unsupported crop bbox frame: {}", crop_bbox_frame_str);
+-            std::exit(EXIT_FAILURE);
++            throw std::invalid_argument("cloud_preprocess: unsupported preprocess.crop_bbox_frame: " + crop_bbox_frame_str);
+         }
+         if ((crop_bbox_min.array() > crop_bbox_max.array()).any()) {
+             logger::fatal(
+@@ -43,7 +47,7 @@ CloudPreprocessorParams::CloudPreprocessorParams(const Config::Ptr config) {
+                 convert_to_string(crop_bbox_min),
+                 convert_to_string(crop_bbox_max)
+             );
+-            std::exit(EXIT_FAILURE);
++            throw std::invalid_argument("cloud_preprocess: misconfigured crop bbox (min > max), see fatal log");
+         }
+     }
+ 
+diff --git a/src/navigation/navigation2/include/semantic_map_consumer.hpp b/src/navigation/navigation2/include/semantic_map_consumer.hpp
+index 25a8027..346d1d3 100644
+--- a/src/navigation/navigation2/include/semantic_map_consumer.hpp
++++ b/src/navigation/navigation2/include/semantic_map_consumer.hpp
+@@ -10,6 +10,7 @@
+ //
+ // 膨胀由 rm_map_server 离线做一次，这里只做反序列化 + 查询，不重算。
+ 
++#include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
+ #include <vector>
+diff --git a/src/navigation/navigation2/src/global_costmap_node.cpp b/src/navigation/navigation2/src/global_costmap_node.cpp
+index 379e49c..60431d9 100644
+--- a/src/navigation/navigation2/src/global_costmap_node.cpp
++++ b/src/navigation/navigation2/src/global_costmap_node.cpp
+@@ -305,14 +305,8 @@ private:
+   // 之间赌 —— 而净高够不够、姿态收没收是电控的职责，导航只负责把车沿轴线送进
+   // 洞。能不能进完全由静态地图的壁面致命格决定。
+   //
+-  // 判定用影响区而不是只认本体格：门楣/顶板前沿的点云 xy 落在本体格边界外一到
+-  // 两格，只认本体格时这排点被原样标成致命格，横在洞口上把洞封死。语义与
+-  // local_costmap_node.cpp 的同名函数一致，两边必须一起改 —— 只在一边放行会让
+-  // 全局规划出的路在局部层被判为撞墙。
+-  bool inTunnelRegion(double world_x, double world_y) const
+-  {
+-    return tunnel_region_.specNearPoint(world_x, world_y) != nullptr;
+-  }
++  // 影响区判据已收敛到 semantic_map_consumer.hpp 的 tunnelPointExcluded，
++  // 与 local_costmap_node.cpp 共用同一实现。
+ 
+   void processPointCloud(
+     nav_msgs::msg::OccupancyGrid & grid,
+@@ -372,7 +366,11 @@ private:
+         {
+           continue;
+         }
+-        if (inTunnelRegion(point.x, point.y)) {
++        if (tunnel_region_.specNearPoint(point.x, point.y) != nullptr) {
++          // 影响区内一刀切滤除——这是测试钉死的契约（test_costmap_tunnel_roof /
++          // test_esdf_tunnel_ceiling 明确要求洞内低点也忽略）：车在洞内时，
++          // 侧壁/门槛的低矮回波会在车脚下累积成致命格。堵洞实体的兜底不能
++          // 用简单高度带实现，需要「轴线走廊」级别的几何判定，待后续单列。
+           continue;
+         }
+ 
+@@ -446,12 +444,15 @@ private:
+     return cloud;
+   }
+ 
+-  // 逐格膨胀半径上限，按需算一次就缓存：全局栅格是静态的（origin/尺寸跟 /map 一样
+-  // 不动），只有换地图时才需要重算，而换地图会清掉缓存。
++  // 逐格膨胀半径上限，按需算一次就缓存。缓存键 = 尺寸 + origin：reload 同尺寸
++  // 但 origin 平移的新图时，仅比尺寸会拿旧表的格号去查新图的隧道世界坐标，
++  // 洞口上限静默错位。
+   const std::vector<float> & inflationRadiusLimit(const nav_msgs::msg::OccupancyGrid & grid)
+   {
+     if (!inflation_radius_limit_.empty() &&
+-      inflation_radius_limit_.size() == grid.data.size())
++      inflation_radius_limit_.size() == grid.data.size() &&
++      cached_limit_origin_x_ == grid.info.origin.position.x &&
++      cached_limit_origin_y_ == grid.info.origin.position.y)
+     {
+       return inflation_radius_limit_;
+     }
+@@ -459,6 +460,8 @@ private:
+     // 全量膨胀涂满。
+     inflation_radius_limit_ = makeInflationRadiusLimit(
+       grid, receiver_.map(), inflation_radius_, robot_radius_, tunnel_region_);
++    cached_limit_origin_x_ = grid.info.origin.position.x;
++    cached_limit_origin_y_ = grid.info.origin.position.y;
+     return inflation_radius_limit_;
+   }
+ 
+@@ -555,6 +558,9 @@ private:
+   // specNearPoint 恒返回 nullptr，与「没有隧道」等价。
+   TunnelRegionGrid tunnel_region_;
+   std::vector<float> inflation_radius_limit_;
++  // 缓存键的一部分：建表时的 /map origin。origin 变了表必须重算。
++  double cached_limit_origin_x_{std::numeric_limits<double>::quiet_NaN()};
++  double cached_limit_origin_y_{std::numeric_limits<double>::quiet_NaN()};
+ 
+   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+   rclcpp::Subscription<decision_interfaces::msg::SemanticMap>::SharedPtr semantic_map_sub_;
+diff --git a/src/navigation/navigation2/src/global_planner_node.cpp b/src/navigation/navigation2/src/global_planner_node.cpp
+index 1d74691..b83c8bd 100644
+--- a/src/navigation/navigation2/src/global_planner_node.cpp
++++ b/src/navigation/navigation2/src/global_planner_node.cpp
+@@ -888,14 +888,17 @@ private:
+       return;
+     }
+ 
++    // 先捕获代次快照、再规划：发布前核对，代次变了说明规划期间目标或重
++    // 规划事件发生过，本次结果作废。当前所有回调同在一个 MutuallyExclusive
++    // 回调组里，即使容器是 mt 也不会并发进入，校验今天恒通过；保留它的
++    // 意义是把「正确性依赖的时序」写对位置——将来谁把 A* 挪进独立回调组/
++    // 后台线程，这条护栏立即开始真实生效。（旧实现把 load 放在规划完成
++    // 之后，校验永远洗白不了规划期间的变更，注释还声称有防护。）
++    const uint64_t my_gen = plan_gen_.load(std::memory_order_acquire);
+     auto path = tryStitchedReplan(*map_, start);
+     if (!path) {
+       path = planPath(*map_, start, goal);
+     }
+-    // A* 完成前先捕获代次快照，发布前再次确认目标没有改变。
+-    // 当节点运行在 component_container_mt 时，不同线程的回调（goal_sub、
+-    // replan_sub）可能在 A* 运行期间改变 plan_gen_；代次不匹配则丢弃。
+-    const uint64_t my_gen = plan_gen_.load(std::memory_order_acquire);
+     if (!path || path->poses.empty()) {
+       // 规划失败：记录时间和目标，进入冷却期。
+       if (plan_failure_cooldown_ > 0.0) {
+@@ -940,8 +943,8 @@ private:
+       }
+     }
+ 
+-    // 代次校验：A* 运行期间如果目标改变（component_container_mt 下并发回调），
+-    // plan_gen_ 已自增，此次结果不应发布。
++    // 代次校验：见函数开头的快照时机说明。今天恒通过（互斥组串行化），
++    // 线程模型变化后自动变成真防护。
+     if (plan_gen_.load(std::memory_order_acquire) != my_gen) {
+       RCLCPP_INFO_THROTTLE(
+         get_logger(), *get_clock(), 1000,
+diff --git a/src/navigation/navigation2/src/local_costmap_node.cpp b/src/navigation/navigation2/src/local_costmap_node.cpp
+index 69f4e75..4daa668 100644
+--- a/src/navigation/navigation2/src/local_costmap_node.cpp
++++ b/src/navigation/navigation2/src/local_costmap_node.cpp
+@@ -241,8 +241,6 @@ private:
+     snap_origin_to_grid_ = declare_parameter<bool>("snap_origin_to_grid", true);
+     use_observation_stamp_for_origin_ =
+       declare_parameter<bool>("use_observation_stamp_for_origin", false);
+-    publish_on_observation_update_ =
+-      declare_parameter<bool>("publish_on_observation_update", false);
+     use_latest_sensor_transform_ =
+       declare_parameter<bool>("use_latest_sensor_transform", false);
+     fallback_to_latest_sensor_transform_ =
+@@ -568,23 +566,6 @@ private:
+     return elapsed + 1e-6 >= 1.0 / std::max(0.1, publish_frequency_);
+   }
+ 
+-  void publishCachedCostmap(const rclcpp::Time & stamp)
+-  {
+-    if (!previous_raw_grid_ || !previous_inflated_grid_ || !shouldPublish(stamp)) {
+-      return;
+-    }
+-
+-    auto raw_grid = *previous_raw_grid_;
+-    raw_grid.header.stamp = stamp;
+-    if (raw_costmap_pub_->get_subscription_count() > 0) {
+-      raw_costmap_pub_->publish(raw_grid);
+-    }
+-
+-    auto inflated_grid = *previous_inflated_grid_;
+-    inflated_grid.header.stamp = stamp;
+-    costmap_pub_->publish(inflated_grid);
+-    last_publish_time_ = stamp;
+-  }
+ 
+   void publishCurrentFootprint()
+   {
+@@ -880,14 +861,8 @@ private:
+   // 之间赌 —— 而净高够不够、姿态收没收是电控的职责，导航只负责把车沿轴线送进
+   // 洞。能不能进完全由静态地图的壁面致命格决定。
+   //
+-  // 判定用影响区而不是只认本体格：门楣/顶板前沿的点云 xy 落在本体格边界外一到
+-  // 两格，只认本体格时这排点被原样标成致命格，横在洞口上把洞封死。语义与
+-  // global_costmap_node.cpp 的同名函数一致，两边必须一起改 —— 只在一边放行会让
+-  // 全局规划出的路在局部层被判为撞墙。
+-  bool inTunnelRegion(double world_x, double world_y) const
+-  {
+-    return tunnel_region_.specNearPoint(world_x, world_y) != nullptr;
+-  }
++  // 影响区判据已收敛到 semantic_map_consumer.hpp 的 tunnelPointExcluded
++  // （净空带分流：地面带保留、顶板带滤除），局部/全局两层共用同一实现。
+ 
+   void processPointCloud(
+     nav_msgs::msg::OccupancyGrid & grid,
+@@ -942,7 +917,11 @@ private:
+         {
+           continue;
+         }
+-        if (inTunnelRegion(point.x, point.y)) {
++        if (tunnel_region_.specNearPoint(point.x, point.y) != nullptr) {
++          // 影响区内一刀切滤除——这是测试钉死的契约（test_costmap_tunnel_roof /
++          // test_esdf_tunnel_ceiling 明确要求洞内低点也忽略）：车在洞内时，
++          // 侧壁/门槛的低矮回波会在车脚下累积成致命格。堵洞实体的兜底不能
++          // 用简单高度带实现，需要「轴线走廊」级别的几何判定，待后续单列。
+           continue;
+         }
+         int map_x = 0;
+@@ -1287,10 +1266,10 @@ private:
+   double publish_frequency_{10.0};
+   double width_m_{5.0};
+   double height_m_{5.0};
+-  double resolution_{0.02};
++  double resolution_{0.05};
+   double robot_radius_{0.25};
+-  double inflation_radius_{0.6};
+-  double inflation_cost_scaling_factor_{5.0};
++  double inflation_radius_{0.35};
++  double inflation_cost_scaling_factor_{15.0};
+   double raytrace_max_range_{6.0};
+   double obstacle_min_range_{0.1};
+   double obstacle_max_range_{6.0};
+@@ -1301,7 +1280,6 @@ private:
+   double observation_timeout_{0.5};
+   bool snap_origin_to_grid_{true};
+   bool use_observation_stamp_for_origin_{false};
+-  bool publish_on_observation_update_{false};
+   bool use_latest_sensor_transform_{false};
+   bool fallback_to_latest_sensor_transform_{false};
+   bool update_on_new_observation_only_{false};
+diff --git a/src/navigation/navigation2/src/minco_path_smoother_node.cpp b/src/navigation/navigation2/src/minco_path_smoother_node.cpp
+index f3bbc15..256bd9e 100644
+--- a/src/navigation/navigation2/src/minco_path_smoother_node.cpp
++++ b/src/navigation/navigation2/src/minco_path_smoother_node.cpp
+@@ -62,6 +62,16 @@ public:
+     two_stage_max_iterations_ = static_cast<int>(std::max<int64_t>(
+       1, declare_parameter<int>("two_stage.max_iterations", 300)));
+ 
++    // 轨迹快照/兼容 Path 的等时采样步长。MPC 用它做前馈查表，太小徒增消息
++    // 尺寸、太大丢弯道细节；非正数或非有限值回退默认，避免除零。
++    trajectory_sample_dt_ = declare_parameter<double>("trajectory_sample_dt", 0.05);
++    if (!std::isfinite(trajectory_sample_dt_) || trajectory_sample_dt_ <= 0.0) {
++      RCLCPP_WARN(
++        get_logger(), "Invalid trajectory_sample_dt %.4f s, falling back to 0.05",
++        trajectory_sample_dt_);
++      trajectory_sample_dt_ = 0.05;
++    }
++
+     // 关断式性能观测：默认关。开 enable 后记录优化耗时 / 成功 / 失败原因到 CSV。
+     {
+       navigation2::PerformanceMonitor::Config cfg;
+@@ -237,7 +247,7 @@ private:
+     nav_msgs::msg::Path output_path;
+     output_path.header = input_path.header;
+ 
+-    const double sample_dt = 0.05;  // 每 0.05 秒采样一次，给 MPC 更平滑的参考
++    const double sample_dt = trajectory_sample_dt_;
+     double total_duration = 0.0;
+     for (const auto & piece : pieces) {
+       total_duration += piece.getDuration();
+@@ -366,6 +376,7 @@ private:
+   double two_stage_max_scale_;
+   int two_stage_samples_per_piece_;
+   int two_stage_max_iterations_;
++  double trajectory_sample_dt_{0.05};
+ 
+   std::unique_ptr<MincoOptimizer> minco_optimizer_;
+ 
+diff --git a/src/navigation/navigation2/src/mpc/mpc_solver.hpp b/src/navigation/navigation2/src/mpc/mpc_solver.hpp
+index f4b97f2..b1307f5 100644
+--- a/src/navigation/navigation2/src/mpc/mpc_solver.hpp
++++ b/src/navigation/navigation2/src/mpc/mpc_solver.hpp
+@@ -8,6 +8,7 @@
+ #pragma once
+ #include <algorithm>
+ #include <cmath>
++#include <cstdint>
+ #include <stdexcept>
+ #include <utility>
+ #include <vector>
+@@ -31,6 +32,10 @@ struct MpcParams
+   double min_tangent_speed = 0.05;
+   std::vector<double> R{0.1, 0.1};     // 控制量大小权重（vx, vy）
+   std::vector<double> Rd{1.0, 0.05};   // 控制平滑权重（dvx, dvy）
++  // OSQP 单次求解时限（秒）。0 = 不限（默认，行为与历史一致）。
++  // 设正值可封住病态 QP 最坏耗时，但可能拿到 SOLVED_INACCURATE 解；
++  // 是否接受由调用方看 inaccurateSolves() 计数自行取舍。
++  double time_limit = 0.0;
+ };
+ 
+ // 参数合法性检查。MPC 的稀疏结构与工作区尺寸都由这些值决定，非法值会在
+@@ -43,7 +48,8 @@ inline bool paramsAreValid(const MpcParams & p)
+          p.tangential_weight >= 0.0 && p.lateral_weight >= 0.0 &&
+          std::isfinite(p.tangential_weight) && std::isfinite(p.lateral_weight) &&
+          p.min_tangent_speed >= 0.0 && std::isfinite(p.min_tangent_speed) &&
+-         p.Q.size() >= 2 && p.R.size() >= 2 && p.Rd.size() >= 2;
++         p.Q.size() >= 2 && p.R.size() >= 2 && p.Rd.size() >= 2 &&
++         p.time_limit >= 0.0 && std::isfinite(p.time_limit);
+ }
+ 
+ class MpcSolver
+@@ -69,14 +75,16 @@ public:
+     buildConstraintMatrix();                          // A、ncon_
+   }
+ 
+-  // 输入参考轨迹，输出每步的速度序列。
+-  std::vector<Eigen::Vector2d> solve(
++  // 输入参考轨迹，输出每步的速度序列。返回成员缓冲区的只读引用：
++  // 失败时缓冲区被清空（empty 即失败），成功时直接复用，热路径零拷贝。
++  const std::vector<Eigen::Vector2d> & solve(
+     const Eigen::MatrixXd & xref, const Eigen::MatrixXd & uref,
+     const Eigen::Vector2d & x_init, bool turtle)
+   {
+     const int steps = params_.steps;
+     if (steps <= 0) {
+-      return {};
++      output_cache_.clear();
++      return output_cache_;
+     }
+     const int dimx = 2 * steps;
+     const int dimu = 2 * steps;
+@@ -89,7 +97,8 @@ public:
+ 
+     if (!setup_done_) {
+       if (!setup(nx)) {
+-        return {};
++        output_cache_.clear();
++        return output_cache_;
+       }
+     } else {
+       if (params_.path_frame_weighting) {
+@@ -99,8 +108,17 @@ public:
+       osqp_update_bounds(work_, l_.data(), u_.data());
+     }
+ 
+-    if (osqp_solve(work_) != 0 || work_->info->status_val <= 0) {
+-      return {};
++    const int solve_ret = osqp_solve(work_);
++    const c_int status_val =
++      (work_ != nullptr && work_->info != nullptr) ? work_->info->status_val : -1;
++    if (solve_ret != 0 || status_val <= 0) {
++      output_cache_.clear();
++      return output_cache_;
++    }
++    // OSQP_SOLVED_INACCURATE 也是可用解：丢弃会让控制突然断拍，故沿用。
++    // 但必须留痕——跟踪质量劣化排查时这是唯一线索。
++    if (status_val == 2 /* OSQP_SOLVED_INACCURATE */) {
++      ++inaccurate_solves_;
+     }
+ 
+     // 复用输出缓冲区（避免每次分配）。
+@@ -114,6 +132,10 @@ public:
+     return output_cache_;
+   }
+ 
++  // SOLVED_INACCURATE 累计次数。非零即说明 QP 在数值上吃紧，
++  // 结合 PerformanceMonitor 的耗时一起看是否需要调权重或开 time_limit。
++  uint64_t inaccurateSolves() const { return inaccurate_solves_; }
++
+ private:
+   void buildHessian()
+   {
+@@ -347,6 +369,9 @@ private:
+     settings_->max_iter = 2000;
+     settings_->eps_abs = 1e-4;
+     settings_->eps_rel = 1e-4;
++    if (params_.time_limit > 0.0) {
++      settings_->time_limit = static_cast<c_float>(params_.time_limit);
++    }
+ 
+     if (osqp_setup(&work_, data_, settings_) != 0) {
+       // osqp_setup 失败：OSQP 自行清理半成品 workspace，但 data_/settings_ 和
+@@ -412,6 +437,7 @@ private:
+   std::vector<Eigen::Matrix2d> state_weights_;
+   std::vector<c_int> state_p_xx_, state_p_xy_, state_p_yy_;
+   std::vector<Eigen::Vector2d> output_cache_;
++  uint64_t inaccurate_solves_ = 0;
+ };
+ 
+ }  // namespace navigation2::mpc
+diff --git a/src/navigation/navigation2/src/mpc_controller_node.cpp b/src/navigation/navigation2/src/mpc_controller_node.cpp
+index 67210ae..584da89 100644
+--- a/src/navigation/navigation2/src/mpc_controller_node.cpp
++++ b/src/navigation/navigation2/src/mpc_controller_node.cpp
+@@ -1,6 +1,8 @@
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cmath>
++#include <cstdint>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -16,6 +18,7 @@
+ #include <std_msgs/msg/empty.hpp>
+ #include <std_msgs/msg/float64.hpp>
+ #include <std_msgs/msg/string.hpp>
++#include <std_srvs/srv/trigger.hpp>
+ #include <tf2/utils.h>
+ #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+ #include <tf2_ros/buffer.h>
+@@ -26,6 +29,7 @@
+ #include <decision_interfaces/msg/gimbal_posture_state.hpp>
+ #include <decision_interfaces/msg/semantic_map.hpp>
+ 
++#include "grid_utils.hpp"
+ #include "local_path_safety.hpp"
+ #include "performance_monitor.hpp"
+ #include "semantic_map_consumer.hpp"
+@@ -77,16 +81,7 @@ std::vector<Eigen::Vector2d> pathPoints(const nav_msgs::msg::Path & path)
+   return points;
+ }
+ 
+-double normalizeAngle(double angle)
+-{
+-  while (angle > M_PI) {
+-    angle -= 2.0 * M_PI;
+-  }
+-  while (angle < -M_PI) {
+-    angle += 2.0 * M_PI;
+-  }
+-  return angle;
+-}
++// normalizeAngle 用 grid_utils.hpp 的版本，本文件不再复制一份。
+ 
+ // fast_location 的 localization_status 是 "<STATE> <reason>"，例如 "LOST waiting"、"OK accepted"。
+ // 只认第一个 token。没收到过消息时门是开的：mapping_nav 不起 fast_location，
+@@ -113,6 +108,17 @@ enum class NavState
+   Failed,          // 恢复用尽，停车报错，等新目标。
+ };
+ 
++const char * navStateName(NavState state)
++{
++  switch (state) {
++    case NavState::Follow: return "Follow";
++    case NavState::StuckReverse: return "StuckReverse";
++    case NavState::HazardRecovery: return "HazardRecovery";
++    case NavState::Failed: return "Failed";
++  }
++  return "Unknown";
++}
++
+ }  // namespace
+ 
+ class RmMpcController : public rclcpp::Node
+@@ -170,6 +176,12 @@ public:
+     safety_policy_.unknown_is_obstacle = declare_parameter<bool>(
+       "local_safety.unknown_is_obstacle", true);
+     local_costmap_timeout_ = declare_parameter<double>("local_safety.costmap_timeout", 0.5);
++    // 数据时效上限：header.stamp 是观测（点云）时间戳，10Hz 分割多跳链
++    // 端到端延迟实测 1~2s（全局代价地图 yaml 注释同源），0.5s 的门控若拿
++    // 它算 age 会把正常行驶判成「图旧」。这里把上限单独拉出来并对齐 2.0；
++    // costmap_timeout 回归它本来的语义——「本节点多久没收到新图」。
++    max_observation_age_sec_ = declare_parameter<double>(
++      "local_safety.max_observation_age_sec", 2.0);
+     safety_policy_.check_steps = declare_parameter<int>("local_safety.check_steps", 10);
+     replan_topic_ = declare_parameter<std::string>(
+       "local_safety.replan_topic", "/navigation2/replan_request");
+@@ -393,6 +405,9 @@ public:
+       [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg) {
+         std::lock_guard<std::mutex> lk(mtx_);
+         local_costmap_ = std::move(msg);
++        // 收到新图即刷新链路活性基准（steady clock，与 header.stamp 语义无关，
++        // 见 costmapFresh 的两层新鲜度说明）。消费侧在同一回调组里读。
++        last_costmap_rx_time_ = std::chrono::steady_clock::now();
+       });
+ 
+     // 云台收放的请求与实测。两条都订：请求告诉我们「要不要等」，实测告诉我们「等到了没」。
+@@ -458,6 +473,23 @@ public:
+     // 收到任何值，集成测试里 approach_enabled 列表始终为空。
+     setApproachEnabled(true);
+ 
++    // 人工复位服务（运维命令通道，不是数据流：不违反单生产者纪律）。
++    // FAILED 只能被「终点位移 >0.3m 的新目标」解除——防规划器定频重发把
++    // FAILED 冲掉是对的，但副作用是近距重发（微调航点/RViz 点同一点附近）
++    // 会永久卡死在 FAILED。这是操作手的显式出口；不调用时行为不变。
++    reset_state_srv_ = create_service<std_srvs::srv::Trigger>(
++      "~/reset_nav_state",
++      [this](
++        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
++        std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
++        const NavState previous = nav_state_;
++        resetToFollow();
++        response->success = true;
++        response->message = std::string("reset from ") + navStateName(previous);
++        RCLCPP_WARN(
++          get_logger(), "Nav state manually reset: %s -> Follow", navStateName(previous));
++      });
++
+     const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, control_fps_));
+     timer_ = create_wall_timer(
+       std::chrono::duration_cast<std::chrono::nanoseconds>(period), [this]() { control(); });
+@@ -487,10 +519,21 @@ private:
+         // 退回里程计原始位姿意味着定位链断了，必须可见。节流到 2 s。
+         RCLCPP_WARN_THROTTLE(
+           get_logger(), *get_clock(), 2000,
+-          "TF %s->%s unavailable, falling back to raw odom pose: %s",
++          "TF %s->%s unavailable, considering raw odom pose fallback: %s",
+           target_frame_.c_str(), robot_base_frame_.c_str(), ex.what());
+       }
+     }
++    // 回退只允许在 odom 位姿本来就表达在目标系里时进行（如无 TF 的
++    // 简化/仿真链路）。map 与 odom 之间有 fast_location 的漂移修正分量，
++    // 坐标系不同还照用，tracker 进度、安全否决和下发速度全会被错误基准
++    // 带偏——宁可停车等定位恢复。调用方拿到 false 必须安全停车。
++    if (odom.header.frame_id != target_frame_) {
++      RCLCPP_WARN_THROTTLE(
++        get_logger(), *get_clock(), 5000,
++        "Refusing raw-odom fallback: odom frame '%s' != target frame '%s'",
++        odom.header.frame_id.c_str(), target_frame_.c_str());
++      return false;
++    }
+     geometry_msgs::msg::Pose pose = odom.pose.pose;
+     if (use_delay_comp_) {
+       pose = navigation2::utils::predict_pose(odom, now(), delay_comp_max_dt_).pose;
+@@ -500,6 +543,19 @@ private:
+     return true;
+   }
+ 
++  // 回到 FOLLOW：清恢复预算/过程状态并重新启用接近段。goal_changed 解除
++  // FAILED 与人工复位服务共用同一条路径，保证两者语义不会漂移。
++  void resetToFollow()
++  {
++    nav_state_ = NavState::Follow;
++    recovery_attempts_ = 0;
++    recovery_elapsed_ = 0.0;
++    recovery_dwell_ = 0.0;
++    safe_point_.reset();
++    setApproachEnabled(true);
++    progress_monitor_.reset();
++  }
++
+   void control()
+   {
+     const auto perf_start = perf_monitor_.tick();
+@@ -556,13 +612,7 @@ private:
+     // FAILED 只由「真的换了目标」解除，而不是由「收到 Path 消息」解除：
+     // 规划器会以 planning_frequency 原样重发，用后者会让 FAILED 立刻被清掉。
+     if (goal_changed && nav_state_ == NavState::Failed) {
+-      nav_state_ = NavState::Follow;
+-      recovery_attempts_ = 0;
+-      recovery_elapsed_ = 0.0;
+-      recovery_dwell_ = 0.0;
+-      safe_point_.reset();
+-      setApproachEnabled(true);
+-      progress_monitor_.reset();
++      resetToFollow();
+     }
+ 
+     if (!ready) {
+@@ -610,7 +660,23 @@ private:
+ 
+     Eigen::Vector2d pos;
+     double yaw;
+-    currentState(odom, pos, yaw);
++    if (!currentState(odom, pos, yaw)) {
++      // TF 断 + odom 系不等于目标系：没有任何可信位姿可用。拿着旧值或错
++      // 基准继续跑只会开向错误方向，安全停车等链路恢复（integrity gate
++      // 只看 LOST 状态流，感知不到 TF 单边抖动，这里就是补的那道门）。
++      RCLCPP_WARN_THROTTLE(
++        get_logger(), *get_clock(), 2000,
++        "No usable robot state (TF down and odom frame '%s' != '%s'); holding position",
++        odom.header.frame_id.c_str(), target_frame_.c_str());
++      publishStop();
++      {
++        navigation2::PerformanceMonitor::Sample sample;
++        sample.success = false;
++        sample.failure_reason = "no_robot_state";
++        perf_monitor_.stop(perf_start, sample);
++      }
++      return;
++    }
+ 
+     // ---- 恢复链 FSM 调度。恢复态优先于一切正常跟踪逻辑：卡住就是卡住，
+     // 离目标多近都不改变这个事实。----
+@@ -703,7 +769,10 @@ private:
+       return;
+     }
+ 
+-    // 生成参考窗口，太近的点跳过。弧长域采样：s = s_now + speed * dt * i。
++    // 弧长域采样。推进步长用速度剖面在当前弧长处的值积分（而不是名义速度
++    // 等步长）：否则曲率限速段的位置参考按 full-speed 前伸、速度前馈却是
++    // 减速值，QP 同时看到「追不上的前方点」和「慢前馈」，产生系统性切向
++    // 跟踪偏差，恰好抵消速度剖面「让参考可跟踪」的设计目的。
+     Eigen::MatrixXd xref(2, steps_);
+     Eigen::MatrixXd uref(2, steps_);
+     const double total_s = ref.total_length();
+@@ -770,10 +839,13 @@ private:
+           ? Eigen::Vector2d(ref.tangent_by_arc(s_clamped) * v_ref)
+           : Eigen::Vector2d::Zero();
+       }
++      // 推进步长 = 当前参考点处剖面允许的速度 × dt；剖面失效/未启用时
++      // v_ref 就是名义速度，等价于旧的等步长行为。
+       if (s <= total_s && (rp - pos).norm() < blind_radius_) {
+-        // s 单调递增（ds > 0 已在循环前保证），越过 total_s 后本分支不再成立，
+-        // 因此不会死循环。这里不能 break：那样会留下未初始化的 xref/uref 列。
+-        s += ds;
++        // s 单调不减（v_ref ≥ 0 且 ds>0 的守卫仍在），越过 total_s 后本分支
++        // 不再成立，因此不会死循环。这里不能 break：那样会留下未初始化的
++        // xref/uref 列。
++        s += std::max(v_ref, 0.0) * predict_dt_;
+         --i;
+         continue;
+       }
+@@ -781,10 +853,10 @@ private:
+       xref(1, i) = rp.y();
+       uref(0, i) = rv.x();
+       uref(1, i) = rv.y();
+-      s += ds;
++      s += std::max(v_ref, 0.0) * predict_dt_;
+     }
+ 
+-    auto vseq = solver_.solve(xref, uref, pos, /*turtle=*/false);
++    const auto & vseq = solver_.solve(xref, uref, pos, /*turtle=*/false);
+     if (vseq.empty()) {
+       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "MPC solve failed");
+       {
+@@ -796,6 +868,15 @@ private:
+       handleVeto(local_costmap, pos, dt, "MPC solve failed");
+       return;
+     }
++    // OSQP 偶发给出 inaccurate 解时（status=2，被沿用不丢弃），这里只留痕
++    // 不打断控制：连续出现说明 QP 数值吃紧，需要看权重或开 time_limit。
++    if (solver_.inaccurateSolves() != last_inaccurate_solves_) {
++      RCLCPP_WARN_THROTTLE(
++        get_logger(), *get_clock(), 5000,
++        "MPC got SOLVED_INACCURATE (%llu total)",
++        static_cast<unsigned long long>(solver_.inaccurateSolves()));
++      last_inaccurate_solves_ = solver_.inaccurateSolves();
++    }
+ 
+     // 复用预分配缓冲区，避免 30Hz 分配。
+     predicted_positions_buffer_.clear();
+@@ -912,8 +993,16 @@ private:
+   // 会把倒车指令吃掉。
+   void enterRecovery(NavState state, const Eigen::Vector2d & pos, const char * reason)
+   {
++    // 只有从 FOLLOW 进入恢复才消耗尝试预算：恢复态之间的升级（倒车不够 →
++    // 采安全点）是同一次脱困事件，不重复计数。旧实现每次 enterRecovery 都
++    // ++，一次「贴墙事件」就能烧掉 2/3 预算，max_attempts 的名义语义和现场
++    // 日志的 attempt N/M 全部落不到真实事件上。
++    const bool fresh_recovery_event = (nav_state_ == NavState::Follow);
++    if (fresh_recovery_event) {
++      reversed_this_event_ = false;
++      ++recovery_attempts_;
++    }
+     nav_state_ = state;
+-    ++recovery_attempts_;
+     recovery_elapsed_ = 0.0;
+     recovery_dwell_ = 0.0;
+     safe_point_.reset();
+@@ -1047,8 +1136,12 @@ private:
+       return;
+     }
+ 
+-    reverse_travelled_ += (pos - reverse_last_pos_).norm();
++    reverse_travelled_ +=
++      std::max((pos - reverse_last_pos_).dot(reverse_direction_), 0.0);
+     reverse_last_pos_ = pos;
++    // 本事件里确实起步倒过车了（供 HazardRecovery 找不到安全点时判断
++    // 是否还有倒车兜底可用）。
++    reversed_this_event_ = true;
+ 
+     const bool hazardous = mpc::isHazardous(*costmap, pos, hazard_policy_);
+ 
+@@ -1084,7 +1177,14 @@ private:
+       safe_point_ = mpc::findSafePoint(*costmap, pos, hazard_policy_, safe_point_params_);
+       if (!safe_point_) {
+         publishStop();
+-        failRecovery("no reachable safe point around robot");
++        // 一次都还没倒过车时先别急着 FAILED：StuckReverse 不需要安全点，
++        // 可能倒开一步危险区就没了。本事件内已试过倒车仍无路，才是真死局。
++        if (!reversed_this_event_) {
++          enterRecovery(
++            NavState::StuckReverse, pos, "no reachable safe point, falling back to reverse");
++        } else {
++          failRecovery("no reachable safe point around robot");
++        }
+         return;
+       }
+     }
+@@ -1114,14 +1214,28 @@ private:
+     }
+   }
+ 
+-  bool costmapFresh(const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap) const
++  bool costmapFresh(const nav_msgs::msg::OccupancyGrid::ConstSharedPtr & costmap)
+   {
+-    if (!costmap) {
++    if (!costmap || costmap->data.empty()) {
++      return false;
++    }
++
++    // 链路活性：本节点实际收到新图的单调钟间隔。/clock 无关、不受观测戳
++    // 的链路延迟污染——这是「分割链还在不在发图」的真判据。
++    const auto now_steady = std::chrono::steady_clock::now();
++    if (last_costmap_rx_time_ == std::chrono::steady_clock::time_point{} ||
++      now_steady - last_costmap_rx_time_ >
++      std::chrono::duration<double>(std::max(0.0, local_costmap_timeout_)))
++    {
+       return false;
+     }
++
++    // 数据时效：观测戳过老说明上游在重放积压旧数据（发布没停但数据是旧的），
++    // 上限与 rm_global_costmap 的 observation_timeout 对齐（默认 2.0s）。
+     const rclcpp::Time stamp(costmap->header.stamp, get_clock()->get_clock_type());
+     const double age = (now() - stamp).seconds();
+-    return std::isfinite(age) && age >= 0.0 && age <= std::max(0.0, local_costmap_timeout_);
++    return std::isfinite(age) && age >= 0.0 &&
++           age <= std::max(0.0, max_observation_age_sec_);
+   }
+ 
+   void requestReplan()
+@@ -1237,6 +1351,11 @@ private:
+   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+   double delay_comp_max_dt_;
+   double local_costmap_timeout_, replan_cooldown_;
++  // 观测戳允许的最大年龄（数据时效层），与链路活性门控分开配置。
++  double max_observation_age_sec_{2.0};
++  // 最近一次收到局部代价图的单调钟时刻（订阅回调写、control() 读）；
++  // 回调组互斥串行 + mtx_ 双保险，见既有共享成员注释。
++  std::chrono::steady_clock::time_point last_costmap_rx_time_{};
+   LocalPathSafetyPolicy safety_policy_;
+ 
+   // 关断式性能观测。control() 在定时器回调里跑（单一回调组），无需加锁；tick/stop
+@@ -1279,6 +1398,7 @@ private:
+   std::string localization_status_payload_;
+ 
+   mpc::MpcSolver solver_;
++  uint64_t last_inaccurate_solves_{0};
+   // 进度跟踪与失效检测只在控制线程里用，不需要加锁。
+   mpc::RouteTracker route_tracker_;
+   mpc::ProgressMonitor progress_monitor_;
+@@ -1297,7 +1417,6 @@ private:
+   // 三条失效路径（跟踪丢失/求解失败/安全否决）的连续否决时长。
+   double veto_streak_{0.0};
+   double veto_recovery_time_{1.5};
+-  double veto_before_recovery_{1.5};
+ 
+   double recovery_reverse_speed_{0.3};
+   double recovery_reverse_distance_{0.4};
+@@ -1318,6 +1437,9 @@ private:
+   double recovery_dwell_{0.0};
+   double recovery_elapsed_{0.0};
+   int recovery_attempts_{0};
++  // 本次脱困事件内是否已经走过 StuckReverse。用于 HazardRecovery 找不到
++  // 安全点时决定「回退试倒车」还是直接 FAILED。
++  bool reversed_this_event_{false};
+   double last_published_speed_{0.0};
+   std::optional<rclcpp::Time> last_control_time_;
+   // 预分配缓冲区，避免 30Hz 控制循环中重复分配。
+@@ -1342,6 +1464,7 @@ private:
+   std::string approach_enabled_topic_;
+   std::optional<rclcpp::Time> last_replan_request_;
+   rclcpp::TimerBase::SharedPtr timer_;
++  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_state_srv_;
+ };
+ 
+ }  // namespace navigation2
+diff --git a/src/navigation/navigation2/src/velocity_smoother_node.cpp b/src/navigation/navigation2/src/velocity_smoother_node.cpp
+index 425e034..5fbb077 100644
+--- a/src/navigation/navigation2/src/velocity_smoother_node.cpp
++++ b/src/navigation/navigation2/src/velocity_smoother_node.cpp
+@@ -1,5 +1,6 @@
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cmath>
+ #include <string>
+ #include <vector>
+@@ -53,7 +54,10 @@ public:
+     cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+       input_topic_, rclcpp::QoS(1),
+       [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
+-        last_cmd_time_ = now();
++        // steady clock 而不是 now()：超时判定不能依赖 ROS/sim 时钟。
++        // use_sim_time 下 /clock 起步为 0、可跳变回拨，会把「刚收到指令」
++        // 误判成「早已超时」而插发零速；单调钟不受影响。
++        last_cmd_time_ = std::chrono::steady_clock::now();
+         current_cmd_ = arrayToTwist(limitAxes(twistToArray(*msg)));
+         cmd_pub_->publish(current_cmd_);
+       },
+@@ -112,9 +116,9 @@ private:
+   void update()
+   {
+     // 超时就把指令归零。有新输入时已经在订阅回调里转发过，这里不改写时间剖面。
+-    const auto stamp = now();
+-    if (last_cmd_time_.nanoseconds() != 0 &&
+-      (stamp - last_cmd_time_).seconds() <= velocity_timeout_)
++    if (last_cmd_time_ != std::chrono::steady_clock::time_point{} &&
++      std::chrono::steady_clock::now() - last_cmd_time_ <=
++      std::chrono::duration<double>(velocity_timeout_))
+     {
+       return;
+     }
+@@ -131,7 +135,7 @@ private:
+   std::array<double, 3> deadband_velocity_{0.0, 0.0, 0.0};
+ 
+   geometry_msgs::msg::Twist current_cmd_;
+-  rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
++  std::chrono::steady_clock::time_point last_cmd_time_{};
+ 
+   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
+   rclcpp::CallbackGroup::SharedPtr cb_group_;
+diff --git a/src/serial/include/serial_driver_node.hpp b/src/serial/include/serial_driver_node.hpp
+index 1aae08c..48350df 100644
+--- a/src/serial/include/serial_driver_node.hpp
++++ b/src/serial/include/serial_driver_node.hpp
+@@ -92,6 +92,11 @@ private:
+   std::atomic<uint64_t> queued_packet_count_{0};
+   std::atomic<uint64_t> sent_packet_count_{0};
+   std::atomic<uint64_t> failed_send_count_{0};
++  // 连续写失败计数：区分「瞬时 EAGAIN 丢帧重试」与「持续故障阈值 reopen」，
++  // 见底盘下发路径的分级处理。仅单写线程访问。
++  std::atomic<int> write_fail_streak_{0};
++  bool allow_fallback_{true};
++  int write_fail_reopen_threshold_{20};
+   std::atomic<uint64_t> received_decision_count_{0};
+   std::atomic<int> last_write_size_{0};
+ 
+diff --git a/src/serial/include/serial_port.hpp b/src/serial/include/serial_port.hpp
+index 21cbfb8..788dc9e 100644
+--- a/src/serial/include/serial_port.hpp
++++ b/src/serial/include/serial_port.hpp
+@@ -1,3 +1,6 @@
++#pragma once
++// （补上的 include guard：此前整文件无 guard，二次包含直接编译错误。）
++
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+@@ -34,6 +37,10 @@ public:
+   StopBit stopbit = StopBit::ONE;
+   Parity parity = Parity::NONE;
+   std::string devname = "/dev/ttyACM0";
++  // 指定设备打不开时是否允许自动扫描 /dev/ttyACM{0..2} 兜底。默认保持
++  // 历史行为（true）；实车多插一个 CDC 设备时务必关掉——静默绑错串口
++  // 就是把指令发给空气甚至别的设备。
++  bool allow_fallback = true;
+ };
+ 
+ class Port {
+@@ -50,6 +57,9 @@ public:
+ 
+   int transmit(uint8_t *buff, int writeSize);
+   int receive(uint8_t *buffer);
++  // 最近一次 transmit/write 失败的 errno（成功时清零）。供调用方区分
++  // 「非阻塞满缓冲（EAGAIN，可下一帧重试）」和「真故障（需要 reopen）」。
++  int lastError() const { return last_errno_; }
+   int fd = -1;
+ 
+ private:
+@@ -57,6 +67,7 @@ private:
+   std::vector<std::string> device_names = {"/dev/ttyACM0", "/dev/ttyACM1",
+                                       "/dev/ttyACM2"};
+   int flags = 0;
++  int last_errno_ = 0;
+   bool isinit = false;
+   bool isopen = false;
+ };
+diff --git a/src/serial/src/serial_driver_node.cpp b/src/serial/src/serial_driver_node.cpp
+index d2fff28..f9692df 100644
+--- a/src/serial/src/serial_driver_node.cpp
++++ b/src/serial/src/serial_driver_node.cpp
+@@ -160,17 +160,37 @@ int SerialDriverNode::transmit()
+ 
+     if (bytes_written != static_cast<int>(packet_size)) {
+       failed_send_count_.fetch_add(1, std::memory_order_relaxed);
++      const int write_errno = port_->lastError();
+       RCLCPP_ERROR(
+         get_logger(),
+-        "Serial write failed. expected=%zu actual=%d device=%s vel_x=%.3f vel_y=%.3f vel_w=%.3f "
+-        "crc16=0x%04X raw=[%s]",
+-        packet_size, bytes_written, config_->devname.c_str(), packet.vel_x, packet.vel_y,
++        "Serial write failed. expected=%zu actual=%d errno=%d(%s) device=%s vel_x=%.3f vel_y=%.3f "
++        "vel_w=%.3f crc16=0x%04X raw=[%s]",
++        packet_size, bytes_written, write_errno, strerror(write_errno),
++        config_->devname.c_str(), packet.vel_x, packet.vel_y,
+         packet.vel_w, static_cast<unsigned int>(packet.crc16), packetToHex(packet).c_str());
+-      reopenPort("Write failure");
++
++      // 旧实现任何写失败一律 close→sleep(1s)→open：非阻塞 fd 的瞬时
++      // EAGAIN（内核发送缓冲满）也会触发全重连，把已排队指令抖掉、云台帧
++      // 节奏打断，代价远大于「本帧丢弃」。现在分级：
++      //   * fd 级致命错误（EBADF/ENODEV/EINVAL）→ 立即 reopen；
++      //   * EAGAIN/其他瞬时错 → 保留端口、丢本帧，连续失败达到阈值才
++      //     reopen 兜底；成功一帧即清零连击。
++      constexpr int kFatalWriteErrnos[] = {EBADF, ENODEV, EINVAL};
++      const bool fatal = std::find(std::begin(kFatalWriteErrnos),
++          std::end(kFatalWriteErrnos), write_errno) != std::end(kFatalWriteErrnos);
++      const int streak = write_fail_streak_.fetch_add(1, std::memory_order_relaxed) + 1;
++      if (fatal || streak >= write_fail_reopen_threshold_) {
++        reopenPort("Write failure");
++      } else {
++        RCLCPP_WARN_THROTTLE(
++          get_logger(), *this->get_clock(), 2000,
++          "Serial write degraded (streak=%d), keeping port open", streak);
++      }
+       return bytes_written;
+     }
+ 
+     sent_packet_count_.fetch_add(1, std::memory_order_relaxed);
++    write_fail_streak_.store(0, std::memory_order_relaxed);
+     // 日志移至 DEBUG 级别，降低 1kHz 循环 CPU 占用
+     RCLCPP_DEBUG(
+       get_logger(),
+@@ -559,6 +579,11 @@ void SerialDriverNode::getParam()
+     chassis_vel_x_scale_ = declare_parameter<double>("chassis_vel_x_scale", -1.0);
+     chassis_vel_y_scale_ = declare_parameter<double>("chassis_vel_y_scale", -1.0);
+     chassis_vel_w_scale_ = declare_parameter<double>("chassis_vel_w_scale", 1.0);
++    // 指定设备打不开时是否允许扫 ttyACM{0..2} 兜底。多 CDC 设备的实车请
++    // 显式设 false，避免静默绑错串口（串口层回退时也会大声告警）。
++    allow_fallback_ = declare_parameter<bool>("allow_device_fallback", true);
++    write_fail_reopen_threshold_ =
++      declare_parameter<int>("write_fail_reopen_threshold", 20);
+   } catch (const rclcpp::ParameterTypeException & ex) {
+     RCLCPP_ERROR(get_logger(), "Invalid serial parameter type: %s", ex.what());
+     throw;
+@@ -602,6 +627,7 @@ void SerialDriverNode::getParam()
+ 
+   config_ = std::make_shared<SerialConfig>(
+     baud_rate, 8, flowcontrol, stop_bits, parity, device_name_);
++  config_->allow_fallback = allow_fallback_;
+ }
+ 
+ }  // namespace serial_driver
+diff --git a/src/serial/src/serial_port.cpp b/src/serial/src/serial_port.cpp
+index 6fc9336..69d1f55 100644
+--- a/src/serial/src/serial_port.cpp
++++ b/src/serial/src/serial_port.cpp
+@@ -140,7 +140,10 @@ namespace serial_driver
+ 
+   int Port::openPort()
+   {
+-    auto try_open = [this](const std::string & device_name) {
++    const std::string requested_device = config->devname;
++    bool bound_fallback = false;
++
++    auto try_open = [this, &bound_fallback](const std::string & device_name) {
+         fd = open(device_name.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
+         if (fd < 0)
+         {
+@@ -156,23 +159,43 @@ namespace serial_driver
+           return false;
+         }
+ 
++        if (device_name != config->devname) {
++          bound_fallback = true;
++        }
+         config->devname = device_name;
+         return true;
+       };
+ 
+     if (!try_open(config->devname))
+     {
+-      for (auto device_name : device_names)
++      // 静默回退是「平时不报错、战时坑人」的典型：多插一个 CDC 设备就会
++      // 把指令发给错误的对象。现在每次回退都大声告警，并支持配置关闭。
++      if (config->allow_fallback)
+       {
+-        if (device_name == config->devname) {
+-          continue;
+-        }
+-        if (try_open(device_name)) {
+-          break;
++        std::cerr << "[FALLBACK] requested device " << requested_device
++                  << " unavailable; scanning ttyACM candidates. Set allow_fallback=false "
++                  << "to disable (recommended when multiple CDC devices are attached)."
++                  << std::endl;
++        for (auto device_name : device_names)
++        {
++          if (device_name == config->devname) {
++            continue;
++          }
++          if (try_open(device_name)) {
++            break;
++          }
+         }
+       }
+     }
+ 
++    if (bound_fallback)
++    {
++      std::cerr << "[FALLBACK] BOUND TO DIFFERENT DEVICE: requested=" << requested_device
++                << " actual=" << config->devname
++                << " — verify this is the MCU, not another USB-serial dongle!"
++                << std::endl;
++    }
++
+     if (fd < 0)
+     {
+       isopen = false;
+@@ -220,9 +243,12 @@ namespace serial_driver
+ 
+   int Port::transmit(uint8_t *buff, int writeSize)
+   {
++    last_errno_ = 0;
++    errno = 0;
+     int num = write(fd, buff, writeSize);
+     if (num < 0)
+     {
++      last_errno_ = errno;
+       std::cerr << "Serial write failed on " << config->devname
+                 << " error=" << strerror(errno) << std::endl;
+     }

@@ -1,6 +1,9 @@
 import os
 import yaml
 
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nav_common
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -198,60 +201,20 @@ def generate_launch_description():
     # 省掉 DDS 序列化 + 传输 + 反序列化。topic QoS 为 SensorDataQoS
     # （volatile + best_effort + keep_last(5)），满足 Humble intra-process 的
     # volatile 限制。
-    perception_container = ComposableNodeContainer(
-        name='perception_container',
-        namespace='',
-        respawn=True, respawn_delay=2.0,  # 容器崩溃自愈（两节点均可从参数重建）
-        package='cpp_lidar_filter',
-        # 固定线程数容器：不用 Humble 自带的 component_container_mt，后者线程数
-        # 恒为 hardware_concurrency()（本机 24）。默认 1 个 executor 线程；
-        # linefit 内部用 OpenMP 做分片，不必再给 executor 超订。
-        executable='perception_container_mt',
-        arguments=[perception_threads] + common_log_arguments,
+    # 感知栈三件套（容器/组件加载/崩溃重载）单一真源：nav_common.py。
+    # 两 launch 不再各自复制 55 行，行为差异只可能来自参数。
+    perception_stack = nav_common.build_perception_stack(
+        threads_arg=perception_threads,
+        log_args=common_log_arguments,
         output=node_output,
-        additional_env=system_libusb_env)
-
-    def perception_component(plugin, name, package, parameters):
-        return LoadComposableNodes(
-            target_container=perception_container,
-            composable_node_descriptions=[
-                ComposableNode(
-                    package=package,
-                    plugin=plugin,
-                    name=name,
-                    parameters=parameters,
-                    # Humble 的 component_container 默认不会给加载的组件打开
-                    # intra-process，必须逐个组件显式传入。
-                    extra_arguments=[{'use_intra_process_comms': True}],
-                )
-            ],
-        )
-
-    def make_perception_load_actions():
-        return [
-            perception_component(
-                'cpp_lidar_filter::LidarFilterNode',
-                'lidar_filter',
-                'cpp_lidar_filter',
-                [lidar_filter_params, {'use_sim_time': use_sim_time}]),
-            perception_component(
-                'linefit_ground_segmentation::SegmentationNode',
-                'ground_segmentation',
-                'linefit_ground_segmentation_ros',
-                [seg_params, seg_env_params, {'use_sim_time': use_sim_time}]),
-        ]
-
-    # 容器每次退出（崩溃被 respawn 或正常退出）都重新调度组件加载。Humble 的
-    # LoadComposableNodes 只执行一次，respawn 只会拉起空容器；与 navigation2
-    # 容器同一套补救逻辑：等 4s 让 rclpy 图缓存里的旧 load_node 服务过期。
-    def reload_perception_on_exit(event, context):
-        cmd = getattr(event, 'cmd', None)
-        if cmd and any('perception_container_mt' in str(part) for part in cmd):
-            return [TimerAction(period=4.0, actions=make_perception_load_actions())]
-        return None
-
-    reload_perception_components = RegisterEventHandler(
-        OnProcessExit(on_exit=reload_perception_on_exit))
+        additional_env=system_libusb_env,
+        use_sim_time=use_sim_time,
+        lidar_filter_params=lidar_filter_params,
+        seg_params=seg_params,
+        seg_env_params=seg_env_params)
+    perception_container = perception_stack['container']
+    make_perception_load_actions = perception_stack['make_load_actions']
+    reload_perception_components = perception_stack['reload_handler']
 
     # ===== 3.5 建图链：点云转激光 + slam_toolbox（仅 mode:=mapping）=====
     # 与 real.launch.py 同一套（说明也见那边）：去地面障碍点云转 2D 扫描，
@@ -341,12 +304,15 @@ def generate_launch_description():
     # ===== 7. 速度转换已并进 navigation2 容器（fake_vel_transform 组件）=====
 
     # ===== 8. 航点执行器（单一 waypoint_executor，默认 follow）=====
+    # respawn 与 real.launch.py 同步：executor 崩溃自愈，仿真/实车行为一致。
     waypoint_follow_executor = Node(
         condition=LaunchConfigurationEquals('mode', 'nav'),
         package='waypoint_editor',
         executable='waypoint_executor',
         name='waypoint_follow_executor',
         output=node_output,
+        respawn=True,
+        respawn_delay=2.0,
         parameters=[waypoint_executor_params, {
             'use_sim_time': use_sim_time,
             'waypoint_file': waypoint_file,

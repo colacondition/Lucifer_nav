@@ -80,7 +80,7 @@ struct DecisionPacket
   uint16_t crc16 = 0;
 } __attribute__((packed));
 
-template <typename T>
+template<typename T>
 inline T bufferToStruct(const uint8_t * buffer)
 {
   T result{};
@@ -88,7 +88,7 @@ inline T bufferToStruct(const uint8_t * buffer)
   return result;
 }
 
-template <typename T>
+template<typename T>
 inline void structToBuffer(const T & inputStruct, uint8_t * outputArray)
 {
   std::memcpy(outputArray, reinterpret_cast<const uint8_t *>(&inputStruct), sizeof(T));

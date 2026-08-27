@@ -72,6 +72,12 @@ public:
     void insert_imu(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel);
     EstimationFrame::ConstPtr insert_frame(const PreprocessedFrame::Ptr frame, std::vector<EstimationFrame::ConstPtr>& marginalized_frames);
     std::vector<EstimationFrame::ConstPtr> get_remaining_frames();
+    /// 最新一帧的 IMU 偏置（[gyro(3), acc(3)]）。尚无任何帧时返回 false。
+    /// 仅暴露读取；偏置所有权重仍在优化器。
+    bool latest_imu_bias(Eigen::Matrix<double, 6, 1>* out) const;
+
+    /// 最新一帧原始陀螺（body 系）。IMU 队列为空返回 false。
+    bool latest_angular_velocity(Eigen::Vector3d* out) const;
     EstimationFrame::ConstPtr get_target_ivox_frame();
 
 private:

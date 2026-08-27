@@ -416,3 +416,51 @@ TEST(WaypointExecutorClient, ResultCallbackHookNotifiesTerminalOutcome)
   EXPECT_EQ(notified->first, decision::TargetName::Patrol);
   EXPECT_FALSE(notified->second);
 }
+
+TEST(WaypointExecutorClient, TimeoutGuardDisabledByDefault)
+{
+  decision::DecisionConfig config;
+  ASSERT_DOUBLE_EQ(config.executor_result_timeout_sec, 0.0);
+  decision::WaypointExecutorClient client(config);
+
+  client.setRunningTarget(decision::TargetName::Patrol, decision::TargetMode::ExecutorFollow, 10.0);
+  // 超时关闭时，任意时钟前进都不得合成失败。
+  EXPECT_FALSE(client.checkGoalTimeout(1.0e6));
+  EXPECT_EQ(client.state().running_target, decision::TargetName::Patrol);
+}
+
+// goal 下发后长时间无任何动作事件（executor 崩溃重生的典型后果）：
+// 守卫在超过时限后合成 Aborted 并触发 result 回调，状态放行重发。
+TEST(WaypointExecutorClient, TimeoutGuardSynthesizesAbortAndAllowsRetry)
+{
+  decision::DecisionConfig config;
+  config.executor_result_timeout_sec = 5.0;
+  decision::WaypointExecutorClient client(config);
+
+  std::optional<std::pair<decision::TargetName, bool>> notified;
+  client.setResultCallback(
+    [&notified](decision::TargetName target, bool success) {
+      notified = std::make_pair(target, success);
+    });
+
+  // 用 setRunningTarget 直接入「已接受执行」态（绕开 action server 搭建，
+  // 该路径的收尾逻辑与真实 result 回调完全一致）。
+  client.setRunningTarget(decision::TargetName::Center, decision::TargetMode::ExecutorFollow, 100.0);
+  client.markGoalInFlightForTest(100.0);
+
+  EXPECT_FALSE(client.checkGoalTimeout(104.0));   // 未超时：不动状态。
+  EXPECT_TRUE(client.state().running_target.has_value());
+
+  EXPECT_TRUE(client.checkGoalTimeout(106.0));    // 超 grace：合成 abort。
+  EXPECT_FALSE(client.state().running_target.has_value());
+  EXPECT_EQ(client.state().result_status, decision::ExecutorResultStatus::Aborted);
+  ASSERT_TRUE(notified.has_value());
+  EXPECT_EQ(notified->first, decision::TargetName::Center);
+  EXPECT_FALSE(notified->second);
+
+  // 合成终态后 shouldRequestTarget 对同目标重新放行（这正是修复点）。
+  EXPECT_TRUE(
+    client.shouldRequestTarget(
+      decision::TargetName::Center, decision::TargetMode::ExecutorFollow,
+      std::nullopt, std::nullopt, 106.0));
+}

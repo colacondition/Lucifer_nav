@@ -119,6 +119,47 @@ bool WaypointExecutorClient::needMaintainReissue(
   return true;
 }
 
+bool WaypointExecutorClient::checkGoalTimeout(double now_sec)
+{
+  if (config_.executor_result_timeout_sec <= 0.0) {
+    return false;
+  }
+  if (!goal_in_flight_) {
+    return false;
+  }
+  const double elapsed = now_sec - last_goal_progress_sec_;
+  if (elapsed < config_.executor_result_timeout_sec) {
+    return false;
+  }
+
+  RCLCPP_WARN(
+    rclcpp::get_logger("decision"),
+    "FollowWaypoints goal produced no event for %.1fs (timeout %.1fs); "
+    "synthesizing abort so the target can be re-requested",
+    elapsed, config_.executor_result_timeout_sec);
+
+  // 收尾在途状态。此后 shouldRequestTarget 对同目标重新放行：
+  // running 已清（或 status 已非 Succeeded），retry_interval 的防抖
+  // 由 stepExecutorTarget 自带的 last_send_time 判断兜住节奏。
+  goal_in_flight_ = false;
+  active_goal_handle_.reset();
+
+  if (state_.running_target.has_value() && state_.running_mode.has_value()) {
+    const auto target = *state_.running_target;
+    const auto mode = *state_.running_mode;
+    applyExecutorResult(target, mode, /*success=*/false, now_sec);
+    if (result_callback_) {
+      result_callback_(target, false);
+    }
+  } else {
+    // 还没走到 goal_response：running 未设，把挂起态标记为失败即可。
+    if (state_.result_status == ExecutorResultStatus::None) {
+      state_.result_status = ExecutorResultStatus::Aborted;
+    }
+  }
+  return true;
+}
+
 bool WaypointExecutorClient::shouldRequestTarget(
   TargetName target,
   TargetMode mode,
@@ -200,6 +241,7 @@ bool WaypointExecutorClient::stepExecutorTarget(
   state_.last_send_time_sec = now_sec;
   state_.active_target = target;
   state_.result_status = ExecutorResultStatus::None;
+  last_goal_progress_sec_ = now_sec;
 
   auto goal = FollowWaypoints::Goal();
   goal.waypoints = path_msg;
@@ -218,6 +260,8 @@ bool WaypointExecutorClient::stepExecutorTarget(
       }
       active_goal_handle_ = goal_handle;
       setRunningTarget(target, mode, now_sec);
+      // goal 被接受也算一次进展：重置超时基准。
+      last_goal_progress_sec_ = now_sec;
       } catch (const std::exception & ex) {
         RCLCPP_ERROR(
           rclcpp::get_logger("decision"), "goal_response_callback threw: %s", ex.what());
@@ -236,6 +280,9 @@ bool WaypointExecutorClient::stepExecutorTarget(
       }
       goal_in_flight_ = false;
       active_goal_handle_.reset();
+      // 终态结果是最强的「有进展」信号。
+      last_goal_progress_sec_ =
+        rclcpp::Clock(RCL_SYSTEM_TIME).now().seconds();
       const bool success = wrapped.code == rclcpp_action::ResultCode::SUCCEEDED &&
         wrapped.result && wrapped.result->success;
       // 只把「确实应用到当前目标」的结果喂给状态机：被抢占的旧目标晚到的

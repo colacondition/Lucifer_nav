@@ -170,6 +170,9 @@ TunnelRegionGrid TunnelRegionGrid::build(const SemanticMap & map, double margin_
   std::vector<float> best_sq(cells, std::numeric_limits<float>::infinity());
   bool any = false;
 
+  // 走廊轴的原料：每条隧道的本体格世界坐标集合。
+  std::vector<std::vector<Eigen::Vector2d>> body_points(map.tunnels().size());
+
   for (int sy = 0; sy < height; ++sy) {
     for (int sx = 0; sx < width; ++sx) {
       if (!map.isTunnelBodyCell(sx, sy)) {
@@ -183,6 +186,7 @@ TunnelRegionGrid TunnelRegionGrid::build(const SemanticMap & map, double margin_
       // tunnelSpecAtCell 返回的指针指向 map.tunnels() 内部，可直接还原下标。
       const std::uint8_t id = static_cast<std::uint8_t>(
         (spec - map.tunnels().data()) + 1);
+      body_points[id - 1].push_back(geometry.cellCenter(sx, sy));
 
       const int y0 = std::max(0, sy - span);
       const int y1 = std::min(height - 1, sy + span);
@@ -210,10 +214,99 @@ TunnelRegionGrid TunnelRegionGrid::build(const SemanticMap & map, double margin_
   if (!any) {
     return result;
   }
+
+  // —— 走廊轴（PCA）：每条隧道一条。退化（单格 / 共线秩亏）时退回方向场或
+  // +x，保证 axes_ 恒有可用方向；half_len=0 表示轴不可信，查询端会保守地
+  // 维持旧的一刀切行为而不是放大盲区。
+  result.axes_.resize(map.tunnels().size());
+  for (std::size_t k = 0; k < map.tunnels().size(); ++k) {
+    const auto & pts = body_points[k];
+    if (pts.empty()) {
+      continue;
+    }
+    CorridorAxis axis;
+    axis.spec_id = static_cast<std::uint8_t>(k + 1);
+    for (const auto & p : pts) {
+      axis.centroid += p;
+    }
+    axis.centroid /= static_cast<double>(pts.size());
+
+    double cxx = 0.0;
+    double cxy = 0.0, cyy = 0.0;
+    for (const auto & p : pts) {
+      const double dx = p.x() - axis.centroid.x();
+      const double dy = p.y() - axis.centroid.y();
+      cxx += dx * dx; cxy += dx * dy; cyy += dy * dy;
+    }
+    // 主特征向量：解析解。cxy≈0 说明轴向已与坐标轴对齐。
+    Eigen::Vector2d dir(1.0, 0.0);
+    if (std::abs(cxy) > 1e-12) {
+      const double lambda = 0.5 * ((cxx + cyy) +
+        std::sqrt((cxx - cyy) * (cxx - cyy) + 4.0 * cxy * cxy));
+      dir = Eigen::Vector2d(lambda - cyy, cxy);
+    } else if (cxx >= cyy) {
+      dir = Eigen::Vector2d(1.0, 0.0);
+    } else {
+      dir = Eigen::Vector2d(0.0, 1.0);
+    }
+    const double norm = dir.norm();
+    if (norm < 1e-9) {
+      const Eigen::Vector2d field_dir =
+        map.directionAtCell(
+          static_cast<int>(axis.centroid.x() / geometry.resolution + geometry.origin.x()),
+          static_cast<int>(axis.centroid.y() / geometry.resolution + geometry.origin.y()));
+      dir = field_dir.norm() > 1e-6 ? field_dir : Eigen::Vector2d(1.0, 0.0);
+    } else {
+      dir /= norm;
+    }
+
+    double half_len = 0.0;
+    for (const auto & p : pts) {
+      half_len = std::max(half_len,
+        std::abs((p - axis.centroid).dot(dir)));
+    }
+    axis.dir = dir;
+    axis.half_len = half_len + geometry.resolution * 0.5;  // 含半格半径
+    result.axes_[k] = axis;
+  }
+
+  result.margin_m_ = std::max(0.0, margin_m);
   result.geometry_ = geometry;
   result.spec_index_ = std::move(spec_index);
   result.tunnels_ = map.tunnels();
   return result;
+}
+
+bool TunnelRegionGrid::pointOutsideCorridor(
+  const double world_x, const double world_y) const noexcept
+{
+  if (axes_.empty()) {
+    return false;  // 轴不可用：保守地维持旧一刀切语义，不扩大盲区也不缩小保护。
+  }
+  const auto cell = geometry_.containingCell(Eigen::Vector2d(world_x, world_y));
+  if (!cell) {
+    return false;
+  }
+  const std::uint8_t id = spec_index_[geometry_.index(cell->x(), cell->y())];
+  if (id == 0 || static_cast<std::size_t>(id - 1) >= tunnels_.size()) {
+    return false;
+  }
+  const CorridorAxis & axis = axes_[id - 1];
+  if (axis.half_len <= 0.0) {
+    return false;  // 单格退化：无法可靠定向，保守处理。
+  }
+
+  const Eigen::Vector2d delta(world_x - axis.centroid.x(),
+                              world_y - axis.centroid.y());
+  const double along = std::abs(delta.dot(axis.dir));
+  // 垂直分量用叉积模长，对方向 ±u 不敏感。
+  const double lateral = std::abs(delta.x() * axis.dir.y() - delta.y() * axis.dir.x());
+
+  const TunnelSpec & spec = tunnels_[id - 1];
+  const double half_width = spec.clear_width * 0.5 + margin_m_;
+  const double reach = axis.half_len + spec.run_up;
+
+  return (along > reach) || (lateral > half_width);
 }
 
 const TunnelSpec * TunnelRegionGrid::specNearPoint(

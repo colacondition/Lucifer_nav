@@ -20,8 +20,13 @@ void CloudCovarianceEstimation::estimate(
 
     const size_t k = neighbors.size() / points.size();
     if (k * points.size() != neighbors.size()) {
+        // 不变量破坏时不再 std::exit：组件容器里 exit 会跳过一切析构，
+        // 连带丢掉其他节点（包括未落盘的建图）。退化成本次调用产出空结果：
+        // 节点存活、日志留证，与上方 points.empty() 的早退风格一致。
         logger::fatal("cloud_cov_estimation", "k * points.size() != neighbors.size()");
-        std::exit(EXIT_FAILURE);
+        normals.clear();
+        covs.clear();
+        return;
     }
 
     estimate(points, neighbors, k, normals, covs);
@@ -73,8 +78,9 @@ std::vector<Eigen::Matrix4d> CloudCovarianceEstimation::estimate(
 
     const size_t k = neighbors.size() / points.size();
     if (k * points.size() != neighbors.size()) {
+        // 同上：不杀容器，返回空协方差让调用方走无协方差分支。
         logger::fatal("cloud_cov_estimation", "k * points.size() != neighbors.size()");
-        std::exit(EXIT_FAILURE);
+        return std::vector<Eigen::Matrix4d>();
     }
 
     return estimate(points, neighbors, k);

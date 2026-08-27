@@ -31,6 +31,11 @@ public:
     * @param angular_vel   Angular velocity
     */
     void insert_imu(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel);
+    /// 最新一帧原始陀螺（body 系）。内部 IMU 队列为空时返回 false。
+    /// 线程安全性同 insert_imu（经内部队列锁/单写者纪律）。
+    bool latest_angular_velocity(Eigen::Vector3d* out) const;
+    /// 最新一帧估计出的 IMU 偏置 [gyro(3), acc(3)]。尚无帧时返回 false。
+    bool latest_imu_bias(Eigen::Matrix<double, 6, 1>* out) const;
 
     /**
     * @brief Insert a preprocessed point cloud into odometry estimation

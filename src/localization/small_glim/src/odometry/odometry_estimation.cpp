@@ -19,6 +19,8 @@
 #include <small_glim/preprocess/cloud_deskewing.hpp>
 #include <small_glim/preprocess/cloud_covariance_estimation.hpp>
 
+#include <stdexcept>
+
 namespace small_glim {
 
 using gtsam::symbol_shorthand::B; // IMU bias
@@ -33,8 +35,10 @@ OdometryEstimationCPUParams::OdometryEstimationCPUParams(const Config::Ptr confi
     if (bias.size() == 6) {
         imu_bias = Eigen::Map<const Eigen::Matrix<double, 6, 1>>(bias.data());
     } else {
+        // 构造期配置错误：抛异常让组件加载路径干净失败（容器存活，本组件
+        // 不加载），不再 exit 全容器。
         logger::fatal("odometry_estimation", "sensors.imu_bias need 6 parameters");
-        std::exit(EXIT_FAILURE);
+        throw std::invalid_argument("odometry_estimation: sensors.imu_bias must have exactly 6 elements");
     }
 
     // odometry config
@@ -516,6 +520,20 @@ EstimationFrame::ConstPtr OdometryEstimationCPU::insert_frame(
     }
 
     return frames[current];
+}
+
+bool OdometryEstimationCPU::latest_imu_bias(Eigen::Matrix<double, 6, 1>* out) const {
+    if (!out || frames.empty()) return false;
+    *out = frames.back()->imu_bias;
+    return true;
+}
+
+bool OdometryEstimationCPU::latest_angular_velocity(Eigen::Vector3d* out) const {
+    if (!out || !imu_integration) return false;
+    Eigen::Vector3d w;
+    if (!imu_integration->latest_angular_velocity(w)) return false;
+    *out = w;
+    return true;
 }
 
 std::vector<EstimationFrame::ConstPtr> OdometryEstimationCPU::get_remaining_frames() {

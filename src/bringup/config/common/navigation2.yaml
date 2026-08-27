@@ -31,7 +31,9 @@ rm_global_planner:
     map_topic: /global_costmap/costmap
     goal_topic: /goal_pose
     path_topic: /plan_raw
-    planning_frequency: 5.0
+    # 8Hz：实测整机 24 核 busy<8%，A* 单次 <5ms —— 用空闲核把「状态变了到
+    # 路径更新」的等待从最坏 200ms 压到 125ms。失败冷却不受影响。
+    planning_frequency: 8.0
     allow_unknown: true
     unknown_cost: 1.4
     obstacle_threshold: 100
@@ -164,7 +166,7 @@ rm_minco_path_smoother:
     # L-BFGS 预算：旧 history=256、单阶段上限4000在两阶段下内存/最坏耗时过大。
     # 现在 objective 矩阵按路标数预分配并跨 line-search 复用；history=32，第一阶段
     # 上限800、第二阶段300。性能监控可记录实际耗时，必要时再收紧。
-    lbfgs.memory_size: 32
+    lbfgs.memory_size: 48   # 空闲核换更深的二阶记忆：难弯道收敛更快
     first_stage.max_iterations: 800
     # 受限两阶段 MINCO：第一阶段给几何形状；若固定采样发现速度/加速度违反阈值，
     # 只增加相应段时间并以较小迭代预算重跑。第二阶段障碍soft梯度只保留轨迹法向，
@@ -332,10 +334,19 @@ rm_mpc_controller:
     local_safety.obstacle_threshold: 90
     local_safety.unknown_is_obstacle: true
     local_safety.costmap_timeout: 0.5
-    # Check 1.0 s ahead; the 5 m rolling map cannot contain the full 3.0 s horizon at max speed.
+    # 「多久没收到新图」判链路活性（steady clock，与 header.stamp 无关）。
+    # 局部图 header.stamp 是观测（点云）时间戳，10Hz 分割链端到端延迟实测
+    # 1~2s，数据时效改由下面 max_observation_age_sec 单独约束——两者分开
+    # 后，正常延迟不再被误判成「图旧」而拖进恢复链。
+    local_safety.max_observation_age_sec: 2.0
+    # 检查预测序列的前 check_steps 个端点（点数而非秒数）：端点间距 =
+    # predict_dt × 名义速度。改 predict_dt 时这条注释不再隐含换算耦合。
     local_safety.check_steps: 10
     local_safety.replan_topic: /navigation2/replan_request
     local_safety.replan_cooldown: 0.5
+    # 大横向偏差的软重规划阈值（m）：比硬 noProgress 阈值更早触发请求，
+    # 只影响请求节拍（仍受 replan_cooldown 限流），不进恢复链。
+    local_safety.soft_replan_track_error: 0.35
     # 隧道限速窗口。洞内的参考速度按 TunnelSpec 的 [velocity_min, velocity_max] 夹：
     # 洞里净空低、余量小，全速冲进去既危险、参考又不可跟踪。窗口在速度剖面的曲率限速
     # 之后、前/后向扫描之前施加，所以「洞口减到 vmax」会沿弧长向洞外铺成一段减速斜坡，

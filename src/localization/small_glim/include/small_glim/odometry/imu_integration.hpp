@@ -115,6 +115,19 @@ public:
     size_t imu_queue_size() const;
 
     /**
+     * @brief 最新一帧去偏置前的角速度（body 系）。队列为空时返回 false。
+     *
+     * 供 odom twist.angular 输出：此前恒为零，下游任何想用角速度的模块
+     * 拿到的是假数据。偏置在调用方结合 state 时再扣（此处给原始读数，
+     * 保持该类对 bias 的唯一所有权不破）。
+     */
+    bool latest_angular_velocity(Eigen::Vector3d& out) const {
+        if (imu_queue.empty()) return false;
+        out = imu_queue.back().segment<3>(4);
+        return true;
+    }
+
+    /**
     * @brief Suppress per-tick gap warnings.
     * @param suppress  true to silence "invalid dt" warnings
     *

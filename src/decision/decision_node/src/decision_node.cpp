@@ -137,6 +137,11 @@ private:
   void onTimer()
   {
     const double now_sec = nowSec();
+    // 超时守卫先于状态机取事件：合成 Aborted 触发的 result 回调产生的
+    // executor_event 要在本拍就被 exchange 进 inputs，不能等一拍。
+    if (waypoint_executor_ && waypoint_executor_->checkGoalTimeout(now_sec)) {
+      RCLCPP_INFO(get_logger(), "Executor goal timeout guard fired; target will be re-requested");
+    }
     decision::DecisionInputs inputs;
     inputs.game_active = gameActive();
     inputs.current_hp = context_.effectiveCurrentHp();

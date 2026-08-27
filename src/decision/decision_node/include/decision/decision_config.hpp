@@ -98,6 +98,11 @@ struct DecisionConfig
 {
   double loop_hz{10.0};
   double retry_interval_sec{1.0};
+  // 目标下发后在此时限内收不到任何动作事件（goal 接受 / 结果返回）时，
+  // 合成一次 Aborted 终态并放行重发——兜住 executor 崩溃重生后旧 action
+  // 永不回结果、decision 永不重发的静默挂死。0 = 关闭（时限必须大于
+  // 最长合法航点段的执行时间，按赛场实测给值；见 bringup decision.yaml）。
+  double executor_result_timeout_sec{0.0};
   std::string goal_frame_id{"map"};
   TopicConfig topics;
   IntegrityGateConfig integrity_gate;

@@ -13,13 +13,8 @@ find_package(nav_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/FollowWaypoints.action"
-  "msg/AllRobotHP.msg"
-  "msg/DecisionNum.msg"
-  "msg/FriendLocation.msg"
   "msg/RobotStatus.msg"
   "msg/GameStatus.msg"
-  "msg/RFID.msg"
-  "msg/RobotControl.msg"
   "msg/TunnelSpec.msg"
   "msg/SemanticMap.msg"
   "msg/GimbalPosture.msg"

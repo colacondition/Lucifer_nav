@@ -160,6 +160,12 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_distance_transform ${PROJECT_NAME})
 
+  # EDT 膨胀与旧卷积实现的逐字节等价性护栏（见 grid_utils.cpp 的论证注释）。
+  ament_add_gtest(test_edt_inflation
+    test/test_edt_inflation.cpp
+  )
+  target_link_libraries(test_edt_inflation ${PROJECT_NAME})
+
   ament_add_gtest(test_mpc_solver
     test/test_mpc_solver.cpp
   )

@@ -21,6 +21,7 @@ cd "$(dirname "$0")"
 # 编译列表。新增包时记得同步，否则 --list / 全量编译的覆盖检查会警告。
 PACKAGES=(
   "decision_interfaces"
+  "sentry_waypoints"
   "mid360_driver"
   "small_glim"
   "fast_location"
@@ -105,6 +106,21 @@ echo "ROS 发行版: $ROS_DISTRO"
 echo "编译模式: 包间顺序、包内并行 -j${NPROC} -l${NPROC}、低优先级"
 echo "待编译: ${#BUILD_LIST[@]} 个包: ${BUILD_LIST[*]}"
 echo ""
+
+# ABI 哨兵：-march=native 口径的一致性是环境记忆而非编译期约束，
+# 每次构建前跑一次断言（CHECK_ABI_FLAGS=0 可显式跳过）。
+if [ "${CHECK_ABI_FLAGS:-1}" = "1" ]; then
+  bash "$PWD/src/bringup/tools/check_abi_flags.sh" || {
+    echo "ABI 旗标断言失败：先解决 march=native 一致性再构建。"
+    exit 1
+  }
+fi
+
+# 参数契约静态校验（与编译无关的 config 关系漂移）。
+python3 "$PWD/src/bringup/tools/check_nav_contract.py" "$PWD" || {
+  echo "导航参数契约校验失败：见上方 [FAIL] 行。"
+  exit 1
+}
 
 # set -e 下失败会直接退出；colcon 的摘要里会标出失败包名。
 nice -n 10 ionice -c3 colcon build --symlink-install \

@@ -10,6 +10,7 @@
 //
 // 膨胀由 rm_map_server 离线做一次，这里只做反序列化 + 查询，不重算。
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -93,12 +94,34 @@ public:
   // 否则返回 nullptr。多条隧道的边距重叠时取距离最近的那条。
   const TunnelSpec * specNearPoint(double world_x, double world_y) const noexcept;
 
+  // 点是否落在该点所属隧道的「保护走廊」内。
+  //
+  // 走廊 = 轴线段沿方向 ±(half_len + run_up)、横向 ±(clear_width/2 + margin) 的
+  // 矩形。几何推导：build() 时按 tunnel id 收集本体格做主成分 (PCA) 取轴向与
+  // 端点极值。影响区内的点若在走廊外，则不再享受一刀切放行 —— 这正是
+  // 「洞内真实障碍可见化」的开口：敌方实体停在走廊侧带或洞口环带上时会被
+  // 正常多帧确认为障碍；走廊内部仍维持先验放行（顶板投影与两侧壁基 clutter
+  // 不能封死通道）。判据依旧与高度无关。
+  bool pointOutsideCorridor(double world_x, double world_y) const noexcept;
+
 private:
+  struct CorridorAxis
+  {
+    Eigen::Vector2d centroid{0.0, 0.0};   // 本体格质心（世界系）
+    Eigen::Vector2d dir{1.0, 0.0};        // 单位主方向
+    double half_len{0.0};                 // 质心到两端的本体长度的一半
+    std::uint8_t spec_id{0};
+  };
+
   GridGeometry geometry_;
   // 每格所属隧道的 id + 1（0 = 不在任何影响区内）。
   std::vector<std::uint8_t> spec_index_;
   // 自持一份 TunnelSpec 拷贝，查询结果的生命周期跟随本对象而不是构建时的那张图。
   std::vector<TunnelSpec> tunnels_;
+  // 每条隧道一条 PCA 轴（index = spec_id - 1）。id 无本体格时为空向量。
+  std::vector<CorridorAxis> axes_;
+  // 构建时的边距（m）：走廊横向半宽 = clear_width/2 + margin_m_。
+  double margin_m_{0.0};
 };
 
 // 带影响区的版本：区内（本体 + 边距）的格子吃 clearance 上限，让洞口不再被两侧

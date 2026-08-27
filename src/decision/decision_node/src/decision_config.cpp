@@ -21,6 +21,7 @@ void declareDecisionParameters(rclcpp::Node & node)
 
   declareParameter(node, "loop_hz", defaults.loop_hz);
   declareParameter(node, "retry_interval_sec", defaults.retry_interval_sec);
+  declareParameter(node, "executor_result_timeout_sec", defaults.executor_result_timeout_sec);
   declareParameter(node, "goal_frame_id", defaults.goal_frame_id);
 
   declareParameter(node, "topics.robot_status", defaults.topics.robot_status);
@@ -79,6 +80,7 @@ DecisionConfig loadDecisionConfig(rclcpp::Node & node)
 
   node.get_parameter("loop_hz", config.loop_hz);
   node.get_parameter("retry_interval_sec", config.retry_interval_sec);
+  node.get_parameter("executor_result_timeout_sec", config.executor_result_timeout_sec);
   node.get_parameter("goal_frame_id", config.goal_frame_id);
 
   node.get_parameter("topics.robot_status", config.topics.robot_status);
@@ -135,6 +137,8 @@ void validateDecisionConfig(DecisionConfig & config)
 {
   config.loop_hz = std::max(config.loop_hz, 0.1);
   config.retry_interval_sec = std::max(config.retry_interval_sec, 0.1);
+  // 负值视为关闭：比抛配置错误更宽容，语义也明确。
+  config.executor_result_timeout_sec = std::max(config.executor_result_timeout_sec, 0.0);
   config.waypoint.switch_distance = std::max(config.waypoint.switch_distance, 0.05);
   config.waypoint.final_goal_tolerance = std::max(config.waypoint.final_goal_tolerance, 0.05);
   config.maintain_goal.xy_tolerance = std::max(config.maintain_goal.xy_tolerance, 0.05);
