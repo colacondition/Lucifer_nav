@@ -127,10 +127,10 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     enable_global_search_ = this->get_parameter("enable_global_search").as_bool();
     global_search_max_map_odom_jump_ = static_cast<float>(std::max(
         0.0, this->get_parameter("global_search_max_map_odom_jump").as_double()));
-    // LOST 渐进放宽：绑架/搬场后 1m 门永远卡住召回，连 /initialpose 远端
-    // 种子都会被 far_prior 吃掉。默认关闭；开启后在持续 LOST 超过 grace
-    // 后按倍数逐级放宽到 max。max 默认 8m 仍低于对称场地「对面角 ~11m」，
-    // 不破坏原有防错锁设计意图。
+    // LOST 渐进放宽：现场无人干预下的唯一自动逃生口。1m 基础门覆盖正常
+    // 降级（推算漂移 < 门限即可自愈）；连续 LOST 超 grace 后按倍数逐级放宽
+    // 到 max —— 应对 LIO 失效级漂移，避免「正确候选被永久拒绝而整车趴窝」。
+    // max 保持在对称角跳变之下，错锁风险仍被压制。
     lost_escape_enable_ = this->declare_parameter<bool>("lost_escape.enable", false);
     lost_escape_grace_sec_ = std::max(
         1.0, this->declare_parameter<double>("lost_escape.grace_sec", 20.0));
