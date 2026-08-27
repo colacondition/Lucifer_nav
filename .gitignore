@@ -29,3 +29,12 @@ __pycache__/
 # ROS
 *.bag
 *.db3
+
+# 会话/工具产物（2026-08 大清理时补）
+.ros_home/
+.run_logs/
+.run_metrics/
+.run_tools/
+.tmp_ocr/
+.image_review/
+.pytest_cache/
