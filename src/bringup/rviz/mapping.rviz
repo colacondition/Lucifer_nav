@@ -188,6 +188,31 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+    # slam_toolbox 的占据栅格。注意它只在机器人累计移动 >=0.5m 或旋转 >=29°
+    # （mapper.yaml 的 minimum_travel_distance/heading）后才把扫描加进图，
+    # 雷达静止不动时 /map 是空的，不是没建图。QoS 与 slam_toolbox 的
+    # latched 发布一致（Reliable + Transient Local）。
+    - Alpha: 0.7
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: true
+      Enabled: true
+      Name: slam_map
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map
+      Update Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map_updates
+      Use Timestamp: false
+      Value: true
     # 感知链自检：地面分割在建图模式下也无条件启动，这两个 display 用来确认
     # sensor_height / max_start_height 调对了 —— 高台应该出现在 obstacle（红）
     # 里而不是 ground（绿）里。同样是 SensorDataQoS(Best Effort)，且节点在没有

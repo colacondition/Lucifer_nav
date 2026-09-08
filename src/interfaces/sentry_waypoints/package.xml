@@ -10,4 +10,11 @@
   </description>
   <maintainer email="cola@example.com">cola</maintainer>
   <license>MIT</license>
+
+  <!-- 缺这个 tag 时 colcon 会把包误判成 catkin：装出来的 install 目录没有
+       ament_prefix_path hook，AMENT_PREFIX_PATH 认领不了它，ros2 launch 报
+       "package 'sentry_waypoints' not found"（2026-09-07 实锤修复）。 -->
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
 </package>

@@ -6,7 +6,8 @@
     imu_topic: /livox/imu
     imu_frame: livox_frame
     lidar_publish_time_interval: 0.1  # 10 Hz，对齐旧驱动 publish_freq
-    host_ip: 192.168.10.50            # 取自旧 MID360_config.json 的 host_net_info
+    host_ip: 192.168.1.50             # 工控机网卡 IP（enp7s0）。雷达出厂默认推流到
+                                      # 192.168.1.50:56301/56401（Mid-360s，IP 192.168.1.101）
     is_topic_name_with_lidar_ip: false
     validate_crc: true
     max_packet_time_jump: 0.5

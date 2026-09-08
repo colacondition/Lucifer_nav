@@ -12,6 +12,7 @@
 #include <utility>
 #include <asio.hpp>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <unordered_map>
@@ -59,12 +60,15 @@ namespace mid360_driver {
         std::unordered_map<asio::ip::address, double, IpAddressHasher> delta_time_map;
         std::unordered_map<asio::ip::address, double, IpAddressHasher> last_lidar_timestamp_map;
         std::unordered_map<asio::ip::address, double, IpAddressHasher> last_imu_timestamp_map;
-        // 连续被判 implausible 的包数（按流、按源地址计）。旧实现里参考时间戳
-        // 只在收包成功时更新，一旦某包 diff 越界，参考值就永久冻结在旧时刻：
-        // 雷达 PTP 重同步 / NTP 步进 / 雷达重启换基准后，后续每个包都越界，
-        // 点云+IMU 无声全灭直到进程重启。现在坏包连击到阈值后把锚重置到当前包。
-        std::unordered_map<asio::ip::address, std::uint64_t, IpAddressHasher> lidar_implausible_streaks;
-        std::unordered_map<asio::ip::address, std::uint64_t, IpAddressHasher> imu_implausible_streaks;
+        // 连续被判 implausible 的起始时刻（按流、按源地址计，空表 = 无待重锚）。
+        // 旧实现里参考时间戳只在收包成功时更新，一旦某包 diff 越界，参考值就
+        // 永久冻结在旧时刻：雷达 PTP 重同步 / NTP 步进 / 雷达重启换基准后，
+        // 后续每个包都越界，点云+IMU 无声全灭直到进程重启。现在坏包连续持续
+        // 满时长阈值（kReanchorAfter）后把锚重置到当前包。用墙钟时长而不是
+        // 包数——Mid-360s 的 IMU 输出率可配成 50~500Hz、ESC 慢速模式会降低
+        // 点云包率，包数阈值会随速率配置变形。
+        std::unordered_map<asio::ip::address, std::chrono::steady_clock::time_point, IpAddressHasher> lidar_implausible_since;
+        std::unordered_map<asio::ip::address, std::chrono::steady_clock::time_point, IpAddressHasher> imu_implausible_since;
         std::function<void(const asio::ip::address &lidar_ip, const std::vector<Point> &points)> on_receive_pointcloud;
         std::function<void(const asio::ip::address &lidar_ip, const ImuMsg &imu_msg)> on_receive_imu;
 

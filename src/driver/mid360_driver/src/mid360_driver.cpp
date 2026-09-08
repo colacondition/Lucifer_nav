@@ -135,42 +135,57 @@ namespace mid360_driver {
         }
     }
 
-    // 重锚阈值：连续坏包达到该数即认为参考锚本身失效（雷达/主机时钟跳变、
-    // 重启换基准），把锚拨到当前包重新起步。取 ~2.5s 的包数——比任何一次
-    // 正常时钟扰动短，又足够长到不会把单帧毛刺当成新基准。
-    constexpr std::uint64_t kLidarReanchorAfterPackets = 25;  // 10Hz 帧 ≈ 2.5s
-    constexpr std::uint64_t kImuReanchorAfterPackets = 500;   // 200Hz 采样 ≈ 2.5s
+    // 重锚窗口：坏包连续持续该时长（墙钟）即认为参考锚本身失效（雷达/主机时钟
+    // 跳变、重启换基准），把锚拨到当前包重新起步。取 ~2.5s——比任何一次正常
+    // 时钟扰动短，又足够长到不会把单帧毛刺当成新基准。用时长而不是包数：
+    // Mid-360s 支持把 IMU 输出率配成 50~500Hz、ESC 慢速模式还会降低点云包率
+    // （控制面 0x0021/0x002B 指令，默认值与 Mid-360 相同），包数阈值会随速率
+    // 配置悄悄变形，时长阈值对任何速率都保持同一语义。
+    constexpr std::chrono::duration<double> kReanchorAfter{2.5};
 
-    bool is_timestamp_plausible(
-        std::unordered_map<asio::ip::address, double, IpAddressHasher> &last_timestamp_map,
-        std::unordered_map<asio::ip::address, std::uint64_t, IpAddressHasher> &implausible_streaks,
-        const asio::ip::address &address,
-        const double timestamp,
-        const double max_time_jump,
-        const std::uint64_t reanchor_after) {
+    enum class PlausibilityResult : std::uint8_t {
+        kAccept,    // 正常接受
+        kReanchor,  // 坏包连续持续满窗口，强制重锚后接受（调用方需同步刷新 NO_SYNC 墙钟锚）
+        kReject     // 丢弃
+    };
+
+    PlausibilityResult is_timestamp_plausible(
+            std::unordered_map<asio::ip::address, double, IpAddressHasher> &last_timestamp_map,
+            std::unordered_map<asio::ip::address, std::chrono::steady_clock::time_point, IpAddressHasher> &implausible_since_map,
+            const asio::ip::address &address,
+            const double timestamp,
+            const double max_time_jump,
+            const std::chrono::duration<double> reanchor_after) {
         if (!std::isfinite(timestamp) || timestamp <= 0.0) {
-            return false;
+            return PlausibilityResult::kReject;
         }
 
         auto [iter, inserted] = last_timestamp_map.try_emplace(address, timestamp);
         if (inserted) {
-            return true;
+            return PlausibilityResult::kAccept;
         }
 
         const double diff = timestamp - iter->second;
         if (diff < -1e-3 || diff > max_time_jump) {
             // 连击计数而不是永远拒绝：这是旧实现「拒收即永久闩锁」的修复点。
-            const std::uint64_t streak = ++implausible_streaks[address];
-            if (streak >= reanchor_after) {
+            // streak 记录的是「第一个坏包的时刻」，坏包持续满 reanchor_after
+            // 才重锚——时长阈值不依赖包到达率。
+            const auto now = std::chrono::steady_clock::now();
+            auto [streak_iter, streak_inserted] = implausible_since_map.try_emplace(address, now);
+            if (!streak_inserted && now - streak_iter->second >= reanchor_after) {
                 iter->second = timestamp;
-                implausible_streaks[address] = 0;
-                return true;
+                implausible_since_map.erase(streak_iter);
+                return PlausibilityResult::kReanchor;
             }
-            return false;
+            return PlausibilityResult::kReject;
         }
-        implausible_streaks[address] = 0;
+        implausible_since_map.erase(address);
         iter->second = timestamp;
-        return true;
+        return PlausibilityResult::kAccept;
+    }
+
+    double host_now_seconds() noexcept {
+        return static_cast<double>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) * 1e-9;
     }
 
     bool is_point_valid(uint8_t tag) noexcept {
@@ -299,22 +314,32 @@ namespace mid360_driver {
                 }
             }
 
-            double header_timestamp = static_cast<double>(header.timestamp) * 1e-9;
+            double raw_header_timestamp = static_cast<double>(header.timestamp) * 1e-9;
+            double header_timestamp = raw_header_timestamp;
             if (header.time_type == TIMESTAMP_TYPE_NO_SYNC) {
                 auto [iter, inserted] = delta_time_map.try_emplace(sender_endpoint.address());
                 if (inserted) {
-                    auto now = static_cast<double>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) * 1e-9;
+                    const double now = host_now_seconds();
                     iter->second = now - header_timestamp;
                     header_timestamp = now;
                 } else {
                     header_timestamp += iter->second;
                 }
             }
-            if (!is_timestamp_plausible(last_lidar_timestamp_map, lidar_implausible_streaks,
+            const auto plausibility = is_timestamp_plausible(last_lidar_timestamp_map, lidar_implausible_since,
                     sender_endpoint.address(), header_timestamp,
-                    robustness_config.max_packet_time_jump, kLidarReanchorAfterPackets)) [[unlikely]] {
+                    robustness_config.max_packet_time_jump, kReanchorAfter);
+            if (plausibility == PlausibilityResult::kReject) [[unlikely]] {
                 log_packet_drop("lidar: implausible timestamp", robustness_config.min_drop_log_interval);
                 continue;
+            }
+            if (plausibility == PlausibilityResult::kReanchor && header.time_type == TIMESTAMP_TYPE_NO_SYNC) [[unlikely]] {
+                // 重锚后把 NO_SYNC 的墙钟锚一并刷新：墙钟锚只在首个包时建立，
+                // 若雷达重启（原始时间戳归零）或时钟跳变后不刷新，发布的时间戳
+                // 会整体偏移到远古/未来。
+                const double now = host_now_seconds();
+                delta_time_map[sender_endpoint.address()] = now - raw_header_timestamp;
+                header_timestamp = now;
             }
             auto interpolate_timestamp = [&](std::size_t i) {
                 return header_timestamp + packet_time_span * static_cast<double>(i) / static_cast<double>(header.dot_num);
@@ -342,6 +367,10 @@ namespace mid360_driver {
                     }
                 }
             } else if (header.data_type == LIVOX_LIDAR_CARTESIAN_COORDINATE_LOW_DATA) {
+                // 0x02 低精度包每轴是 int16、分辨率 10mm（协议 2.3.3「Unit: 10mm」，
+                // SDK 头文件注释 Unit:cm 同义），别和高精度包的 1mm 混用——
+                // 旧实现按 0.001 缩放会把低精度点云放大 10 倍。
+                constexpr float kCartesianLowScale = 0.01f;
                 const std::uint8_t * raw_points = buffer + sizeof(DataHeader);
                 for (std::size_t i = 0; i < header.dot_num; ++i) {
                     CartesianLowPoint raw_point{};
@@ -353,9 +382,9 @@ namespace mid360_driver {
                     }
                     Point point;
                     point.timestamp = interpolate_timestamp(i);
-                    point.x = static_cast<float>(raw_point.x * 0.001);
-                    point.y = static_cast<float>(raw_point.y * 0.001);
-                    point.z = static_cast<float>(raw_point.z * 0.001);
+                    point.x = static_cast<float>(raw_point.x) * kCartesianLowScale;
+                    point.y = static_cast<float>(raw_point.y) * kCartesianLowScale;
+                    point.z = static_cast<float>(raw_point.z) * kCartesianLowScale;
                     point.intensity = raw_point.reflectivity;
                     if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z) && point.x * point.x + point.y * point.y + point.z * point.z <= robustness_config.max_point_range * robustness_config.max_point_range) {
                         points.push_back(point);
@@ -405,22 +434,30 @@ namespace mid360_driver {
                     continue;
                 }
             }
-            double header_timestamp = static_cast<double>(header.timestamp) * 1e-9;
+            double raw_header_timestamp = static_cast<double>(header.timestamp) * 1e-9;
+            double header_timestamp = raw_header_timestamp;
             if (header.time_type == TIMESTAMP_TYPE_NO_SYNC) {
                 auto [iter, inserted] = delta_time_map.try_emplace(sender_endpoint.address());
                 if (inserted) {
-                    auto now = static_cast<double>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) * 1e-9;
+                    const double now = host_now_seconds();
                     iter->second = now - header_timestamp;
                     header_timestamp = now;
                 } else {
                     header_timestamp += iter->second;
                 }
             }
-            if (!is_timestamp_plausible(last_imu_timestamp_map, imu_implausible_streaks,
+            const auto plausibility = is_timestamp_plausible(last_imu_timestamp_map, imu_implausible_since,
                     sender_endpoint.address(), header_timestamp,
-                    robustness_config.max_packet_time_jump, kImuReanchorAfterPackets)) [[unlikely]] {
+                    robustness_config.max_packet_time_jump, kReanchorAfter);
+            if (plausibility == PlausibilityResult::kReject) [[unlikely]] {
                 log_packet_drop("imu: implausible timestamp", robustness_config.min_drop_log_interval);
                 continue;
+            }
+            if (plausibility == PlausibilityResult::kReanchor && header.time_type == TIMESTAMP_TYPE_NO_SYNC) [[unlikely]] {
+                // 同点云路径：重锚时刷新 NO_SYNC 墙钟锚，避免时间戳整体偏移。
+                const double now = host_now_seconds();
+                delta_time_map[sender_endpoint.address()] = now - raw_header_timestamp;
+                header_timestamp = now;
             }
             Imu raw_imu{};
             std::memcpy(&raw_imu, buffer + sizeof(DataHeader), sizeof(Imu));
