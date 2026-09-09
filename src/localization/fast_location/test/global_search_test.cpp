@@ -39,6 +39,31 @@ TEST(GlobalSearchTest, MapOdomJumpRejectsFarCorner)
   EXPECT_FALSE(fast_location::mapOdomJumpExceeds(previous, far, 0.0f));
 }
 
+// 跳变门超时放行：门只在「开启 + 确已 LOST + 超过 timeout」三者同时成立时放行，
+// 否则必须保持拦截（否则正确候选会被漂移后的错锚点永久拒绝，整车停在 LOST）。
+TEST(GlobalSearchTest, JumpGateLiftsOnlyAfterLostTimeout)
+{
+  EXPECT_FALSE(fast_location::jumpGateIsAdvisory(false, true, 100.0, 10.0));
+  EXPECT_FALSE(fast_location::jumpGateIsAdvisory(true, false, 100.0, 10.0));
+  EXPECT_FALSE(fast_location::jumpGateIsAdvisory(true, true, 100.0, 0.0));
+  EXPECT_FALSE(fast_location::jumpGateIsAdvisory(true, true, -1.0, 10.0));
+  EXPECT_FALSE(fast_location::jumpGateIsAdvisory(true, true, 9.99, 10.0));
+  EXPECT_TRUE(fast_location::jumpGateIsAdvisory(true, true, 10.0, 10.0));
+  EXPECT_TRUE(fast_location::jumpGateIsAdvisory(true, true, 61.0, 10.0));
+}
+
+// 现场故障复盘：门限 1m、错锚点偏离真值 6.94m。超时前必须拒绝（防错锁），
+// 超时后必须放行 —— 否则全场搜每拍都找到 fitness≈1.0 的真值也永远写不进去。
+TEST(GlobalSearchTest, JumpGateDeadlockResolvesAfterTimeout)
+{
+  const auto drifted_anchor = fast_location::planarPoseMatrix({0.0, 0.0, 0.0});
+  const auto true_pose = fast_location::planarPoseMatrix({6.94, 0.0, 0.0});
+
+  EXPECT_TRUE(fast_location::mapOdomJumpExceeds(drifted_anchor, true_pose, 1.0f));
+  EXPECT_FALSE(fast_location::jumpGateIsAdvisory(true, true, 3.0, 10.0));
+  EXPECT_TRUE(fast_location::jumpGateIsAdvisory(true, true, 12.0, 10.0));
+}
+
 TEST(GlobalSearchTest, CoversMapBoundsAndFullYawRange)
 {
   fast_location::PlanarBounds bounds{-2.0f, 2.0f, -1.0f, 3.0f};

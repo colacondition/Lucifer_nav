@@ -14,6 +14,7 @@ struct MincoOptimizer::Impl
   lbfgs::lbfgs_parameter_t lbfgs_params_;
 
   std::function<bool(const Eigen::Vector2d &, Eigen::Vector2d &)> tunnel_axis_query_;
+  std::function<bool(const Eigen::Vector2d &, TunnelCorridorFrame &)> tunnel_corridor_query_;
   std::function<bool(const Eigen::Vector2d &, double &, Eigen::Vector2d &)> distance_query_;
 
   // 优化过程中的临时变量
@@ -221,6 +222,100 @@ struct MincoOptimizer::Impl
     return cost_val;
   }
 
+  // 隧道横向走廊软代价，逐点累加。借鉴 TDT-nav-kit 的 Item.corridor：路标点不再
+  // 被钉死在轴线上，而是被约束在一个「洞内半宽 = clear_width/2 - robot_radius、
+  // 出洞后按到洞口距离线性放宽」的走廊里。落在无约束 L-BFGS 上，硬约束只能写成
+  // 带解析梯度的惩罚项；硬保证由 smoother 的发布前校验兜住。
+  //
+  // 走廊形状：横向半宽 bound(along) = half_width_inner + max(0, |along| - half_len)。
+  // 洞内是常量（车体刚好放得下的物理余量），出洞后每往前 1 m 放宽 1 m —— 这正是
+  // 洞口「喇叭形」的真实几何，比一刀切的 on/off 开关平滑，L-BFGS 不会在洞口看到
+  // 代价跳变。
+  //
+  // 纵向不设界：路径必须穿过隧道，|along| > half_len 是正常情况而不是违规。
+  double attach_corridor_functional(const Eigen::Matrix2Xd & in_ps, Eigen::Matrix2Xd & gradp) const
+    noexcept
+  {
+    const double w = params_.tunnel_corridor_weight;
+    if (w <= 0.0 || !tunnel_corridor_query_) {
+      return 0.0;
+    }
+    const int M = piece_num_ + 1;  // 总点数（含首尾）
+
+    double cost_val = 0.0;
+    double c_cost = 0.0;
+    TunnelCorridorFrame frame;
+
+    for (int k = 0; k < M; ++k) {
+      Eigen::Vector2d p;
+      if (k == 0) {
+        p = waypoints_.front();
+      } else if (k == M - 1) {
+        p = waypoints_.back();
+      } else {
+        p = in_ps.col(k - 1);
+      }
+      if (!tunnel_corridor_query_(p, frame)) {
+        continue;
+      }
+      if (!(frame.half_len > 0.0) || !frame.dir.allFinite() || !frame.centroid.allFinite() ||
+        frame.half_width_inner < 0.0)
+      {
+        continue;
+      }
+
+      const Eigen::Vector2d e = p - frame.centroid;
+      const double along = e.dot(frame.dir);
+      // 横向单位法向（dir 的左法向）。lat 取 |e·n|，对 ±dir 不敏感。
+      const Eigen::Vector2d normal(-frame.dir.y(), frame.dir.x());
+      const double lat_signed = e.dot(normal);
+      const double lat = std::abs(lat_signed);
+      const double along_abs = std::abs(along);
+
+      // 边界 = 洞内物理半宽 + 出洞后的纵向喇叭 + 影响区外的横向喇叭。
+      //
+      // 两个喇叭都是为了让惩罚在「约束失效」的边界上连续而不是跳变：
+      //   纵向：出洞后每远离洞口 1 m 放宽 1 m（真实的洞口喇叭形几何）。
+      //   横向：|lat| 超过影响区外沿后，边界跟着 |lat| 一起长，于是 violation
+      //         变成常数、代价平滑封顶、梯度归零。没有这一项时，影响区边界
+      //         （clear_width/2 + margin）两侧的代价会从 w·lat² 直接跳到 0 ——
+      //         对 L-BFGS 是一道悬崖，会让线搜索反复失败。
+      const double lateral_flare = std::max(0.0, lat - frame.lateral_outer);
+      const double extra = std::max(0.0, along_abs - frame.half_len);
+      const double bound = frame.half_width_inner + extra + lateral_flare;
+      const double violation = lat - bound;
+      if (violation <= 0.0) {
+        continue;
+      }
+
+      kahan_sum(cost_val, c_cost, w * violation * violation);
+
+      // violation = lat - inner - extra - lateral_flare，逐项求导：
+      //   d(lat)/dp            = sign(lat) * n
+      //   d(extra)/dp          = (|along| > half_len) ? sign(along) * dir : 0
+      //   d(lateral_flare)/dp  = (|lat| > outer)     ? sign(lat) * n    : 0
+      // 横向喇叭生效时它的导数正好抵消 d(lat)/dp —— 横向梯度归零（代价封顶）。
+      const double lat_sign = (lat_signed >= 0.0) ? 1.0 : -1.0;
+      const bool lateral_capped = frame.lateral_outer > 0.0 && lat > frame.lateral_outer;
+      Eigen::Vector2d dvio = Eigen::Vector2d::Zero();
+      if (!lateral_capped) {
+        dvio += lat_sign * normal;
+      }
+      if (extra > 0.0) {
+        dvio -= (along >= 0.0 ? 1.0 : -1.0) * frame.dir;
+      }
+      const Eigen::Vector2d g = 2.0 * w * violation * dvio;
+      if (!g.allFinite()) {
+        continue;
+      }
+      // 只有内部点进 gradp；边界点固定，梯度丢弃（与其它项同一约定）。
+      if (k >= 1 && k <= M - 2) {
+        gradp.col(k - 1).noalias() += g;
+      }
+    }
+    return cost_val;
+  }
+
   // L-BFGS 代价函数
   static double cost(void * ptr, const Eigen::VectorXd & x, Eigen::VectorXd & g) noexcept
   {
@@ -278,6 +373,7 @@ struct MincoOptimizer::Impl
     cost_val += instance->attach_penalty_functional(in_ps, gradp);
     cost_val += instance->attach_axis_functional(in_ps, gradp);
     cost_val += instance->attach_obstacle_functional(in_ps, gradp);
+    cost_val += instance->attach_corridor_functional(in_ps, gradp);
 
     auto & g_full = instance->full_grad_cache_;
     g_full.setZero();
@@ -384,10 +480,29 @@ struct MincoOptimizer::Impl
 
       // 优化失败时返回空轨迹，让节点的“发布原始路径”回退真正生效。
       // 旧实现失败仍把可能已经发散的 x_opt 写回轨迹，NaN 路径会一路流到 MPC。
-      if (!(ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH)) {
+      //
+      // 两类“没收敛但有可用解”的返回码按可用处理（与既有的
+      // LBFGSERR_MAXIMUMLINESEARCH 同一口径）：
+      //   MAXIMUMITERATION —— 迭代预算用尽。实测在**接近共线**的输入上必然发生：
+      //     沿路径方向的代价谷几乎是平的，梯度压不到 g_epsilon，跑满 800 次仍
+      //     返回这个码。此时 x_opt 是一条完全可用的 MINCO 插值，把它判为失败会
+      //     让节点回退到 A* 的 8 邻域折线 —— 那条折线不光滑、被 speed_profile
+      //     按曲率限速压到爬行，严格劣于一个“没完全收敛的平滑轨迹”。
+      // 安全性由下面的一致性检查兜住：结果必须有限，且最终轨迹必须有限，
+      // 否则仍然按失败处理。真正的发散（NaN/Inf）不会被放行。
+      if (!(ret >= 0 || ret == lbfgs::LBFGSERR_MAXIMUMLINESEARCH ||
+        ret == lbfgs::LBFGSERR_MAXIMUMITERATION))
+      {
         RCLCPP_ERROR(
           rclcpp::get_logger("minco_optimizer"),
           "MINCO optimization failed: %s", lbfgs::lbfgs_strerror(ret));
+        return {};
+      }
+      if (!x_opt.allFinite()) {
+        RCLCPP_ERROR(
+          rclcpp::get_logger("minco_optimizer"),
+          "MINCO optimization diverged (%s): non-finite decision vector",
+          lbfgs::lbfgs_strerror(ret));
         return {};
       }
     }
@@ -414,6 +529,24 @@ struct MincoOptimizer::Impl
     std::vector<Piece<5, 2>> final_traj;
     minco_.getPieces(final_traj);
 
+    // 最终护栏：任一段的持续时间或采样点非有限就整体判失败。这是上面放宽
+    // MAXIMUMITERATION 之后唯一的兜底 —— 决策向量有限不等于插值结果有限
+    // （带状 LU 在极端时间比下仍可能产生 Inf）。
+    for (const auto & piece : final_traj) {
+      if (!std::isfinite(piece.getDuration()) || piece.getDuration() <= 0.0) {
+        RCLCPP_ERROR(rclcpp::get_logger("minco_optimizer"), "MINCO produced invalid duration");
+        return {};
+      }
+      const double dur = piece.getDuration();
+      if (!piece.getPos(0.0).allFinite() || !piece.getPos(dur).allFinite() ||
+        !piece.getVel(0.0).allFinite() || !piece.getVel(dur).allFinite() ||
+        !piece.getAcc(0.0).allFinite() || !piece.getAcc(dur).allFinite())
+      {
+        RCLCPP_ERROR(rclcpp::get_logger("minco_optimizer"), "MINCO produced non-finite trajectory");
+        return {};
+      }
+    }
+
     return final_traj;
   }
 };
@@ -436,6 +569,12 @@ void MincoOptimizer::setTunnelAxisQuery(
   std::function<bool(const Eigen::Vector2d &, Eigen::Vector2d &)> query_fn)
 {
   impl_->tunnel_axis_query_ = query_fn;
+}
+
+void MincoOptimizer::setTunnelCorridorQuery(
+  std::function<bool(const Eigen::Vector2d &, TunnelCorridorFrame &)> query_fn)
+{
+  impl_->tunnel_corridor_query_ = query_fn;
 }
 
 void MincoOptimizer::setDistanceQuery(

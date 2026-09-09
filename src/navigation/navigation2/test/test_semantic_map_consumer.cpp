@@ -589,4 +589,102 @@ TEST(SemanticMapConsumerTest, RealWorldMapRoundTripAccepted)
   (void)geometry;
 }
 
+// 走廊查询必须在**真实地图**上生效。RMUL 的两条隧道 clear_width 都是 0.5 m，
+// 而代价地图的 robot_radius 是 0.25 m —— 相减恰好为 0。最初的实现把「半宽 <= 0」
+// 当成「给不了约束」直接返回 false，于是整个走廊项在真实地图上静默失效：
+// 参数看着打开了，实际一次都没触发过。这个用例把那条路径钉死。
+TEST(TunnelRegionGridTest, RealMapCorridorActivatesWithZeroPhysicalMargin)
+{
+  const std::string path = "/home/cola/Lucifer_nav/src/bringup/map/RMUL.msgpack";
+  const SemanticMapData data = loadSemanticMap(path);
+  ASSERT_FALSE(data.tunnels.empty());
+  ASSERT_GT(data.tunnels.front().clear_width, 0.0);
+
+  InflationParams inflation;
+  inflation.resolution = data.geometry.resolution;
+  inflation.full_cost_radius_m = 0.10;
+  inflation.cutoff_radius_m = 0.30;
+  inflation.decay_rate_per_m = 24.0;
+  inflation.non_body_magnitude_cap = kMaxInflatedMagnitude;
+  const SemanticMap map = SemanticMap::inflate(data, inflation);
+  const auto region = TunnelRegionGrid::build(map, 0.20);
+  ASSERT_FALSE(region.empty());
+
+  const double robot_radius = 0.25;  // 与 rm_global_costmap 的 robot_radius 同值
+  const double expected_inner =
+    std::max(0.0, data.tunnels.front().clear_width * 0.5 - robot_radius);
+  EXPECT_DOUBLE_EQ(expected_inner, 0.0);  // 车体直径 == 净宽，物理余量为零
+
+  // 在隧道本体格中心查询：必须返回 true（有轴可用），且半宽就是那个 0。
+  TunnelRegionGrid::CorridorFrame frame;
+  bool found = false;
+  for (int y = 0; y < map.geometry().height && !found; ++y) {
+    for (int x = 0; x < map.geometry().width; ++x) {
+      if (!map.isTunnelBodyCell(x, y)) {
+        continue;
+      }
+      const Eigen::Vector2d center = map.geometry().cellCenter(x, y);
+      if (region.corridorFrameAtPoint(center.x(), center.y(), robot_radius, 0.0, frame)) {
+        found = true;
+        break;
+      }
+    }
+  }
+  ASSERT_TRUE(found) << "corridorFrameAtPoint must activate inside a real tunnel";
+  EXPECT_GT(frame.half_len, 0.0);
+  EXPECT_NEAR(frame.dir.norm(), 1.0, 1e-9);
+  EXPECT_NEAR(frame.half_width_inner, 0.0, 1e-12);
+
+  // 轴必须是无向单位向量（正进倒进等价），法向与轴正交。
+  const Eigen::Vector2d normal(-frame.dir.y(), frame.dir.x());
+  EXPECT_NEAR(normal.norm(), 1.0, 1e-9);
+  EXPECT_NEAR(frame.dir.dot(normal), 0.0, 1e-12);
+
+  // lateral_margin 是唯一的放宽手段：给 0.05 m 就让半宽变成 0.05。
+  TunnelRegionGrid::CorridorFrame widened;
+  ASSERT_TRUE(
+    region.corridorFrameAtPoint(
+      frame.centroid.x(), frame.centroid.y(), robot_radius, 0.05, widened));
+  EXPECT_NEAR(widened.half_width_inner, 0.05, 1e-12);
+
+  // 隧道外（远离任何隧道）必须返回 false，调用方据此跳过约束。
+  TunnelRegionGrid::CorridorFrame outside;
+  EXPECT_FALSE(region.corridorFrameAtPoint(0.0, 0.0, robot_radius, 0.0, outside));
+}
+
+// 换图后的几何。实际比赛地图的隧道净宽是 0.8 m（RMUL 当前地图是 0.5 m）。
+// 半宽 = 0.8/2 - 0.25 = 0.15 m —— 这时走廊是一条**真正有宽度**的约束，
+// 不再是 RMUL 那种「必须压轴线」的零宽情形。走廊几何完全由地图里的
+// clear_width 驱动，换图不需要改任何代码，这条用例把公式钉住。
+TEST(TunnelRegionGridTest, EightHundredMillimetreTunnelLeavesPositiveCorridor)
+{
+  const auto msg = makeTunnelMsg(10, 6, 0.05, 0.0, 0.0, 3, 0.3, 0.8);
+  const auto map = semanticMapFromMsg(msg);
+  const auto region = TunnelRegionGrid::build(map, 0.20);
+  ASSERT_FALSE(region.empty());
+
+  // 本体行是 y=3，格中心世界 y = 3*0.05 + 0.025 = 0.175。
+  TunnelRegionGrid::CorridorFrame frame;
+  ASSERT_TRUE(region.corridorFrameAtPoint(0.25, 0.175, 0.25, 0.0, frame));
+  EXPECT_NEAR(frame.half_width_inner, 0.15, 1e-9);
+  // 影响区横向外沿 = clear_width/2 + margin = 0.4 + 0.2。
+  EXPECT_NEAR(frame.lateral_outer, 0.60, 1e-9);
+  EXPECT_GT(frame.half_len, 0.0);
+
+  // 车体半径小于净宽一半时同样成立：0.8/2 - 0.20 = 0.20 m。
+  TunnelRegionGrid::CorridorFrame wider;
+  ASSERT_TRUE(region.corridorFrameAtPoint(0.25, 0.175, 0.20, 0.0, wider));
+  EXPECT_NEAR(wider.half_width_inner, 0.20, 1e-9);
+
+  // 净宽小于车体直径时钳到 0（压轴线），而不是拒绝给约束。
+  TunnelRegionGrid::CorridorFrame clamped;
+  ASSERT_TRUE(region.corridorFrameAtPoint(0.25, 0.175, 0.50, 0.0, clamped));
+  EXPECT_NEAR(clamped.half_width_inner, 0.0, 1e-12);
+
+  // lateral_margin 叠加在半宽之上。
+  TunnelRegionGrid::CorridorFrame margin;
+  ASSERT_TRUE(region.corridorFrameAtPoint(0.25, 0.175, 0.25, 0.05, margin));
+  EXPECT_NEAR(margin.half_width_inner, 0.20, 1e-9);
+}
+
 }  // namespace navigation2

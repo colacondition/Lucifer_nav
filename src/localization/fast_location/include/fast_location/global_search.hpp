@@ -105,6 +105,8 @@ std::vector<Eigen::Matrix4f> generatePlanarCandidates(
 
 // 上一拍与候选 map→odom 的 XY 平移距离。LOST 仍全场搜，
 // 但跳变超过门限（RMUL 对面角 ≈ 11m）就是锁错角。max_xy_jump<=0 关门。
+// 注意：该判据的前提是"上一拍锚点大体正确"，前端漂移级故障下前提不成立，
+// 由 jumpGateIsAdvisory 兜底放行。
 inline float mapOdomXyJump(
   const Eigen::Matrix4f & previous, const Eigen::Matrix4f & candidate)
 {
@@ -122,6 +124,20 @@ inline bool mapOdomJumpExceeds(
     return false;
   }
   return mapOdomXyJump(previous, candidate) > max_xy_jump;
+}
+
+// 跳变门超时放行（lost_escape.*）：连续 LOST 超过 timeout_sec 后，跳变门不再
+// 拦候选。判据本身是「候选 vs 上一拍锚点」，而上一拍锚点在前端失效级漂移时
+// 就是错的 —— 此时门会把唯一正确的候选永久丢掉（实测：全场搜稳定给出
+// fitness≈1.0 的真值，只因离错锚点 6.9m 被逐次拒绝，整车停在 LOST 不动）。
+// 放行后候选仍须过 margin / GICP 精化 fitness / 时序校验。
+inline bool jumpGateIsAdvisory(
+  bool escape_enabled, bool lost_active, double lost_sec, double timeout_sec)
+{
+  if (!escape_enabled || !(timeout_sec > 0.0) || !lost_active) {
+    return false;
+  }
+  return lost_sec >= timeout_sec;
 }
 
 // 给每个候选位姿打分，分数越高越像当前扫描。kdtree 由调用方传入并复用

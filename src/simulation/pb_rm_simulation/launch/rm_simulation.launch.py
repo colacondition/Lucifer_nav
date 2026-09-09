@@ -23,6 +23,7 @@ from launch.actions.append_environment_variable import AppendEnvironmentVariable
 class WorldType:
     RMUC = 'RMUC'
     RMUL = 'RMUL'
+    RMUL27 = 'RMUL27'
 
 def get_world_config(world_type):
     world_configs = {
@@ -39,6 +40,22 @@ def get_world_config(world_type):
             'z': '0.170',    # base_link 在地面上方（轮子接触地面）
             'yaw': '1.57',
             'world_path': 'RMUL2024_world/rmul27.world'
+        },
+        # 新导出的平铺场地，world 里绕 X 翻 180° 摆正（花纹面朝上，
+        # 支撑结构变成场地的墙/架在行驶面上方），行驶面在世界 z=0.1。
+        # 出生点 z = 0.1 + 轮半径 0.06 + 余量。
+        #
+        # x/y 不是照抄 RMUL：map 系是"开机瞬间机器人位姿"定义的，场地挪过地方后，
+        # 只有把出生点也挪一下，旧 map/PCD 的 XY 才对得上：
+        #   p_M.x = y - Y0 要落在 [-2.05, 6.55] → Y0 = -8.6+2.05 = -6.55
+        #   p_M.y = -(x - X0) 要落在 [-1.54, 11.06] → X0 = 5.32-1.54 = 3.78
+        # 想随便放就自己改这四个数（用户明确说自己调出生点）。
+        WorldType.RMUL27: {
+            'x': '3.78',
+            'y': '-6.55',
+            'z': '0.170',
+            'yaw': '1.57',
+            'world_path': 'RMUL27_world/RMUL27.world'
         }
     }
     return world_configs.get(world_type, None)
@@ -84,7 +101,7 @@ def generate_launch_description():
     declare_world_cmd = DeclareLaunchArgument(
         'world',
         default_value=WorldType.RMUC,
-        description='Choose <RMUC> or <RMUL>'
+        description='Choose <RMUC> or <RMUL> or <RMUL27>'
     )
 
     declare_rviz_config_file_cmd = DeclareLaunchArgument(
@@ -235,6 +252,7 @@ def generate_launch_description():
 
     bringup_RMUC_cmd_group = create_gazebo_launch_group(WorldType.RMUC)
     bringup_RMUL_cmd_group = create_gazebo_launch_group(WorldType.RMUL)
+    bringup_RMUL27_cmd_group = create_gazebo_launch_group(WorldType.RMUL27)
 
     # Create the launch description and populate
     ld = LaunchDescription()
@@ -257,6 +275,7 @@ def generate_launch_description():
     ld.add_action(start_joint_state_publisher_cmd)
     ld.add_action(start_robot_state_publisher_cmd)
     ld.add_action(bringup_RMUL_cmd_group) # type: ignore
+    ld.add_action(bringup_RMUL27_cmd_group) # type: ignore
     ld.add_action(bringup_RMUC_cmd_group) # type: ignore
 
     # Uncomment this line if you want to start RViz

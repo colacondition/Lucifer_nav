@@ -1,0 +1,68 @@
+<?xml version="1.0"?>
+<!-- RMUL2026 场地（装配体1 导出的 STL，单位已经是米）。
+
+     和老的 meshes/RMUL2024_world/meshes/rmul27.STL 是同一块场地，区别：
+       * 老 STL 是"立着"导出的（12.6 × 0.52 × 8.6），world 里靠 roll=-90° 放平，
+         放平后行驶面朝下、支撑架在上方（世界 z 0.1~0.52）；
+       * 这块是新导出的"平铺"版本（12.6 × 8.6 × 0.52），但导出时是"光面朝上、
+         带花纹的行驶面朝下"，所以要绕 X 翻 180° 才能摆正（见下面 world 的位姿）。
+
+     坐标（模型局部系）：
+       * 包围盒 x∈[-7.2834, 5.3166]，y∈[-8.6, 0]，z∈[-0.8351, -0.3151]
+       * 光面（无花纹、整块 108.36 m² = 12.6 × 8.6，只有 2 个三角形）在 z=-0.3151 朝上
+       * 带花纹/开孔的行驶面（91.73 m²，448 个三角形）在 z=-0.4151 朝下
+       * 支撑结构在 z∈[-0.8351, -0.4151]（在花纹面那一侧）
+       * link pose z=+0.320105 把光面抬到局部 z=+0.005 —— 单独 include 这个模型时
+         就是"光面朝上、结构埋在地面以下"的平铺摆法（= 用户保存的 RMUL27.world）。
+       * world/RMUL27_world/RMUL27.world 里位姿 (0, -8.6, 0.005) + roll=180°：
+         绕 X 翻 180°，花纹面（行驶面）→ 世界 z=0.1 朝上，光面 → 0.0 贴地，
+         支撑结构 → 0.1~0.52 在行驶面上方（场地的墙/架）。
+       * 机器人出生点按这个高度给：base_link z ≈ 0.1 + 轮半径 0.06 + 余量 ≈ 0.17。
+-->
+<sdf version="1.6">
+  <model name="RMUL27_world">
+    <static>true</static>
+
+    <link name="base_link">
+      <pose>0 0 0.320105 0 0 0</pose>
+
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <uri>model://RMUL27_world/meshes/base_link.STL</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <lighting>1</lighting>
+          <ambient>0.6 0.6 0.6 1</ambient>
+          <diffuse>0.8 0.8 0.8 1</diffuse>
+          <specular>0.1 0.1 0.1 1</specular>
+        </material>
+        <cast_shadows>true</cast_shadows>
+      </visual>
+
+      <collision name="collision">
+        <geometry>
+          <mesh>
+            <uri>model://RMUL27_world/meshes/base_link.STL</uri>
+          </mesh>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>1.0</mu>
+              <mu2>1.0</mu2>
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <max_vel>0.1</max_vel>
+              <min_depth>0.001</min_depth>
+            </ode>
+          </contact>
+        </surface>
+        <laser_retro>0</laser_retro>
+      </collision>
+    </link>
+  </model>
+</sdf>

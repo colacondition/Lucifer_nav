@@ -326,6 +326,49 @@ const TunnelSpec * TunnelRegionGrid::specNearPoint(
   return &tunnels_[static_cast<std::size_t>(id - 1)];
 }
 
+bool TunnelRegionGrid::corridorFrameAtPoint(
+  const double world_x, const double world_y, const double robot_radius,
+  const double lateral_margin, CorridorFrame & out) const noexcept
+{
+  // 与 pointOutsideCorridor 同一套「找不到就保守返回 false」的语义：轴退化
+  // （half_len<=0）、不在影响区、轴表为空，三种情况都给不了约束。
+  if (axes_.empty()) {
+    return false;
+  }
+  const auto cell = geometry_.containingCell(Eigen::Vector2d(world_x, world_y));
+  if (!cell) {
+    return false;
+  }
+  const std::uint8_t id = spec_index_[geometry_.index(cell->x(), cell->y())];
+  if (id == 0 || static_cast<std::size_t>(id - 1) >= tunnels_.size()) {
+    return false;
+  }
+  const CorridorAxis & axis = axes_[id - 1];
+  if (axis.half_len <= 0.0) {
+    return false;
+  }
+
+  const TunnelSpec & spec = tunnels_[id - 1];
+  // 物理横向半宽：车体中心离轴线最多这么远，圆形车体才不擦壁。
+  //
+  // 钳到 0 而不是返回 false：RMUL 的真实隧道净宽 0.5 m、车体半径 0.25 m，
+  // 相减恰好是 0 —— 这是「车体直径等于净宽、物理余量为零」的正常情形，
+  // 正确的约束是压轴线（半宽 0 的走廊 = 轴线），而不是放弃约束。返回 false
+  // 会让整个走廊特性在真实地图上静默失效（这就是最初的实现犯的错）。
+  // 只有负值（净宽真的放不下车体，隧道不可通行）才没有意义，也一并钳到 0，
+  // 由静态地图的壁面致命格去否决。
+  const double half_width_inner =
+    std::max(0.0, spec.clear_width * 0.5 - robot_radius) + std::max(0.0, lateral_margin);
+
+  out.centroid = axis.centroid;
+  out.dir = axis.dir;
+  out.half_len = axis.half_len;
+  out.half_width_inner = half_width_inner;
+  // 与 pointOutsideCorridor 的横向半宽同式：影响区外沿。
+  out.lateral_outer = spec.clear_width * 0.5 + margin_m_;
+  return true;
+}
+
 std::vector<float> makeInflationRadiusLimit(
   const nav_msgs::msg::OccupancyGrid & grid, const SemanticMap & map, double default_radius,
   double robot_radius, const TunnelRegionGrid & region)

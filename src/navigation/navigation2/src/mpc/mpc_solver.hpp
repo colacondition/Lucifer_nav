@@ -5,6 +5,16 @@
 // 约束：x_0 = x_init；x_i = x_{i-1} + u_{i-1}*dt（动力学）；
 //       |u_i| <= vmax；|u_i - u_{i-1}| <= amax*dt。
 // 这里仅做轨迹跟踪 QP；避障由全局规划器和局部安全检查负责。
+//
+// 速度上界的两种语义（enforce_speed_norm）：
+//   false（历史行为）：逐分量 box |u_x|,|u_y| <= vmax。这是 L∞ 球，对角方向
+//     实际能跑到 sqrt(2)*vmax —— 声明 2.0 m/s 的机器人斜 45° 会下发 2.83 m/s。
+//   true：内接正八边形（L2 圆的 8 边线性近似）。轴向 4 个法向（0/45/90/135°）
+//     的支撑距离统一取 vmax*cos(22.5°)，顶点恰好落在半径 vmax 的圆上 —— 既
+//     保证 ||u||_2 <= vmax 处处成立，又把轴向速度只压到 0.924*vmax。八边形
+//     内接于圆而不是外切，所以是「收紧到声明值」而不是「放大到对角值」。
+//     实现上复用原有的 2 行速度 box（只是把界从 vmax 换成 vmax*cos(22.5°)），
+//     再追加 2 行对角方向，净增 2*steps 行约束。
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -17,6 +27,11 @@
 #include <osqp.h>
 
 namespace navigation2::mpc {
+
+// 内接正八边形的支撑距离系数：半径 r 的圆内接八边形，各边法向到圆心的距离是
+// r*cos(pi/8)。轴向速度因此从 vmax 压到 0.924*vmax，但对角方向从 1.414*vmax
+// 压回 vmax —— 顶点正好落在圆上，是能保证 ||u||_2 <= vmax 的最紧 8 边线性近似。
+constexpr double kOctagonSupport = 0.92387953251128673848;  // cos(22.5°)
 
 struct MpcParams
 {
@@ -36,6 +51,10 @@ struct MpcParams
   // 设正值可封住病态 QP 最坏耗时，但可能拿到 SOLVED_INACCURATE 解；
   // 是否接受由调用方看 inaccurateSolves() 计数自行取舍。
   double time_limit = 0.0;
+  // 速度上界按 L2 模长收紧（内接八边形）。默认开：max_speed 声明的是速度上限，
+  // 逐分量 box 让对角实际跑到 sqrt(2)*max_speed 是缺陷。轴向速度因此为
+  // 0.924*max_speed；要保留对角速度就把 max_speed 提到 1/cos(22.5°) 倍。
+  bool enforce_speed_norm = true;
 };
 
 // 参数合法性检查。MPC 的稀疏结构与工作区尺寸都由这些值决定，非法值会在
@@ -50,6 +69,9 @@ inline bool paramsAreValid(const MpcParams & p)
          p.min_tangent_speed >= 0.0 && std::isfinite(p.min_tangent_speed) &&
          p.Q.size() >= 2 && p.R.size() >= 2 && p.Rd.size() >= 2 &&
          p.time_limit >= 0.0 && std::isfinite(p.time_limit);
+  // 注意：enforce_speed_norm 下 max_speed==0 是合法的（八边形退化成「必须停」，
+  // 是强制停车的一种配置），不要在这里拒绝它 —— 拒绝会触发调用方的「回退默认
+  // 参数」，反而让机器人按 2.0 m/s 跑起来。
 }
 
 class MpcSolver
@@ -264,6 +286,7 @@ private:
     const int dimx = 2 * steps;
     const int nx = dimx + 2 * steps;
     // 行分布：[动力学 2*steps][速度边界 2*steps][加速度平滑 2*(steps-1)]
+    //         [模长对角 2*steps（仅 enforce_speed_norm）]
     const int dyn = 2 * steps;
     const int veloff = dyn;
     const int accoff = dyn + 2 * steps;
@@ -305,6 +328,20 @@ private:
       add(r + 1, u + 1, 1.0); add(r + 1, up + 1, -1.0);
     }
     ncon_ = accoff + 2 * (steps - 1);
+    // 模长收紧时的对角方向（±45°）。轴向 0°/90° 已由速度 box 行覆盖，这里补齐
+    // 另外两个法向，凑成完整的内接八边形。结构在 configure() 一次建好，
+    // 热路径只改 l/u。
+    if (params_.enforce_speed_norm) {
+      const int normoff = ncon_;
+      constexpr double kInvSqrt2 = 0.70710678118654752440;
+      for (int i = 0; i < steps; ++i) {
+        const int r = normoff + 2 * i;
+        const int c = dimx + 2 * i;
+        add(r, c, kInvSqrt2); add(r, c + 1, kInvSqrt2);       // (ux+vy)/sqrt2
+        add(r + 1, c, kInvSqrt2); add(r + 1, c + 1, -kInvSqrt2);  // (ux-vy)/sqrt2
+      }
+      ncon_ = normoff + 2 * steps;
+    }
     // CSC 要求每列中的行号按升序排列。
     for (auto & col : cols) {
       std::sort(col.begin(), col.end());
@@ -319,7 +356,11 @@ private:
     const int dyn = 2 * steps;
     const int veloff = dyn;
     const int accoff = dyn + 2 * steps;
-    const double vmax = turtle ? params_.turtle_max_speed : params_.max_speed;
+    const double vmax_raw = turtle ? params_.turtle_max_speed : params_.max_speed;
+    // enforce_speed_norm 时轴向界收紧到内接八边形的支撑距离，使顶点恰好落在
+    // 半径 vmax 的圆上；对角行用同一个界。见文件头注释的推导。
+    const double vmax = params_.enforce_speed_norm ?
+      vmax_raw * kOctagonSupport : vmax_raw;
     const double dv = params_.max_accel * params_.dt;
 
     l_.assign(ncon_, -1e30);
@@ -343,6 +384,14 @@ private:
       const int r = accoff + 2 * (i - 1);
       l_[r] = -dv; u_[r] = dv;
       l_[r + 1] = -dv; u_[r + 1] = dv;
+    }
+    if (params_.enforce_speed_norm) {
+      const int normoff = accoff + 2 * (steps - 1);
+      for (int i = 0; i < steps; ++i) {
+        const int r = normoff + 2 * i;
+        l_[r] = -vmax; u_[r] = vmax;
+        l_[r + 1] = -vmax; u_[r + 1] = vmax;
+      }
     }
   }
 

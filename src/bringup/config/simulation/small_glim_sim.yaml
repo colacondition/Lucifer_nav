@@ -12,6 +12,18 @@
       # 0.05 -> 0.1：每帧点数约减半，单帧 GICP 耗时波动更小（开阔场地特征稀疏时
       # 耗时起伏是 odom 节律不均、看着顿挫的主因）。实车保留 0.05。
       downsample_resolution: 0.1
+      # 必须与 downsample_resolution 相同（仿真）：common 里定位分辨率是 0.05，
+      # 与仿真的 0.1 不等时会走 preprocess_for_localization() 另算一张稠密帧，
+      # 而 pub_localization_cloud() 要用「本帧 IMU 轨迹」给它逐点 deskew，校验
+      # imu_times.back() >= dense->scan_end_time。仿真点云没有逐点时间戳
+      # （time_keeper 按点序生成伪时间），两张云的点集不同 → 稠密帧的
+      # scan_end_time 常超出轨迹末尾 → 校验失败、整帧丢弃：
+      #   [small_glim] Skip dense localization cloud: invalid/incomplete IMU trajectory
+      # 实测 /small_glim/deskewed_cloud 只有 1~6Hz（应 10Hz）且忽快忽慢，连带
+      # lidar_filter → /segmentation/obstacle、pointcloud_to_laserscan → /scan、
+      # 代价地图障碍源全部跟着抖。分辨率对齐后走零拷贝复用分支
+      # （use_odometry_cloud），稠密云稳定 10Hz。实车有真实逐点时间戳，保持 0.05。
+      localization_downsample_resolution: 0.1
     odometry_estimation:
       num_threads: 2           # 8-core budget: LIO 2
       # 3.0 -> 1.5：后台 ISAM2 修正滞后减半，odom 的 IMU 预测参考状态更"新鲜"。

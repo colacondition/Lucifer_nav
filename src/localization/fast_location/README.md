@@ -32,8 +32,10 @@ small_glim 输出的纯 xyz PCD。
 
 1. **初始定位**（未 `initialized`）：开机走出生点 `globalLocalization(initial_pcd_to_odom_)`
    （保证在家，不跑全场）。`LOST` 后若开了搜索，仍全场网格；接受时 `map→odom` XY
-   相对上一拍不能超过 `global_search_max_map_odom_jump`（默认 4m）。RMUL 对面角约 11m，
-   跳过去会被丢掉。`/initialpose` 把 generation 作废：相对上一拍 ≤4m 才当先验做局部 ICP；
+   相对上一拍不能超过 `global_search_max_map_odom_jump`。RMUL 对面角约 11m，
+   跳过去会被丢掉——**但连续 `LOST` 超过 `lost_escape.timeout_sec` 后跳变门转为放行**
+   （见下「跳变门超时放行」），否则正确候选会被永久拒绝、整车停在 `LOST` 不动。
+   `/initialpose` 把 generation 作废：相对上一拍在门内才当先验做局部 ICP；
    跳过大（点到对面角）立刻 `LOST` 全场召回，且不把错误种子写进 `T_pcd_to_odom_`。
    关掉搜索时 `LOST` 也用上一拍做多尺度 ICP。首次匹配须过 `first_localization_th`。
 2. **跟踪**（已初始化）：仅当 `has_new_scan_`（新扫描到来）才重定位，pose_guess 用上次
@@ -57,15 +59,31 @@ small_glim 输出的纯 xyz PCD。
 
 运行配置 `enable_global_search: true`。开机不搜（在家，局部 ICP）。`LOST` 后走
 全场 `performGlobalSearch()`；精化与 `acceptLocalizationResult` 都会丢掉
-`map→odom` XY 跳变超过 `global_search_max_map_odom_jump`(4.0m) 的候选。
-RMUL 对面角约 11m，锁过去会被拒绝；只有远角胜出来时停在 `LOST`。
-跳变门配 0 关闭。
+`map→odom` XY 跳变超过 `global_search_max_map_odom_jump`(1.0m) 的候选。
+RMUL 对面角约 11m，锁过去会被拒绝。跳变门配 0 关闭。
 
 流程：AABB × 360° yaw 按 `xy_step`(2.0m)/`yaw_step`(30°) 布候选 → KD-tree 命中率打分
 → 取 `top_k`(6) 并按 `candidate_separation` 去重 → 分差小于
 `global_search_min_score_margin`(0.03) 则整次拒绝 →
 `refine_radius` 邻域精细 ICP（跳变过门的丢掉） → `enable_temporal_verification` 用下一帧再打分，
 过 `temporal_min_score` 才写入 `map→odom`。
+
+### 跳变门超时放行（`lost_escape.*`）
+
+跳变门的判据是「候选 vs **上一拍** `map→odom`」，前提是上一拍锚点大体正确。
+前提被打破时门会锁死：前端失效级漂移把锚点带偏 → NIS 连败判 `LOST` → 全场搜每拍
+都能稳定找到真值（实测 fitness≈1.0、第二名 0.92、margin 远超 0.03），却因为
+"离那个**错锚点** 6.9m"被逐次丢弃，`LOST` 永久保持、下游一直停车等重定位。
+
+因此：连续 `LOST` 超过 `lost_escape.timeout_sec`（且 `lost_escape.enable: true`）后，
+跳变门**整体放行**，取通过 margin 与时序校验的最佳候选并重新锚定（`WARN`
+"Jump gate lifted after ..." 可审计）。放行不等于降标准——候选仍须过粗搜/精搜打分、
+`min_score_margin`、逐级 GICP 精化（`fitness > first_localization_th`）与时序校验；
+对称场地防错锁由 margin + 时序把关。跳变门只该压"单拍跳变"，不该负责"永不自愈"。
+
+历史坑（两个都踩过，别再回头）：① 重复的 `lost_escape.enable` 键让 YAML 后者覆盖
+前者，静默把逃生口关成 `false`；② 旧版"逐级放宽"的 `max_jump_m: 6.0` 小于实测
+跳变 6.94m，门永远开不够。所以改成超时放行，不再猜跳变量级。
 
 候选数硬上限 `max_candidates`，超了自动加大 `xy_step`，避免一次重定位 OOM。
 粗搜在定位线程串行打分，精化仍用 `gicp_num_threads=2`，不加线程。
@@ -102,7 +120,7 @@ NIS、走廊投影、跳变门、连败召回都在定位内部做完再贴 reas
 | `LOST waiting` | 开机未锁 | 停车 + 冻下发 |
 | `LOST nis_lost` | NIS 连败 | 停车 + 全场搜 |
 | `LOST tracking_lost` | ICP 连败满 `tracking_failures_before_global_search`(5) | 停车 + 全场搜 |
-| `LOST map_odom_jump` | 接受结果相对上一拍 XY 跳 > `global_search_max_map_odom_jump`(4m) | 停车 + 全场搜 |
+| `LOST map_odom_jump` | 接受结果相对上一拍 XY 跳 > `global_search_max_map_odom_jump`（门未超时放行时） | 停车 + 全场搜 |
 | `LOST pose_prior_jump` | 远处 `/initialpose`（点到对面角），种子**不写**进 `T_pcd_to_odom_` | 停车 + 全场搜 |
 | `LOST frontend_diverged` | 前端发散连败满 | 停车 + 全场搜 |
 
@@ -159,16 +177,18 @@ Humble 下 `transient_local` 与 intra-process 不能同时开，见下「契约
 | :- | :- | :- |
 | `enable_nis` | true | 过几何质量后再做 scan-to-map 一致性门 |
 | `nis_reject_threshold` | 12.0 | 3 自由度 χ² 约 99%；超则本拍不写 `map→odom` |
-| `nis_lost_streak` | 8 | 连续 NIS 拒绝后进 `LOST`；全场搜，`map→odom` 跳变过大则拒绝 |
+| `nis_lost_streak` | 8 | 连续 NIS 拒绝后进 `LOST`；全场搜，`map→odom` 跳变过大且门未超时放行则拒绝 |
 | `nis_prior_xy_std` / `nis_prior_yaw_std_deg` | 0.20 / 8.0 | 当前位姿先验，进创新协方差 |
 | `frontend_diverged_streak` | 5 | Hessian 满但匹配差连续这么多拍才进 `LOST` |
 
 **全局搜索**：`enable_global_search`、`global_search_max_map_odom_jump`、
+`lost_escape.enable` / `lost_escape.timeout_sec`（跳变门超时放行，见上）、
 `global_search_xy_step`、`global_search_yaw_step_deg`、
 `global_search_score_distance`、`global_search_score_stride`、`global_search_top_k`、
 `global_search_min_score_margin`、`global_search_refine_radius`、
 `global_search_refine_accumulate_frames`、`global_search_enable_temporal_verification`
-等，见 `config/fast_location_main.yaml` 内注释。
+等，见 `config/fast_location_main.yaml` 内注释。旧键 `lost_escape.grow_factor` /
+`lost_escape.max_jump_m` 已废弃（声明保留、判定忽略，传了会 WARN）。
 
 ## launch 接线
 
@@ -200,8 +220,9 @@ fov_far: 12.0, localization_rate_hz: 10.0, gicp_num_threads: 2, map_publish_rate
   导航容器同一条纪律。节点是独立进程，intra-process 本来也没收益。
 - **Hessian 管信息、NIS 管一致性**：条件数只说明观测有没有约束；过了几何质量后再算
   scan-to-map NIS。对外二态与 reason 见上「完整性契约」。不重置 small_glim、不加线程。
-  `LOST` 后走全局搜索（margin 拒歧义，跳变门拒对面角，时序校验第二帧才接受）。
-  `/initialpose` 自增 `reloc_generation_`。近处先验走局部 ICP；跳 > 4m 则 `LOST pose_prior_jump`，
+  `LOST` 后走全局搜索（margin 拒歧义，跳变门拒对面角——但 `lost_escape.timeout_sec`
+  超时后放行，时序校验第二帧才接受）。
+  `/initialpose` 自增 `reloc_generation_`。近处先验走局部 ICP；跳过大则 `LOST pose_prior_jump`，
   不把错误种子写进 `map→odom`。不要把 `OK nis_reject` 当停车。
 
 ## 设计取舍
@@ -210,5 +231,8 @@ fov_far: 12.0, localization_rate_hz: 10.0, gicp_num_threads: 2, map_publish_rate
   本工作区只有 fast_location 发 map→odom,整拍拒绝会让 TF 冻结、精度退回 LIO 开环漂移。
 - **每帧都跑 GICP 而非运动门控**：输入变化时 GICP 首轮即收敛,静止成本低;间断修正
   会变成低频大跳变,不如每帧高频小修正稳定。
+- **跳变门有超时，不是永久门**：门的作用是压"单拍跳变/锁错对称角"，不是保证"永不自愈"。
+  连续 `LOST` 超时后必须放行，否则锚点漂移时正确候选被永久拒绝（实测趴窝现场）。
+  防错锁的最终把关是 margin + 时序校验 + `first_localization_th`，三者都不通过就不写 TF。
 - **对外不广播中间态**：写门留在定位内部。下游只要「当前锁还能不能信」；`OBS_DEGRADED` / `SUSPECT` / `NORMAL`
   没有消费者按名字做事，已撤。也不要改成「只盯 `map→odom` 跳变」——跳变门看不到走廊投影、NIS 拒写、已锁错角。

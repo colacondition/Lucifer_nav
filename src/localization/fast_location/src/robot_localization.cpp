@@ -127,25 +127,28 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     enable_global_search_ = this->get_parameter("enable_global_search").as_bool();
     global_search_max_map_odom_jump_ = static_cast<float>(std::max(
         0.0, this->get_parameter("global_search_max_map_odom_jump").as_double()));
-    // LOST 渐进放宽：现场无人干预下的唯一自动逃生口。1m 基础门覆盖正常
-    // 降级（推算漂移 < 门限即可自愈）；连续 LOST 超 grace 后按倍数逐级放宽
-    // 到 max —— 应对 LIO 失效级漂移，避免「正确候选被永久拒绝而整车趴窝」。
-    // max 保持在对称角跳变之下，错锁风险仍被压制。
+    // 跳变门超时放行：现场无人干预下的唯一自动逃生口。门限内的正常降级由
+    // 基础门覆盖（推算漂移 < 门限即可自愈）；连续 LOST 超过 timeout_sec 后跳变门
+    // 整体放行 —— 应对 LIO 失效级漂移把锚点带偏、正确候选被永久拒绝的场景。
+    // 放行只作用于跳变门，候选仍须过 margin、GICP 精化 fitness 与时序校验。
     lost_escape_enable_ = this->declare_parameter<bool>("lost_escape.enable", false);
-    lost_escape_grace_sec_ = std::max(
-        1.0, this->declare_parameter<double>("lost_escape.grace_sec", 20.0));
-    lost_escape_grow_factor_ = std::max(
-        1.0f, static_cast<float>(this->declare_parameter<double>("lost_escape.grow_factor", 2.0)));
-    lost_escape_max_jump_m_ = static_cast<float>(std::max(
-        0.0, this->declare_parameter<double>("lost_escape.max_jump_m", 8.0)));
-    // 契约自检：放宽上限仍须显著小于场地尺度的一半对角线，否则渐进放宽
-    // 会重新打开「错锁对称角」的门（RMUL 对面角 ~11m）。
-    if (lost_escape_enable_ && lost_escape_max_jump_m_ > 4.0f) {
+    lost_escape_timeout_sec_ = std::max(
+        0.0, this->declare_parameter<double>("lost_escape.timeout_sec", 10.0));
+    // 兼容旧配置：grow_factor / max_jump_m 曾决定"逐级放宽"的倍率与上限，
+    // grace_sec 曾是放宽的起始延时。三者都已被超时放行取代，仍声明（避免外部
+    // -p 覆盖报 undeclared parameter）但不再参与判定。
+    const double legacy_grace_sec =
+        this->declare_parameter<double>("lost_escape.grace_sec", 0.0);
+    const double legacy_grow_factor =
+        this->declare_parameter<double>("lost_escape.grow_factor", 0.0);
+    const double legacy_max_jump_m =
+        this->declare_parameter<double>("lost_escape.max_jump_m", 0.0);
+    if (legacy_grace_sec > 0.0 || legacy_grow_factor > 0.0 || legacy_max_jump_m > 0.0) {
         RCLCPP_WARN(
             this->get_logger(),
-            "lost_escape.max_jump_m=%.1f exceeds the symmetric-venue safe band (<=4m); "
-            "verify against your arena's diagonal before enabling.",
-            lost_escape_max_jump_m_);
+            "lost_escape.grace_sec/grow_factor/max_jump_m are deprecated and ignored; "
+            "the jump gate now lifts entirely after lost_escape.timeout_sec (%.1fs).",
+            lost_escape_timeout_sec_);
     }
     global_search_config_.xy_step = std::max(
         0.1, this->get_parameter("global_search_xy_step").as_double());
@@ -677,13 +680,23 @@ bool RobotLocalizationNode::performGlobalSearch()
     Eigen::Matrix4f best_guess = selected.front().pcd_from_odom;
     Eigen::Matrix4f previous_map_odom = Eigen::Matrix4f::Identity();
     const float jump_limit = effectiveGlobalSearchJumpLimit();
+    const bool gate_advisory = jumpGateIsAdvisory();
     bool gate_map_odom_jump = false;
     {
         std::lock_guard<std::mutex> lock(tf_mutex_);
-        if (had_accepted_pose_ && jump_limit > 0.0f) {
+        // 超时放行时不再用上一拍锚点卡候选：锚点本身可能就是漂移后的错值。
+        if (had_accepted_pose_ && jump_limit > 0.0f && !gate_advisory) {
             previous_map_odom = T_pcd_to_odom_;
             gate_map_odom_jump = true;
         }
+    }
+    if (gate_advisory) {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Jump gate lifted after %.1fs in LOST (lost_escape.timeout_sec=%.1fs): "
+            "the previous map→odom anchor may itself be the drift; accepting the best "
+            "margin- and verification-passing candidate instead.",
+            (this->now() - lost_since_).seconds(), lost_escape_timeout_sec_);
     }
     int skipped_jump = 0;
     float best_jumped_fitness = 0.0f;
@@ -1002,9 +1015,10 @@ bool RobotLocalizationNode::acceptLocalizationResult(
             return false;
         }
         // 不限全局搜索：/initialpose 局部 ICP 锁对面角也是一次 map→odom 大跳。
+        // 跳变门超时放行后（连续 LOST 太久，锚点可能已被漂移带偏）不再拦结果，
+        // 否则正确候选会被永久拒绝，整车停在 LOST 不动。
         if (had_accepted_pose_ &&
-            fast_location::mapOdomJumpExceeds(
-                T_pcd_to_odom_, result, gs_jump_limit))
+            jumpGateBlocks(T_pcd_to_odom_, result))
         {
             rejected_jump = fast_location::mapOdomXyJump(T_pcd_to_odom_, result);
             jump_rejected = true;
@@ -1199,29 +1213,34 @@ PointCloudXYZI::Ptr RobotLocalizationNode::cachedOrDownsample(
     return filtered;
 }
 
-// LOST 渐进放宽后的有效跳变门。只在 lost_escape.enable 开启且确已进入
-// LOST 并超过 grace 后逐级放大；其余时刻与基础门完全一致。
-// 放宽只作用于召回门，不改变 EMA/锚点更新逻辑：接受仍需过 ICP 精化与时序校验。
+// 跳变门门限本身不随时间变化；"超时放行"由 jumpGateIsAdvisory 决定。
 float RobotLocalizationNode::effectiveGlobalSearchJumpLimit()
 {
-    const float base = global_search_max_map_odom_jump_;
-    if (!lost_escape_enable_ || base <= 0.0f || !lost_since_valid_) {
-        return base;
+    return global_search_max_map_odom_jump_;
+}
+
+// 跳变门是否已超时放行。只在 lost_escape.enable 开启且确已进入 LOST 超过
+// timeout_sec 后为真；其余时刻门照常生效。放行只作用于跳变门：候选仍须过
+// margin、逐级 GICP 精化（fitness > first_localization_th）与时序校验。
+bool RobotLocalizationNode::jumpGateIsAdvisory()
+{
+    if (!lost_escape_enable_ || !lost_since_valid_) {
+        return false;
     }
     const double lost_sec = (this->now() - lost_since_).seconds();
-    if (lost_sec < lost_escape_grace_sec_) {
-        return base;
+    return fast_location::jumpGateIsAdvisory(
+        lost_escape_enable_, lost_since_valid_, lost_sec, lost_escape_timeout_sec_);
+}
+
+// 跳变门是否应拦下这次结果。门限 <=0 表示关门；超时放行后一律不拦。
+bool RobotLocalizationNode::jumpGateBlocks(
+    const Eigen::Matrix4f & previous, const Eigen::Matrix4f & candidate)
+{
+    const float limit = global_search_max_map_odom_jump_;
+    if (limit <= 0.0f || jumpGateIsAdvisory()) {
+        return false;
     }
-    const int stages =
-        static_cast<int>((lost_sec - lost_escape_grace_sec_) / lost_escape_grace_sec_) + 1;
-    float widened = base;
-    for (int i = 0; i < stages; ++i) {
-        widened = std::min(widened * lost_escape_grow_factor_, lost_escape_max_jump_m_);
-        if (widened >= lost_escape_max_jump_m_) {
-            break;
-        }
-    }
-    return widened;
+    return fast_location::mapOdomJumpExceeds(previous, candidate, limit);
 }
 
 void RobotLocalizationNode::enterLost(const char * reason)
@@ -1851,13 +1870,21 @@ void RobotLocalizationNode::subInitPose(const geometry_msgs::msg::PoseStamped::S
         tf_ready_ = had_accepted_pose_;
         ema_initialized_ = false;
         pending_global_result_valid_ = false;
-        // LOST 渐进放宽同样作用于 /initialpose 种子门：搬场后远端种子在
-        // grace 期满后才能被接受——这正是逃生通道要开的那扇门。
+        // 跳变门超时放行同样作用于 /initialpose 种子门：搬场后远端种子在
+        // timeout 期满后才能被接受——这正是逃生通道要开的那扇门。
         prior_limit = effectiveGlobalSearchJumpLimit();
-        far_prior = had_accepted_pose_ &&
+        const bool prior_gate_advisory = jumpGateIsAdvisory();
+        far_prior = had_accepted_pose_ && !prior_gate_advisory &&
             fast_location::mapOdomJumpExceeds(
                 T_pcd_to_odom_, pcd_from_odom, prior_limit);
-        if (far_prior) {
+        if (prior_gate_advisory) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Jump gate lifted after %.1fs in LOST; accepting /initialpose seed "
+                "%.2f m away from the (possibly drifted) anchor.",
+                (this->now() - lost_since_).seconds(),
+                fast_location::mapOdomXyJump(T_pcd_to_odom_, pcd_from_odom));
+        } else if (far_prior) {
             prior_jump = fast_location::mapOdomXyJump(T_pcd_to_odom_, pcd_from_odom);
         }
         use_pose_prior_ = !far_prior;

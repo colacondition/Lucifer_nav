@@ -177,6 +177,9 @@ rm_minco_path_smoother:
     two_stage.max_scale: 1.5
     two_stage.samples_per_piece: 5
     two_stage.max_iterations: 300
+    # 两阶段的 v/a 极值检测：true = 多项式求根（精确，能看见段内尖峰）；
+    # false = 旧的每段等距采样（更省，但 5 个样本会低估峰值 10-20%）。
+    two_stage.exact_dynamics_check: true
 
     # 语义地图：隧道格的轴线用来在洞内给「偏离轴线」加软代价。收不到或图里没隧道时
     # 对齐项自动失效，退回纯几何平滑。
@@ -184,6 +187,58 @@ rm_minco_path_smoother:
     # 隧道内偏离轴线的软代价权重：每段加 w * (1 - |cos θ|)。防止平滑阶段在洞口把对着
     # 洞的走向拧成斜切。软代价而非硬约束（车是圆柱，朝向不影响能不能过）。设 0 关闭。
     tunnel_axis_weight: 5.0
+    # 隧道横向走廊软代价：路标点横向偏移超出 clear_width/2 - robot_radius 时加
+    # w * 超出量²。轴向项管「走向正不正」，这项管「别贴壁」—— 洞里斜着走一格就
+    # 吃掉横向余量，光有轴向项压不住。纵向不设界（路径要从洞两头穿出去）。
+    # 出洞后走廊按到洞口的距离线性放宽（喇叭形），L-BFGS 在洞口不会看到代价跳变。
+    # 权重 100 由 RMUL 实图扫描得到（tools/sfc_corridor_dump + render_corridor.py）：
+    # 同一条穿洞路径，洞内横向偏移 均值/最大 随权重变化为
+    #   0 -> 0.196/0.395   20 -> 0.115/0.310   50 -> 0.081/0.256
+    #   100 -> 0.067/0.215  200 -> 0.057/0.177  500 -> 0.041/0.130
+    # 取 100：居中效果相对 20 明显提升（均值降 42%），量级仍与数据项 10、轴向项 5
+    # 同档，且不会把轨迹从前端路径上扯开（走廊项只在隧道影响区内生效）。
+    #
+    # 注意**软惩罚给不了硬保证**：RMUL 隧道自由格宽 0.65 m、车体半径 0.25 m，
+    # 车心必须保持在轴线 ±0.075 m 内才不擦壁，而权重扫到 500 最大偏移仍有 0.13 m。
+    # 硬保证来自 global_check 的 SFC 校验 + repair 修复循环，不是这一项。
+    # 设 0 关闭。
+    tunnel_corridor_weight: 100.0
+    # 走廊查询用的隧道影响区边距，与 rm_global_costmap / rm_local_costmap 的
+    # tunnel_margin_m 同一取值，三处必须一起改。
+    tunnel_corridor.margin_m: 0.20
+    # 横向半宽 = max(0, clear_width/2 - robot_radius) + 本值。
+    # RMUL 两条隧道的 clear_width 都是 0.5 m，而代价地图 robot_radius 是 0.25 m，
+    # 相减恰好为 0 —— 车体直径等于净宽，物理余量为零。此时半宽 0 的含义是
+    # 「把车压在轴线上」，不是「没有约束」；调大本值会放宽成一条有宽度的走廊，
+    # 只有在实车量出的车体半径明显小于 0.25 m 时才需要。
+    tunnel_corridor.lateral_margin_m: 0.0
+
+    # —— 全图级安全校验（借鉴 TDT-nav-kit 的 SFC 走廊）——
+    # 现有发布前校验只覆盖 rm_local_costmap 的 5x5 m 滚动窗口，5 m 以外的全局障碍
+    # 对它不可见。这里从全局代价地图建「以采样点为中心的最大无致命格方形」，
+    # 半宽 < robot_radius 即拒绝。收不到全局代价地图时该项自动跳过（无法判定
+    # 不等于判为不可行），不报错。
+    global_check.enable: true
+    global_check.costmap_topic: /global_costmap/costmap
+    # 与 rm_global_costmap / rm_local_costmap 的 robot_radius 同源。
+    global_check.robot_radius: 0.25
+    # 单个走廊的最大半宽。只影响查询效率上界，不影响判定结果。
+    global_check.max_range: 2.5
+    # 必须与 rm_global_planner 的 obstacle_threshold 一致：不一致会把 A* 走过的
+    # 膨胀格判成不可行，整条轨迹被无条件拒绝。
+    global_check.obstacle_threshold: 100
+    # 与 rm_global_planner 的 allow_unknown 互补：allow_unknown=true 时这里必须 false。
+    global_check.unknown_is_lethal: false
+    # —— 有界迭代修复（借鉴 TDT-nav-kit 的碰撞迭代）——
+    # 校验失败不再立刻整条拒绝回退折线，而是先修复再重优化，预算用尽才回退。
+    # 第 1 次修复放大 data_weight（弱约束：压住偏离前端路径的自由度），第 2 次
+    # 在最偏离处插入路标点（强约束：给 L-BFGS 新自由度），交替。0 = 关闭，
+    # 回到历史行为。修复会叠加优化耗时，性能监控的 P95 是是否保留的判据。
+    repair.max_attempts: 2
+    # 插点修复的最小偏离阈值（m）：最差采样点离前端路径折线小于此值时不再插点，
+    # 避免在偏离可忽略的位置白白增加路标数。
+    repair.waypoint_spacing: 0.15
+
 
 rm_local_costmap:
   ros__parameters:
@@ -322,6 +377,16 @@ rm_mpc_controller:
     R: [0.1, 0.1]
     # 原先 Rd=[1.0, 0.05] 世界系 x 比 y 平滑一个数量级，沿场地 x 方向加速明显发闷。
     Rd: [0.15, 0.15]
+    # 速度上界语义。false = 逐分量 box |ux|,|uy| <= max_speed，对角方向实际
+    # 能跑到 sqrt(2)*max_speed（声明 2.0 的机器人斜 45° 会下发 2.83 —— 电控的
+    # 功率控制大概率把它削掉，MPC 的预测与实际不符，表现为跟踪误差）。
+    # true = 内接正八边形，||u||_2 <= max_speed 处处成立，轴向保留 92.4%
+    # （2.0 -> 1.85 m/s）。见 mpc_solver.hpp 头注释的推导。
+    #
+    # 默认 true：max_speed 声明的是「速度上限」，让实际值超出声明 41% 是缺陷
+    # 而不是特性。若团队当初就是按「每轴上限」在调参、想保留对角速度，
+    # 改回 false，或把 max_speed 提到 2.16（2.0/cos22.5°）再保持 true。
+    speed_norm.enforce: true
     # Odometry delay compensation (off by default; extrapolates pose over odom->now latency).
     delay_compensation.enable: false
     delay_compensation.max_dt: 0.5
@@ -335,7 +400,13 @@ rm_mpc_controller:
     local_safety.unknown_is_obstacle: true
     local_safety.costmap_timeout: 0.5
     # Check 1.0 s ahead; the 5 m rolling map cannot contain the full 3.0 s horizon at max speed.
-    local_safety.check_steps: 10
+    #
+    # 11 而不是 10：这是与 speed_norm.enforce 的耦合。check_steps 是**时间**窗
+    # （11 * predict_dt 0.1 = 1.1 s），而安全判据关心的是**距离**（要在撞上之前
+    # 发现障碍）。八边形把最大速度从 2.0 压到 1.85 m/s（0.924 倍），同样的 1.0 s
+    # 只看前 1.85 m 而不是 2.0 m —— 提前量少 7%。补到 11 步把距离拉回 2.03 m，
+    # 保持原有的安全提前量。改 speed_norm.enforce 时必须同步复核这个值。
+    local_safety.check_steps: 11
     local_safety.replan_topic: /navigation2/replan_request
     local_safety.replan_cooldown: 0.5
     # 隧道限速窗口。洞内的参考速度按 TunnelSpec 的 [velocity_min, velocity_max] 夹：

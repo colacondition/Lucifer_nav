@@ -80,6 +80,11 @@
     global_search_max_candidates: 2000000  # 候选硬上限：飞点/大图时自动加大步长防止 OOM
     global_search_yaw_step_deg: 30.0
     global_search_max_map_odom_jump: 1.0  # LOST 召回：map→odom XY 跳变上限；0=关门
+    # 跳变门超时放行：连续 LOST 超过该秒数后，跳变门不再拦候选（锚点可能已被
+    # 前端漂移带偏）。候选仍须过 margin、GICP 精化 fitness 与时序校验。
+    # 0 = 关闭（跳变门永久生效）。详版说明见 bringup/config/common/fast_location.yaml。
+    lost_escape.enable: true
+    lost_escape.timeout_sec: 10.0
     global_search_score_distance: 0.45
     global_search_score_stride: 4
     global_search_top_k: 6

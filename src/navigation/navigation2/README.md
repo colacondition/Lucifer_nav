@@ -25,9 +25,9 @@
 - `rm_map_server_node`：读取 `map/<world>.msgpack` 语义地图并发布 `/map`（占据栅格由 `terrain` 通道的 OBSTACLE 格推导；隧道等「能站但要摆姿态才能进」的先验在另一张语义通道里，不参与 /map 占据判定）。
 - `rm_global_planner_node`：订阅 `/goal_pose` 和 `/map`，生成 `/plan_raw`。含规划失败冷却、路径发布前验收和规划代次校验。
 - `rm_global_costmap_node`：订阅 `/map` 和 `/segmentation/obstacle`，发布全局代价地图。
-- `rm_minco_path_smoother_node`：用 MINCO L-BFGS 平滑 `/plan_raw` 并发布 `/plan`；段时间采用距离 + 转角固定预分配，障碍距离使用进程内 Signed ESDF 的二次插值梯度，详见 `MINCO_README.md`。
+- `rm_minco_path_smoother_node`：用 MINCO L-BFGS 平滑 `/plan_raw` 并发布 `/plan`；段时间采用距离 + 转角固定预分配，障碍距离使用进程内 Signed ESDF 的二次插值梯度，详见 `MINCO_README.md`。发布前做两道互补校验（全图 SFC 清障 + 局部距离场），失败先走有界修复再重优化，预算用尽才回退原始路径；相同输入几何去重不重优化。
 - `rm_local_costmap_node`：基于 `/segmentation/obstacle` 点云构建滚动局部代价地图。
-- `rm_mpc_controller_node`：使用 OSQP 跟踪路径，发布 `/cmd_vel_nav` 和 `/predict_path`。位置代价可按轨迹切向/法向旋转，优先压低窄通道横向误差，同时保持二维虚拟云台模型。内置接近减速、多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）和弧长域速度剖面。订阅 `/localization_status`：仅 `LOST` 停车等重定位、不进恢复链；`OK`（含 `nis_reject` 握住 TF、`projected` 走廊投影）不停；没收到过消息时不拦（`mapping_nav` / 测试）。
+- `rm_mpc_controller_node`：使用 OSQP 跟踪路径，发布 `/cmd_vel_nav` 和 `/predict_path`。位置代价可按轨迹切向/法向旋转，优先压低窄通道横向误差，同时保持二维虚拟云台模型。内置接近减速、多假设弧长进度跟踪、无进展/卡住检测、恢复链 FSM（倒车/安全点脱困）和弧长域速度剖面。订阅 `/localization_status`：仅 `LOST` 停车等重定位、不进恢复链；`OK`（含 `nis_reject` 握住 TF、`projected` 走廊投影）不停；没收到过消息时不拦（`mapping_nav` / 测试）。速度上界默认逐分量 box（对角可达 √2·max_speed），`speed_norm.enforce: true` 切到内接八边形把模长压回 max_speed。
 - `rm_velocity_smoother_node`：将 `/cmd_vel_nav` 限幅为 `/cmd_vel`（夹速度、死区、输入超时归零；不加减速斜坡）。
 - `fake_vel_transform`：同容器内将 `/cmd_vel` 转为底盘执行话题 `/cmd_vel_chassis`。
 - `rm_nav2_compat_node`：提供 `/navigate_to_pose` action，把 RViz Nav2 Goal 转成 `/goal_pose`。

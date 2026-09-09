@@ -364,6 +364,9 @@ public:
       "tracking_frame_weights.min_tangent_speed", 0.05);
     mp.R = declare_parameter<std::vector<double>>("R", std::vector<double>{0.1, 0.1});
     mp.Rd = declare_parameter<std::vector<double>>("Rd", std::vector<double>{1.0, 0.05});
+    // 速度上界语义。默认开 = 内接八边形，||u||_2 <= max_speed 处处成立；
+    // false = 历史的逐分量 box（对角能跑到 sqrt(2)*max_speed）。见 mpc_solver.hpp。
+    mp.enforce_speed_norm = declare_parameter<bool>("speed_norm.enforce", true);
     // 参数非法时回退到安全默认值而不是把节点带崩：负 steps 会在 configure()
     // 里转成巨大 resize，过短的 Q/R/Rd 会越界。configure() 本身也保留同样的
     // 库级校验作为第二道防线。

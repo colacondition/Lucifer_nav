@@ -88,37 +88,31 @@
 
     # ========== 全局重定位参数 ==========
     # 开机保证在家：走出生点局部 ICP。LOST 仍全场网格搜索；接受时
-    # map→odom XY 相对上一拍不能超过 max_map_odom_jump（默认 4m）。
-    # RMUL 对面角约 11m，跳过去会被丢掉。margin + 时序仍在。
+    # map→odom XY 相对上一拍不能超过 max_map_odom_jump。margin + 时序仍在。
     # 跳变门配 0 关闭。不加线程、不重置 small_glim。
     enable_global_search: true
     global_search_xy_step: 2.0
     global_search_max_candidates: 2000000  # 候选硬上限：飞点/大图时自动加大步长防止 OOM
     global_search_yaw_step_deg: 30.0
     global_search_max_map_odom_jump: 1.0
-    # LOST 渐进放宽 —— 现场无人干预下的唯一自动逃生口。
+    # 跳变门超时 —— 现场无人干预下的唯一自动逃生口。
     #
-    # 契约更新（2026-08）：比赛现场不允许任何人接触机器人。正常跟踪由 EMA/
-    # GICP 逐拍吸收（cm 级）；LOST 后若纯航位推算累计漂移仍 <1m，门内召回
-    # 自愈；若 LIO 已失效级漂移突破 1m，则正确候选永远被拒 -> 若无本机制即
-    # 整车静默趴窝到终局。
+    # 跳变门的判据是「候选位姿 vs 上一拍 map→odom」，前提是上一拍锚点大体正确。
+    # 前提被打破时（前端失效级漂移把锚点带偏，NIS 随后判 LOST）门就锁死：
+    # 全场搜能稳定找到 fitness≈1.0 的真值，却因为"离那个错锚点 6.9m"被逐次丢弃
+    # -> 永远停在 LOST。连续 LOST 超过 timeout_sec 即认定异常已确证（而非单拍
+    # 抖动/瞬时误拒），跳变门转为放行。
     #
-    # 放宽只发生在「连续 LOST 超 grace_sec」之后（异常已确证而非抖动），接受
-    # 仍需过逐级 GICP 精化与时序校验；max 封顶故意低于对称角跳变(~11m)，
-    # 保住"不会错锁对面角"的底线。风险对比：分级的有限放宽 vs 永久趴窝，
-    # 选前者。
+    # 放行不是降标准：候选仍须过粗搜/精搜打分、分差 margin、逐级 GICP 精化
+    # （fitness > first_localization_th）与时序校验。对称场地防错锁仍由 margin +
+    # 时序把关，跳变门只负责压"单拍跳变"，不该负责"永不自愈"。
+    #
+    # 历史坑：这里曾经出现重复的 `lost_escape.enable` 键（YAML 后者覆盖前者），
+    # 静默把逃生口关成 false；另一版是逐级放宽但 max_jump_m=6.0 < 实际跳变
+    # 6.94m，门永远开不够。故改用「超时放行」，不再依赖对跳变量级的猜测。
+    # 旧键 grace_sec / grow_factor / max_jump_m 已废弃（传了只 WARN，不生效）。
     lost_escape.enable: true
-    lost_escape.grace_sec: 10.0
-    lost_escape.grow_factor: 2.0
-    lost_escape.max_jump_m: 6.0
-    # 开启后：持续 LOST 超过 grace_sec 才开始放宽，每过一个 grace 周期
-    # 门限 ×grow_factor，直到 max_jump_m。max=8.0 仍低于 RMUL 对面角 ~11m，
-    # 不会重新打开「错锁对面角」的门；/initialpose 远端种子同受此门管辖，
-    # 搬场后 grace 期满即可用 initialpose 拉回。
-    lost_escape.enable: false
-    lost_escape.grace_sec: 20.0
-    lost_escape.grow_factor: 2.0
-    lost_escape.max_jump_m: 8.0
+    lost_escape.timeout_sec: 10.0
     global_search_score_distance: 0.45
     global_search_score_stride: 4
     global_search_top_k: 6

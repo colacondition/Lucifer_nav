@@ -3,12 +3,44 @@
 基于 ROSE 方案的 MINCO（Minimum Control Effort）轨迹优化器，用于平滑 A* 规划的路径。
 优化默认开启（`enable_optimization: true`），几何平滑 + 数据保持 + 隧道轴向对齐 + 进程内距离场障碍 soft 代价。
 
+在原有基础上引入了三件来自 TDT-nav-kit（MIT License，SnifferCaptain & Nathongc）的机制：
+**方形安全走廊（SFC）全图校验**、**有界迭代修复**、**隧道路标点横向走廊约束**。
+三者都不改变默认的优化器形式（仍是无约束 L-BFGS），只是把「软惩罚 + 事后整条拒绝」
+升级成「软惩罚 + 有界修复 + 双通道校验」。
+
+> **与 MPC 的参数耦合**：`speed_norm.enforce: true` 把 MPC 的轴向最大速度从
+> `max_speed` 压到 `0.924 * max_speed`，而 `local_safety.check_steps` 是**时间**
+> 窗、安全判据关心**距离**。两者必须一起改（当前 `check_steps: 11` 就是补偿
+> 2.0 → 1.85 m/s 后的取值）。改任一个都要复核另一个。
+
 ## 功能特性
 
 - **固定时间、形状优化**：L-BFGS 只优化内部路标点 XY，段时间不作为优化变量
 - **转角感知时间初值**：距离/速度基础上为急弯两侧增加过渡时间
 - **动力学连续性**：最小化 jerk（加加速度），保证轨迹平滑
 - **L-BFGS 优化**：高效的非线性优化求解器
+- **全图 SFC 校验**（`global_check.*`）：从全局代价地图建「以采样点为中心的最大
+  无致命格方形」，半宽 < `robot_radius` 即拒绝。补上局部 5×5 m 距离场看不到的
+  全局障碍盲区。实现见 `sfc_corridor.{hpp,cpp}`
+- **有界迭代修复**（`repair.*`）：校验失败先修复再重优化，预算用尽才回退。
+  第 1 次放大 `data_weight`（弱约束，压住偏离前端路径的自由度），第 2 次在最偏离
+  处插入路标点（强约束，给 L-BFGS 新自由度），与 TDT 的碰撞迭代同一思路
+- **几何去重**：全局规划器 5-8 Hz 重发同一条路径时不再重复跑 L-BFGS
+  （指纹 = 路径几何 FNV-1a + 语义地图代次；障碍距离场不进指纹，理由见代码注释）
+- **隧道横向走廊**（`tunnel_corridor_weight`，默认 20.0）：路标点横向偏移超出
+  `max(0, clear_width/2 - robot_radius) + lateral_margin` 时加 `w * 超出量²`，
+  出洞后按距离线性放宽（洞口喇叭形）。与轴向项互补：轴向项管「走向正不正」，
+  这项管「别贴壁」。
+  **RMUL 的真实情形是半宽恰好 0**：两条隧道的 `clear_width` 都是 0.5 m，而
+  代价地图的 `robot_radius` 是 0.25 m —— 车体直径等于净宽，物理余量为零。
+  半宽 0 的语义是「把车压在轴线上」，不是「没有约束」；`lateral_margin_m`
+  是唯一的放宽手段，只有实测车体半径明显小于 0.25 m 时才需要调大。
+  （最初的实现把半宽 <= 0 当成「给不了约束」直接返回，于是这项在真实地图上
+  静默失效 —— 参数看着打开了，一次都没触发过。已由
+  `test_semantic_map_consumer.cpp` 的真实地图用例钉死。）
+- **两阶段 v/a 精确检测**（`two_stage.exact_dynamics_check`）：用 MINCO 库已有的
+  多项式求根替代每段 5 点采样。5 阶多项式的速度是 4 次函数，5 个等距样本会漏掉
+  段内尖峰、把峰值低估 10-20%。放大后还会复核一次，超限只告警不改行为
 
 ## 架构说明
 
@@ -21,13 +53,25 @@
 
 2. **RmMincoPathSmoother** (`minco_path_smoother_node.cpp`)
    - ROS 2 节点封装
-   - 订阅原始路径 `/plan_raw`
+   - 订阅原始路径 `/plan_raw`、语义地图、全局代价地图
    - 发布优化后路径 `/plan`
 
 3. **MINCO 库** (`minco/minco.hpp`)
    - 来自 ROSE 的 MINCO 实现
    - 带状线性系统求解器
    - 梯度传播计算
+
+4. **SfcCorridor** (`sfc_corridor.{hpp,cpp}`)
+   - 方形安全走廊，移植自 TDT-nav-kit 的 `SfcSquare`
+   - 积分图实现 O(log r) 查询（TDT 原版逐格扩张是 O(r²)）
+   - 修复了 TDT 原版的 origin 符号不一致与 `FLT_MAX` 未定义行为
+
+5. **KinodynamicAstar** (`kinodynamic_astar.{hpp,cpp}`)
+   - 二维全向动力学可行搜索，移植自 TDT-nav-kit
+   - 无状态（grid 作入参），节点数有 `max_nodes` 上限
+   - 当前未接入任何运行链路：对全向底盘，恢复场景的短距低速机动用射线可达性
+     已经足够，硬塞进去只增加耗时与风险。留作「需要一条动力学可行局部段」时
+     的现成工具（如给 MPC 供初值、验证脱困点是否 maneuver 得过去）
 
 ### 与当前 path_smoother 的区别
 
@@ -86,7 +130,39 @@ ros2 run navigation2 rm_minco_path_smoother_node --ros-args --log-level debug
 # Color: 绿色（区分原始路径）
 ```
 
-### 3. 性能分析
+### 3. 重新出走廊图（换图后）
+
+走廊/轨迹的可视化是离线工具，换地图后重跑两条命令即可，不需要改代码 ——
+隧道几何完全由 `map/<world>.msgpack` 里的 `clear_width` 驱动：
+
+```sh
+source install/setup.bash
+ros2 run navigation2 sfc_corridor_dump \
+  src/bringup/map/<world>.msgpack <sx> <sy> <gx> <gy> /tmp/dump.json [corridor_weight]
+python3 install/navigation2/share/navigation2/tools/render_corridor.py \
+  src/bringup/map/<world>.msgpack /tmp/dump.json /tmp/viz
+```
+
+产出三张图（配色对齐 TDT-nav-kit 示例图：绿=前端化简路径、蓝框=SFC 走廊、
+红=MINCO 轨迹、品红=隧道本体、青线=隧道轴线）：
+
+| 文件 | 内容 |
+|---|---|
+| `sfc_corridor.png` | 全图：走廊框沿路径铺开 |
+| `sfc_corridor_tunnel.png` | 隧道附近放大，走廊项关/开对比 |
+| `sfc_corridor_demo.png` | 受控实验：把洞内路标点人为横移 0.2 m 后再看关/开 |
+
+RMUL 当前地图（净宽 0.5 m、车体半径 0.25 m）实测：洞内横向偏移均值从
+**0.196 m 降到 0.067 m**（`tunnel_corridor_weight: 100`）。注意软惩罚压不到
+「不擦壁」所需的 ±0.075 m（扫到权重 500 仍有 0.13 m），硬保证来自
+`global_check` 的 SFC 校验。已出好的图在 `docs/images/sfc_corridor*.png`。
+
+换图后的预期：走廊半宽 = `clear_width/2 - robot_radius`。净宽 0.8 m、车体半径
+0.25 m 时是 **0.15 m** —— 一条真正有宽度的走廊，不再是 RMUL 那种零宽情形，
+软惩罚的作用会更充分。几何全部由地图的 `clear_width` 驱动，换图不需要改代码。
+
+
+### 4. 性能分析
 
 如果优化时间过长（>100ms）：
 
@@ -94,7 +170,7 @@ ros2 run navigation2 rm_minco_path_smoother_node --ros-args --log-level debug
 2. **降低迭代次数**：修改 `lbfgs_params_.max_iterations`（默认 4000）
 3. **关闭优化**：设置 `enable_optimization: false` 作为 fallback
 
-### 4. 常见问题
+### 5. 常见问题
 
 **问题：优化失败，输出原始路径**
 

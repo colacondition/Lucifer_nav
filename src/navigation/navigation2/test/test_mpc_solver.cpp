@@ -106,5 +106,66 @@ TEST(MpcPathFrameWeights, RotatingReferenceRotatesCommand)
   EXPECT_NEAR(out_b.front().y(), expected.y(), 3e-3);
 }
 
+// enforce_speed_norm = true 时，QP 的解在任何方向上的模长都不得超过 max_speed。
+// 参考「斜 45°、参考速度远超上限」，旧 box 语义下解会贴到 (vmax, vmax)，
+// 模长 sqrt(2)*vmax；八边形语义下必须被压回 vmax 以内。
+TEST(MpcSpeedNorm, DiagonalSpeedCappedAtMaxSpeed)
+{
+  auto box_params = params(false);
+  auto norm_params = params(false);
+  // 显式打开历史语义：默认已是八边形，这里要对比的是被修掉的那个行为。
+  box_params.enforce_speed_norm = false;
+  norm_params.enforce_speed_norm = true;
+  MpcSolver box_solver;
+  MpcSolver norm_solver;
+  box_solver.configure(box_params);
+  norm_solver.configure(norm_params);
+
+  Eigen::MatrixXd xref(2, box_params.steps);
+  Eigen::MatrixXd uref(2, box_params.steps);
+  // 45° 方向、4.2 m/s 参考速度（模长已超 max_speed），box 语义下各分量饱和到
+  // vmax，模长 sqrt(2)*vmax。
+  for (int i = 0; i < xref.cols(); ++i) {
+    const double d = 4.2 * 0.1 * i;
+    xref.col(i) = Eigen::Vector2d(d * std::sqrt(0.5), d * std::sqrt(0.5));
+    uref.col(i) = Eigen::Vector2d(4.2 * std::sqrt(0.5), 4.2 * std::sqrt(0.5));
+  }
+  const Eigen::Vector2d initial(0.0, 0.0);
+
+  const auto box_out = box_solver.solve(xref, uref, initial, false);
+  const auto norm_out = norm_solver.solve(xref, uref, initial, false);
+  ASSERT_FALSE(box_out.empty());
+  ASSERT_FALSE(norm_out.empty());
+
+  const double limit = box_params.max_speed;
+  // 历史语义确实允许对角超速（这是要修的行为，先钉住它存在）。
+  EXPECT_GT(box_out.front().norm(), limit * 1.05);
+  // 八边形语义把模长压回声明值。
+  EXPECT_LE(norm_out.front().norm(), limit * (1.0 + 1e-6));
+  // 内接八边形保留 cos(22.5°) ≈ 0.924 的轴向能力，不该被压到过保守。
+  EXPECT_GE(norm_out.front().norm(), limit * 0.5);
+}
+
+// 轴向参考下八边形不应把速度压得过低：仍能逼近 max_speed 的 92% 以上。
+TEST(MpcSpeedNorm, AxialSpeedRetained)
+{
+  auto norm_params = params(false);
+  norm_params.enforce_speed_norm = true;
+  norm_params.max_accel = 50.0;
+  MpcSolver solver;
+  solver.configure(norm_params);
+
+  Eigen::MatrixXd xref(2, norm_params.steps);
+  Eigen::MatrixXd uref(2, norm_params.steps);
+  for (int i = 0; i < xref.cols(); ++i) {
+    xref.col(i) = Eigen::Vector2d(2.9 * 0.1 * i, 0.0);
+    uref.col(i) = Eigen::Vector2d(2.9, 0.0);
+  }
+  const auto out = solver.solve(xref, uref, Eigen::Vector2d::Zero(), false);
+  ASSERT_FALSE(out.empty());
+  EXPECT_NEAR(out.front().x(), norm_params.max_speed * 0.9238795, 0.05);
+  EXPECT_NEAR(out.front().y(), 0.0, 1e-6);
+}
+
 }  // namespace
 }  // namespace navigation2::mpc

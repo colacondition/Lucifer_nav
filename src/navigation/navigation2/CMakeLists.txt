@@ -171,6 +171,18 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_mpc_solver ${PROJECT_NAME})
 
+  # 方形安全走廊：origin 符号统一、积分图查询、ROS 占据语义的护栏。
+  ament_add_gtest(test_sfc_corridor
+    test/test_sfc_corridor.cpp
+  )
+  target_link_libraries(test_sfc_corridor ${PROJECT_NAME})
+
+  # 二维 Kinodynamic A*：动力学可行性、绕障、内存上界、非法输入拒绝。
+  ament_add_gtest(test_kinodynamic_astar
+    test/test_kinodynamic_astar.cpp
+  )
+  target_link_libraries(test_kinodynamic_astar ${PROJECT_NAME})
+
   # ROS 级集成测试：启真节点、喂合成话题、断言 FSM 行为。
   # gtest 只能覆盖纯函数；FSM 状态转移、接近段开关时序、
   # last_published_speed 是否真的驱动 ProgressMonitor 这些必须在节点层验证 ——
@@ -212,6 +224,14 @@ if(BUILD_TESTING)
   # 跟 LOST 用例共进程会被前面 latch 污染，缺省分支进不去。
   add_launch_test(test/test_integrity_gate_no_status.py TIMEOUT 90)
 endif()
+
+# 离线可视化工具（开发用，不参与运行链路）。只链接本包与 Eigen，不引入新依赖。
+# 产出 JSON，交给 tools/render_corridor.py 渲染成图。
+add_executable(sfc_corridor_dump tools/sfc_corridor_dump.cpp)
+target_link_libraries(sfc_corridor_dump ${PROJECT_NAME} Eigen3::Eigen)
+install(TARGETS sfc_corridor_dump DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY tools/ DESTINATION share/${PROJECT_NAME}/tools
+  FILES_MATCHING PATTERN "*.py")
 
 ament_auto_package(
   INSTALL_TO_SHARE

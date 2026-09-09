@@ -104,6 +104,39 @@ public:
   // 不能封死通道）。判据依旧与高度无关。
   bool pointOutsideCorridor(double world_x, double world_y) const noexcept;
 
+  // 世界坐标处可用于「路径硬约束」的走廊几何。
+  //
+  // 与 pointOutsideCorridor 的保护走廊不同：保护走廊用的是 clear_width/2 + margin
+  // （往外扩，为了把洞口的门楣点云也罩进去），这里是给平滑器/规划器约束**车体
+  // 中心**用的，横向半宽是 clear_width/2 - robot_radius + lateral_margin（往里
+  // 收，保证圆形车体不擦壁）。两者方向相反，绝不能混用。
+  //
+  // 关于「半宽恰好为 0」：这不是退化，是**真实地图的常态**。RMUL 两条隧道的
+  // clear_width 都是 0.5 m，而代价地图的 robot_radius 是 0.25 m —— 车体直径
+  // 正好等于净宽，物理余量为零。此时的正确约束不是「放弃约束」，而是
+  // 「把车压在轴线上」（半宽 0 的走廊就是轴线本身）。所以这里对负值钳到 0 而
+  // 不是返回 false：钳到 0 让约束生效，返回 false 会让整个特性在真实地图上
+  // 静默失效。
+  //
+  // 纵向不设界：路径要穿过隧道，纵向越界是正常的（车要从洞两头出去），
+  // 只有横向偏移才是要压住的对象。
+  struct CorridorFrame
+  {
+    Eigen::Vector2d centroid{0.0, 0.0};  // 本体格质心（世界系）
+    Eigen::Vector2d dir{1.0, 0.0};       // 单位轴向（无向）
+    double half_len{0.0};                // 纵向半长：|along| <= half_len 时算洞内
+    double half_width_inner{0.0};        // 横向半宽（物理），可为 0（= 压轴线）
+    // 影响区的横向外沿：clear_width/2 + margin_m。|lat| 超过它就不再属于这条隧道
+    // 的影响区，惩罚项据此把代价平滑地封顶，而不是在边界上跳变。
+    double lateral_outer{0.0};
+  };
+
+  // 返回 false 只表示「这条隧道的轴不可用」：不在任何隧道影响区内、轴表为空、
+  // 或轴退化（half_len <= 0，单格/共线秩亏）。此时调用方应跳过，不要编造约束。
+  bool corridorFrameAtPoint(
+    double world_x, double world_y, double robot_radius, double lateral_margin,
+    CorridorFrame & out) const noexcept;
+
 private:
   struct CorridorAxis
   {
