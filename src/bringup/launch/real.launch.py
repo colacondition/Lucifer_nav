@@ -44,6 +44,7 @@ def generate_launch_description():
     use_decision = LaunchConfiguration('use_decision')
     mapping_nav = LaunchConfiguration('mapping_nav')
     perception_threads = LaunchConfiguration('perception_threads')
+    dual_lidar = LaunchConfiguration('dual_lidar')
 
     # 建图模式下可选再跑导航（SLAM-navigation）：map 帧与 /map 由 slam_toolbox 边扫边
     # 发，语义地图缺席（还没有 .msgpack 可读），隧道相关逻辑全部退化失效，仅作普通
@@ -81,13 +82,35 @@ def generate_launch_description():
     mapper_params = os.path.join(common_config_dir, 'mapper.yaml')
     lidar_filter_params = os.path.join(common_config_dir, 'lidar_filter.yaml')
     cloud_to_scan_params = os.path.join(common_config_dir, 'pointcloud_to_laserscan.yaml')
+    cloud_to_scan_env_params = os.path.join(reality_config_dir, 'pointcloud_to_laserscan.yaml')
     waypoint_executor_params = os.path.join(common_config_dir, 'waypoint_executor.yaml')
     decision_params = os.path.join(common_config_dir, 'decision.yaml')
     serial_driver_params = os.path.join(reality_config_dir, 'serial_driver.yaml')
     small_glim_common_params = os.path.join(common_config_dir, 'small_glim.yaml')
     small_glim_params = os.path.join(reality_config_dir, 'small_glim_real.yaml')
-    mid360_driver_params = os.path.join(
+    # 单雷达 / 双雷达（驱动层融合）两套参数。双雷达那套的 lidar_topic 与单雷达
+    # 完全相同，所以 cpp_lidar_filter / small_glim / 两套 costmap 都不用改。
+    single_driver_params = os.path.join(
         bringup_dir, 'config', 'reality', 'mid360_driver_real.yaml')
+    dual_driver_params = os.path.join(
+        bringup_dir, 'config', 'reality', 'mid360_driver_dual.yaml')
+    mid360_driver_params = PythonExpression([
+        "'", dual_driver_params, "'",
+        " if '", dual_lidar, "' == 'true' else ",
+        "'", single_driver_params, "'",
+    ])
+
+    # 双雷达模式下给副雷达补一条 base_link -> livox_frame_b 静态 TF（纯可视化/排障用；
+    # 融合后的点云在 livox_frame 里，不依赖这条 TF）。外参直接从驱动参数里读，
+    # 保证"标定值只有一个来源"。
+    try:
+        with open(dual_driver_params, 'r') as f:
+            _dual = yaml.safe_load(f)
+        _ext = _dual['/**']['ros__parameters'][
+            'merge_extrinsic_secondary_to_primary']
+    except Exception as exc:  # 文件还没装/格式变了都不该让整条 launch 挂掉
+        print(f'[real.launch.py] 读不到双雷达外参，跳过 livox_frame_b 静态 TF：{exc}')
+        _ext = None
     # 与 sim.launch.py 保持一致：mapping 模式没有 map 帧，用专门的 mapping.rviz
     # （Fixed Frame=odom）。建图 + 导航（mapping_nav）用 mapping_nav.rviz：
     # Fixed Frame 取 map（slam_toolbox 发），带 GoalTool 和 /map，保留 /Laser_map（odom 系）。
@@ -133,12 +156,22 @@ def generate_launch_description():
     # 新世界的文件只落在 install/ 里，下次 colcon build 就没了，要自己拷回源码。
     declare_map_save_dir = DeclareLaunchArgument(
         'map_save_dir', default_value=os.path.join(bringup_dir, 'PCD'))
+    # 建图时把每个关键帧的 IMU 系点云 + 位姿（frame_<idx>.pcd / poses.txt）落到
+    # map_save_dir，供离线清动态残影工具 tools/clean_map_dynamic.py 使用。
+    # 只在 mode:=mapping 下有意义；默认关，避免平时建图多写一堆文件。
+    declare_save_keyframes = DeclareLaunchArgument(
+        'save_keyframes', default_value='False',
+        description='建图时保存关键帧点云+位姿，供离线清残影')
     # 串口是实车链路的终点：它订阅 /cmd_vel_chassis 下发底盘速度，并把裁判系统
     # 的 robot_status / game_status 喂给决策节点。没有它，导航算出的速度无人接收。
     # 默认开启；缺少串口设备时用 use_serial_driver:=False 关掉。
     declare_use_serial_driver = DeclareLaunchArgument(
         'use_serial_driver', default_value='True',
         description='Start serial_driver (chassis cmd downlink + referee uplink)')
+    declare_dual_lidar = DeclareLaunchArgument(
+        'dual_lidar', default_value='false',
+        description='双 MID360（驱动层融合）：用 mid360_driver_dual.yaml，'
+                    '对外仍是 /livox/lidar/pointcloud 一个话题')
     declare_use_decision = DeclareLaunchArgument(
         'use_decision', default_value='True',
         description='Start the decision node (needs serial_driver for referee data)')
@@ -177,6 +210,10 @@ def generate_launch_description():
         package='small_glim',
         executable='small_glim_node',
         output='log',
+        # PCL 1.12 的 libpcl_io 需要预加载较新的 libusb，否则 dlopen 失败：
+        #   "undefined symbol: libusb_set_option" → class_loader 抛异常 → SIGABRT。
+        # 本机（以及很多 22.04 + PCL 1.12 的机器）都会中招，与单/双雷达无关。
+        additional_env=system_libusb_env,
         parameters=[
             small_glim_common_params,
             small_glim_params,
@@ -185,6 +222,8 @@ def generate_launch_description():
                 'node.enable_mapping': lio_save_map,
                 'mapping.output_dir': LaunchConfiguration('map_save_dir'),
                 'mapping.map_name': lio_map_name,
+                'mapping.save_raw_mapping_frames':
+                    LaunchConfiguration('save_keyframes'),
             },
         ],
         arguments=common_log_arguments)
@@ -234,7 +273,7 @@ def generate_launch_description():
             ('cloud_in', '/segmentation/obstacle'),
             ('scan', '/scan'),
         ],
-        parameters=[cloud_to_scan_params, {'use_sim_time': use_sim_time}],
+        parameters=[cloud_to_scan_params, cloud_to_scan_env_params, {'use_sim_time': use_sim_time}],
         arguments=common_log_arguments)
 
     slam_mapping_node = Node(
@@ -334,6 +373,11 @@ def generate_launch_description():
         for target in (
             'patrol', 'center', 'wait_center', 'home', 'wait_home', 'wait_hp')
     }
+    # 中心占领区四个角点。⚠️ 文件名是 **range.csv**，不是 zone.csv ——
+    # 参数名叫 zone_waypoint_file，但航点文件是录的时候起的名，这里显式对上，
+    # 不要靠 f'{target}.csv' 去推（推出来会是 zone.csv，读不到）。
+    decision_waypoint_files['targets.zone_waypoint_file'] = PathJoinSubstitution(
+        [waypoints_share, 'waypoints', 'RMUL', 'range.csv'])
     decision_node = Node(
         condition=IfCondition(use_decision),
         package='decision',
@@ -361,15 +405,31 @@ def generate_launch_description():
         arguments=['-d', rviz_config, '--ros-args', '--log-level', log_level],
         condition=IfCondition(use_nav_rviz))
 
+    base_link_to_livox_b = None
+    if _ext is not None and len(_ext) == 6:
+        base_link_to_livox_b = Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='base_link2livox_frame_b',
+            output='log',
+            arguments=[
+                '--x', f'{_ext[0]}', '--y', f'{_ext[1]}', '--z', f'{_ext[2]}',
+                '--roll', f'{_ext[3]}', '--pitch', f'{_ext[4]}', '--yaw', f'{_ext[5]}',
+                '--frame-id', 'base_link', '--child-frame-id', 'livox_frame_b',
+            ],
+            condition=IfCondition(dual_lidar))
+
     ld = LaunchDescription()
     for action in [
         declare_world, declare_mode, declare_mapping_nav, declare_use_sim_time,
         declare_nav_rviz, declare_log_level, declare_node_output,
         declare_perception_threads,
-        declare_waypoint_file, declare_map_save_dir,
+        declare_waypoint_file, declare_map_save_dir, declare_save_keyframes,
         declare_use_serial_driver, declare_use_decision,
+        declare_dual_lidar,
         robot_state_pub,
         lidar_driver,
+        *([base_link_to_livox_b] if base_link_to_livox_b is not None else []),
         lio_node,
         perception_container,
         *make_perception_load_actions(),

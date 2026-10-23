@@ -1,3 +1,5 @@
+// Copyright (c) 2026 colacondition
+// Licensed under the MIT License. See LICENSE in the project root.
 #ifndef FAKE_VEL_TRANSFORM__FAKE_VEL_TRANSFORM_HPP_
 #define FAKE_VEL_TRANSFORM__FAKE_VEL_TRANSFORM_HPP_
 
@@ -8,13 +10,16 @@
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <memory>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/publisher.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/subscription.hpp>
+#include <string>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include "fake_vel_transform/monotonic_stamp_gate.hpp"
+#include "fake_vel_transform/velocity_transform.hpp"
 
 namespace fake_vel_transform
 {
@@ -54,9 +59,7 @@ private:
   bool have_path_yaw_{false};
   double path_lookahead_distance_{0.8};
   double yaw_filter_alpha_{0.25};
-  float angular_deadband_{0.05F};
-  float min_translate_speed_for_spin_{0.15F};
-  float spin_speed_{0.0F};
+  // 本工程模型 = 可平移的运动云台：节点只做坐标变换，不建模/注入底盘自旋。
 };
 
 }  // namespace fake_vel_transform

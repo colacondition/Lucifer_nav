@@ -974,7 +974,8 @@ private:
     geometry_msgs::msg::Twist cmd;
     cmd.linear.x = std::cos(yaw) * v_world.x() + std::sin(yaw) * v_world.y();
     cmd.linear.y = -std::sin(yaw) * v_world.x() + std::cos(yaw) * v_world.y();
-    // 恢复期保留 default_wz_：哨兵的小陀螺由这个参数驱动，脱困时不该停转。
+    // 恢复期同样下发 default_wz_（虚拟云台模型恒 0；不做底盘小陀螺，
+    // 角速度指令由 fake_vel_transform 原样透传）。
     cmd.angular.z = default_wz_;
     cmd_pub_->publish(cmd);
     last_published_speed_ = v_world.norm();

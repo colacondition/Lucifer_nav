@@ -225,7 +225,8 @@ void PointCloudToLaserScanNode::cloudCallback(
     }
 
     // overwrite range at laserscan ray if new range is smaller
-    const uint32_t index = static_cast<uint32_t>((angle - scan_msg->angle_min) / scan_msg->angle_increment);
+    const uint32_t index =
+      static_cast<uint32_t>((angle - scan_msg->angle_min) / scan_msg->angle_increment);
     if (index >= ranges_size_) {
       continue;
     }

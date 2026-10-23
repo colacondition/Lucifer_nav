@@ -44,8 +44,23 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     this->declare_parameter<bool>("global_search_enable_temporal_verification", true);
     this->declare_parameter<float>("global_search_temporal_min_score", 0.30);
     this->declare_parameter<int>("tracking_failures_before_global_search", 5);
+    // Scan Context 重定位（可选）：LOST 后先用描述子召回候选 + yaw 初值，
+    // 再走现有 GICP 精化 + margin + 时序校验；召回不足自动回退全场网格搜索。
+    this->declare_parameter<bool>("enable_scan_context", false);
+    this->declare_parameter<std::string>("scan_context_map_path", "");
+    this->declare_parameter<int>("scan_context_top_k", 15);
+    this->declare_parameter<int>("scan_context_min_candidates", 2);
     this->declare_parameter<bool>("enable_nis", true);
     this->declare_parameter<double>("nis_reject_threshold", 12.0);
+    // χ² 版 NIS（默认）：退化时不再跳过一致性检验，按可观测子空间降秩算 NIS，
+    // dof=观测秩、用 χ² 上尾概率判拒。nis_use_chi2=false 退回旧固定阈值行为。
+    this->declare_parameter<bool>("nis_use_chi2", true);
+    this->declare_parameter<double>("nis_rejection_probability", 1e-3);
+    this->declare_parameter<double>("nis_observable_eigen_ratio", 1e-3);
+    // 首配/全局重定位位姿门：平移秩下限（实际取 max(2, 该值)）。
+    this->declare_parameter<int>("min_observable_rank", 2);
+    // 首配/全局重定位是否要求完整位姿（平移秩≥2 且 yaw 可观测）才写 TF。
+    this->declare_parameter<bool>("require_full_pose_on_init", true);
     this->declare_parameter<int>("nis_lost_streak", 8);
     this->declare_parameter<double>("nis_prior_xy_std", 0.20);
     this->declare_parameter<double>("nis_prior_yaw_std_deg", 8.0);
@@ -193,8 +208,23 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
         0.0f, 1.0f);
     tracking_recovery_ = fast_location::TrackingRecovery(static_cast<std::size_t>(std::max<int64_t>(
         1, this->get_parameter("tracking_failures_before_global_search").as_int())));
+    enable_scan_context_ = this->get_parameter("enable_scan_context").as_bool();
+    scan_context_map_path_ = this->get_parameter("scan_context_map_path").as_string();
+    scan_context_top_k_ = std::clamp(
+        static_cast<int>(this->get_parameter("scan_context_top_k").as_int()), 1, 100);
+    scan_context_min_candidates_ = std::clamp(
+        static_cast<int>(this->get_parameter("scan_context_min_candidates").as_int()), 1, 100);
     enable_nis_ = this->get_parameter("enable_nis").as_bool();
     nis_reject_threshold_ = this->get_parameter("nis_reject_threshold").as_double();
+    nis_use_chi2_ = this->get_parameter("nis_use_chi2").as_bool();
+    nis_rejection_probability_ = std::clamp(
+        this->get_parameter("nis_rejection_probability").as_double(), 1e-12, 0.5);
+    nis_observable_eigen_ratio_ = std::clamp(
+        this->get_parameter("nis_observable_eigen_ratio").as_double(), 1e-9, 0.5);
+    min_observable_rank_ = std::clamp(
+        static_cast<int>(this->get_parameter("min_observable_rank").as_int()), 1, 3);
+    require_full_pose_on_init_ =
+        this->get_parameter("require_full_pose_on_init").as_bool();
     nis_lost_streak_ = static_cast<int>(std::max<int64_t>(
         1, this->get_parameter("nis_lost_streak").as_int()));
     nis_prior_xy_std_ = std::max(1e-3, this->get_parameter("nis_prior_xy_std").as_double());
@@ -346,6 +376,29 @@ RobotLocalizationNode::RobotLocalizationNode(const rclcpp::NodeOptions & options
     kdtree_global_map.reset(new pcl::KdTreeFLANN<Point>);
     kdtree_global_map->setInputCloud(global_map_);
     RCLCPP_DEBUG(this->get_logger(), "KdTree built successfully!");
+
+    // Scan Context 库在全局地图加载后按需加载；失败不影响主链路（回退网格搜索）。
+    if (enable_scan_context_) {
+        if (scan_context_map_path_.empty()) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "enable_scan_context=true but scan_context_map_path is empty; "
+                "fallback to planar grid global search.");
+            enable_scan_context_ = false;
+        } else if (!scan_context_db_.load(scan_context_map_path_)) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Failed to load Scan Context database '%s'; fallback to planar grid global search.",
+                scan_context_map_path_.c_str());
+            enable_scan_context_ = false;
+        } else {
+            const auto & sc = scan_context_db_.config();
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Scan Context database loaded: %zu entries, %d rings x %d sectors, max_radius=%.1fm",
+                scan_context_db_.size(), sc.rings, sc.sectors, sc.max_radius);
+        }
+    }
 
     // 地图加载完成后再启动全局地图发布。
     map_publish_timer = this->create_wall_timer(
@@ -599,14 +652,55 @@ bool RobotLocalizationNode::performGlobalSearch()
     odom_from_base.block<3,1>(0,3) = Eigen::Vector3f(p.x, p.y, p.z);
 
     std::vector<Eigen::Matrix4f> candidates;
-    try {
-        candidates = fast_location::generatePlanarCandidates(
-            fast_location::computePlanarBounds(*global_map_),
-            odom_from_base,
-            global_search_config_);
-    } catch (const std::exception &error) {
-        RCLCPP_ERROR(this->get_logger(), "Cannot generate global search candidates: %s", error.what());
-        return false;
+    bool scan_context_used = false;
+    if (enable_scan_context_ && !scan_context_db_.empty()) {
+        // Scan Context 描述子需要 odom 系点云；base 模式先转到 odom。
+        PointCloudXYZI::Ptr scan_odom = scan_for_icp;
+        if (scan_input_frame_mode_ == "base") {
+            scan_odom.reset(new PointCloudXYZI);
+            pcl::transformPointCloud(*scan_for_icp, *scan_odom, odom_from_base);
+        }
+        const auto sc_candidates = scan_context_db_.query(
+            *scan_odom, odom_from_base, scan_context_top_k_);
+        if (!sc_candidates.empty()) {
+            const Eigen::Matrix4f base_from_odom = odom_from_base.inverse();
+            candidates.reserve(sc_candidates.size());
+            for (const auto &candidate : sc_candidates) {
+                Eigen::Matrix4f map_from_base = Eigen::Matrix4f::Identity();
+                map_from_base.block<3, 3>(0, 0) =
+                    Eigen::AngleAxisf(candidate.yaw_rad, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+                map_from_base(0, 3) = candidate.position.x();
+                map_from_base(1, 3) = candidate.position.y();
+                // 与网格搜索同一语义：候选 = T_map_base * T_base_odom。
+                candidates.push_back(map_from_base * base_from_odom);
+            }
+        }
+        if (static_cast<int>(candidates.size()) < scan_context_min_candidates_) {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 3000,
+                "Scan Context retrieval returned %zu candidates (< %d); fallback to planar grid search.",
+                candidates.size(), scan_context_min_candidates_);
+            candidates.clear();
+        } else {
+            scan_context_used = true;
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Scan Context retrieval: %zu candidates (top distance=%.3f, yaw range=[%.1f, %.1f] deg).",
+                candidates.size(), sc_candidates.front().distance,
+                sc_candidates.front().yaw_rad * 180.0 / M_PI,
+                sc_candidates.back().yaw_rad * 180.0 / M_PI);
+        }
+    }
+    if (!scan_context_used) {
+        try {
+            candidates = fast_location::generatePlanarCandidates(
+                fast_location::computePlanarBounds(*global_map_),
+                odom_from_base,
+                global_search_config_);
+        } catch (const std::exception &error) {
+            RCLCPP_ERROR(this->get_logger(), "Cannot generate global search candidates: %s", error.what());
+            return false;
+        }
     }
 
     // 先把扫描点云稀疏一点，减少粗搜开销。
@@ -936,16 +1030,51 @@ bool RobotLocalizationNode::globalLocalization(const Eigen::Matrix4f &pose_guess
 
     if(fitness > th)
     {
-        if (!first_localization_ && enable_nis_ && !last_assessment_.is_degenerate) {
-            const auto nis = fast_location::computeScanToMapNis(
-                pose_guess, T_final, last_hessian_,
-                nis_prior_xy_std_, nis_prior_yaw_std_);
-            if (nis.valid && nis.value > nis_reject_threshold_) {
-                handleInconsistentObservation(nis.value);
-                degeneracy_recovery_ = false;
-                coarse_escape_ = false;
-                return false;
+        // 一致性检验（scan-to-map NIS）。只在跟踪期做：首配/重定位的
+        // pose_guess 可能是出生点或漂移后的错锚点，拿"上一拍"当先验做 NIS
+        // 会把正确候选拒掉（lost_escape 的教训）；首配/重定位的验收交给
+        // require_full_pose_on_init 的完整位姿门。
+        //
+        // χ² 模式（默认）：退化时**不再跳过** NIS。computeScanToMapNisProjected
+        // 只保留 H3 的可观测子空间，退化方向（走廊沿向）既不参与白化也不参与
+        // 判拒，dof = 可观测秩，门限由 χ² 上尾概率反解，随 dof 自适应。
+        //
+        // nis_use_chi2=false：回退旧行为（退化跳过、固定阈值 12），用于现场快速回退。
+        bool nis_rejected = false;
+        double nis_value = -1.0;
+        double nis_threshold = nis_reject_threshold_;
+        double nis_upper_tail = -1.0;
+        if (enable_nis_ && !first_localization_) {
+            if (nis_use_chi2_) {
+                const auto nis = fast_location::computeScanToMapNisProjected(
+                    pose_guess, T_final, last_hessian_,
+                    nis_prior_xy_std_, nis_prior_yaw_std_,
+                    nis_observable_eigen_ratio_);
+                if (nis.valid) {
+                    nis_value = nis.value;
+                    nis_upper_tail = nis.upper_tail;
+                    nis_threshold = fast_location::chiSquareThreshold(
+                        nis.dof, nis_rejection_probability_);
+                    nis_rejected =
+                        nis.upper_tail < nis_rejection_probability_ ||
+                        (nis_threshold > 0.0 && nis.value > nis_threshold);
+                }
+            } else if (!last_assessment_.is_degenerate) {
+                // 旧行为：退化方向跳过（避免 H3 奇异逆爆炸）。
+                const auto nis = fast_location::computeScanToMapNis(
+                    pose_guess, T_final, last_hessian_,
+                    nis_prior_xy_std_, nis_prior_yaw_std_);
+                if (nis.valid) {
+                    nis_value = nis.value;
+                    nis_rejected = nis.value > nis_reject_threshold_;
+                }
             }
+        }
+        if (nis_rejected) {
+            handleInconsistentObservation(nis_value, nis_threshold, nis_upper_tail);
+            degeneracy_recovery_ = false;
+            coarse_escape_ = false;
+            return false;
         }
         nis_conflict_streak_ = 0;
         frontend_diverged_streak_ = 0;
@@ -996,6 +1125,27 @@ bool RobotLocalizationNode::acceptLocalizationResult(
     const std::chrono::high_resolution_clock::time_point &start_time,
     bool global_search_result)
 {
+    // 首配/全局重定位完整位姿门（require_full_pose_on_init）：必须拿到
+    // 平移秩≥2 且 yaw 可观测的位姿才允许写第一帧 map→odom。部分可观测的初值
+    // （走廊里沿走廊方向无约束、或旋转退化）写进去后，缺失方向全靠 LIO 开环，
+    // 后续 NIS / 投影都很难纠正。宁可继续 LOST 等一个几何更好的帧。
+    // 注意：只拦首配/重定位；正常跟踪不走这里（保持既有 OK/LOST 语义）。
+    if (require_full_pose_on_init_ && (first_localization_ || global_search_result) &&
+        !initPoseIsFullyObservable())
+    {
+        const auto & six = last_assessment_.six_dof;
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "First/global localization rejected: pose only partially observable "
+            "(six_dof_valid=%d, translation_rank=%d (need %d), yaw_observable=%d, "
+            "yaw_information=%.1f); withholding map→odom, reason init_partial_pose.",
+            static_cast<int>(six.valid), six.translation_rank,
+            std::max(2, min_observable_rank_),
+            static_cast<int>(six.yaw_observable), six.yaw_information);
+        enterLost("init_partial_pose");
+        return false;
+    }
+
     // 出洞/几何恢复拍用高 α 快速收敛：退化期间沿退化轴交回 LIO，LIO 累积的
     // 漂移在几何恢复后由 ICP 一次性找回；若仍走 0.7 的 EMA 会抹成数秒爬行。
     // 保留少量平滑（recovery_alpha_≈0.95）防止本拍单点噪声完全外露成抖动。
@@ -1298,17 +1448,40 @@ void RobotLocalizationNode::publishIntegrityState(
     pub_localization_status_->publish(msg);
 }
 
-void RobotLocalizationNode::handleInconsistentObservation(double nis)
+void RobotLocalizationNode::handleInconsistentObservation(
+    double nis, double threshold, double upper_tail)
 {
     ++nis_conflict_streak_;
+    // reason 词表保持不变（下游按 "nis_reject" 识别短暂拒写，不当作停车）。
     publishIntegrityState(fast_location::IntegrityState::OK, "nis_reject");
-    RCLCPP_WARN_THROTTLE(
-        this->get_logger(), *this->get_clock(), 1000,
-        "Scan-to-map NIS %.1f > %.1f (streak %d); holding map→odom.",
-        nis, nis_reject_threshold_, nis_conflict_streak_);
+    if (upper_tail >= 0.0) {
+        // χ² 模式：同时给出 dof 自适应的门限与上尾概率，便于现场判断是
+        // "NIS 略超门限"还是"几乎不可能一致"。
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 1000,
+            "Projected scan-to-map NIS %.2f > χ² threshold %.2f (upper tail %.3g < %.1e, "
+            "streak %d); holding map→odom.",
+            nis, threshold, upper_tail, nis_rejection_probability_, nis_conflict_streak_);
+    } else {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 1000,
+            "Scan-to-map NIS %.1f > %.1f (streak %d); holding map→odom.",
+            nis, threshold, nis_conflict_streak_);
+    }
     if (nis_conflict_streak_ >= nis_lost_streak_) {
         enterLost("nis_lost");
     }
+}
+
+bool RobotLocalizationNode::initPoseIsFullyObservable() const
+{
+    const auto & six = last_assessment_.six_dof;
+    if (!six.valid) {
+        return false;
+    }
+    // 平移秩：平面机器人至少约束住 2 个方向；min_observable_rank 只允许更严。
+    const int required_rank = std::max(2, min_observable_rank_);
+    return six.translation_rank >= required_rank && six.yaw_observable;
 }
 
 void RobotLocalizationNode::handleFrontendDiverged()
@@ -1423,7 +1596,8 @@ Eigen::Matrix4f RobotLocalizationNode::runICP(PointCloudXYZI::Ptr src, PointClou
     auto fitness_start = std::chrono::high_resolution_clock::now();
     const auto assessment = fast_location::assessAlignment(
         converged, aligned, tgt_filtered, 1.5f * voxel_scale,
-        static_cast<float>(degenerate_condition_threshold_), &hessian);
+        static_cast<float>(degenerate_condition_threshold_), &hessian,
+        nis_observable_eigen_ratio_);
     if (!assessment.usable) {
         fitness_score = 0.0f;
         last_assessment_ = assessment;

@@ -130,7 +130,29 @@
     global_search_enable_temporal_verification: true
     global_search_temporal_min_score: 0.30
     tracking_failures_before_global_search: 5
+    # Hessian 只管“有没有信息”；过几何质量后再算 NIS 管“和当前 map→odom 是否一致”。
+    #
+    # 默认 χ² 模式：退化时不再跳过 NIS —— computeScanToMapNisProjected 把创新和
+    # 观测协方差都投影到 H3 的可观测子空间（退化方向既不参与白化也不参与判拒），
+    # dof=可观测秩，门限由 χ² 上尾概率反解、随 dof 自适应。走廊里 yaw 与垂直
+    # 走廊的平移仍被检验，只有沿走廊的平移创新被忽略。不改线程预算，不重置 small_glim。
     enable_nis: true
+    # χ² 判拒开关：true（默认）= 投影/白化 NIS + χ² 上尾判拒；false = 回退旧行为
+    # （退化跳过 NIS + 固定 nis_reject_threshold），现场一键回退用。
+    nis_use_chi2: true
+    # χ² 上尾概率门限（越小越严格）：1e-3 ≈ 3DoF 16.27 / 2DoF 13.82 / 1DoF 10.83。
+    # 注意 dof 随可观测秩变化，所以不再用固定 12；回退模式才看 nis_reject_threshold。
+    nis_rejection_probability: 0.001
+    # H3 观测秩的相对特征值阈值 λ_i > ratio·λ_max（同时用于 6DoF Schur 观测秩）。
+    # 量纲无关：绝对特征值随点数/体素变化，相对谱不变。
+    nis_observable_eigen_ratio: 0.001
+    # 首配/全局重定位：平移观测秩下限（实际取 max(2, 该值)）。
+    min_observable_rank: 2
+    # 首配/全局重定位完整位姿门：平移秩≥2 且 yaw 可观测才接受。部分可观测的初值
+    # （走廊里沿走廊方向无约束、旋转退化）会让缺失方向永久交给 LIO 开环，宁可继续
+    # LOST 等下一帧；拒绝时 reason=init_partial_pose 且不写 TF。
+    require_full_pose_on_init: true
+    # nis_reject_threshold 仅在 nis_use_chi2=false 的回退模式生效；nis_lost_streak 两种模式共用。
     nis_reject_threshold: 12.0
     nis_lost_streak: 8
     nis_prior_xy_std: 0.20
@@ -147,3 +169,14 @@
     # PCD 与 nav 语义图各自独立：定位只读 PCD，导航只读 map/<world>.msgpack。
     # 不读 occupancy yaml，也不用 map_start_pose。需要对齐时由 launch 传入
     # pcd_to_map_pose [x, y, yaw]；缺省单位阵。
+
+    # ========== Scan Context 重定位（可选，默认关） ==========
+    # 开启后 LOST 的全场重定位先用描述子召回 top-k 位置 + yaw 初值，再做现有
+    # top-k GICP 精化 + margin + 时序校验；召回为空/过少时自动回退全场网格搜索。
+    # 前提：先用 build_scan_context_map 从同一张先验 PCD 生成 .scdb（参数一致）。
+    enable_scan_context: false
+    scan_context_map_path: ""        # .scdb 绝对路径；空 = 不加载
+    scan_context_top_k: 15           # 召回候选数；太少会丢真值、太多会拖慢精化
+    scan_context_min_candidates: 2   # 有效候选少于此值回退全场网格搜索
+    # 建库参数（rings/sectors/max_radius/map_sensor_z 等）存在 .scdb 文件头，
+    # 加载端自动使用；重建库时必须与 build_scan_context_map 的参数保持一致。

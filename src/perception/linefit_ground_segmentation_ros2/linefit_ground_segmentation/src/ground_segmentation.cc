@@ -11,21 +11,19 @@
 #include <omp.h>
 #endif
 
-
-GroundSegmentation::GroundSegmentation(const GroundSegmentationParams& params) :
-    params_(params),
-    segments_(params.n_segments, Segment(params.n_bins,
-                                         params.min_slope,
-                                         params.max_slope,
-                                         params.max_error_square,
-                                         params.long_threshold,
-                                         params.max_long_height,
-                                         params.max_start_height,
-                                         params.sensor_height)) {
+GroundSegmentation::GroundSegmentation(const GroundSegmentationParams & params)
+: params_(params),
+  segments_(
+    params.n_segments,
+    Segment(
+      params.n_bins, params.min_slope, params.max_slope, params.max_error_square,
+      params.long_threshold, params.max_long_height, params.max_start_height, params.sensor_height))
+{
   if (params.visualize) viewer_.reset(new Viewer());
 }
 
-void GroundSegmentation::segment(const PointCloud& cloud, std::vector<int>* segmentation) {
+void GroundSegmentation::segment(const PointCloud & cloud, std::vector<int> * segmentation)
+{
   // std::cout << "Segmenting cloud with " << cloud.size() << " points...\n";
   segmentation->clear();
   segmentation->resize(cloud.size(), 0);
@@ -37,14 +35,13 @@ void GroundSegmentation::segment(const PointCloud& cloud, std::vector<int>* segm
   std::list<PointLine> lines;
   if (params_.visualize) {
     getLines(&lines);
-  }
-  else {
+  } else {
     getLines(NULL);
   }
   assignCluster(segmentation);
 
   size_t n_ground = 0;
-  for (const auto seg: *segmentation) {
+  for (const auto seg : *segmentation) {
     n_ground += seg;
   }
 
@@ -56,8 +53,10 @@ void GroundSegmentation::segment(const PointCloud& cloud, std::vector<int>* segm
     PointCloud::Ptr ground_cloud = std::make_shared<PointCloud>();
     ground_cloud->reserve(n_ground);
     for (size_t i = 0; i < cloud.size(); ++i) {
-      if (segmentation->at(i) == 1) ground_cloud->push_back(cloud[i]);
-      else obstacle_cloud->push_back(cloud[i]);
+      if (segmentation->at(i) == 1)
+        ground_cloud->push_back(cloud[i]);
+      else
+        obstacle_cloud->push_back(cloud[i]);
     }
     PointCloud::Ptr min_cloud = std::make_shared<PointCloud>();
     getMinZPointCloud(min_cloud.get());
@@ -66,7 +65,8 @@ void GroundSegmentation::segment(const PointCloud& cloud, std::vector<int>* segm
 }
 
 void GroundSegmentation::runParallel(
-    std::size_t count, const std::function<void(std::size_t, std::size_t)> & task) {
+  std::size_t count, const std::function<void(std::size_t, std::size_t)> & task)
+{
   if (count == 0) {
     return;
   }
@@ -94,7 +94,8 @@ void GroundSegmentation::runParallel(
 #endif
 }
 
-void GroundSegmentation::getLines(std::list<PointLine> *lines) {
+void GroundSegmentation::getLines(std::list<PointLine> * lines)
+{
   // 分片互不重叠；visualize 时主线程与工作线程并发写同一个 lines 列表，
   // 保留互斥锁。
   std::mutex line_mutex;
@@ -102,17 +103,18 @@ void GroundSegmentation::getLines(std::list<PointLine> *lines) {
     static_cast<std::size_t>(params_.n_segments),
     [this, lines, &line_mutex](std::size_t start_index, std::size_t end_index) {
       lineFitThread(
-        static_cast<unsigned int>(start_index), static_cast<unsigned int>(end_index),
-        lines, &line_mutex);
+        static_cast<unsigned int>(start_index), static_cast<unsigned int>(end_index), lines,
+        &line_mutex);
     });
 }
 
-void GroundSegmentation::lineFitThread(const unsigned int start_index,
-                                       const unsigned int end_index,
-                                       std::list<PointLine> *lines, std::mutex* lines_mutex) {
+void GroundSegmentation::lineFitThread(
+  const unsigned int start_index, const unsigned int end_index, std::list<PointLine> * lines,
+  std::mutex * lines_mutex)
+{
   const bool visualize = lines;
-  const double seg_step = 2*M_PI / params_.n_segments;
-  double angle = -M_PI + seg_step/2 + seg_step * start_index;
+  const double seg_step = 2 * M_PI / params_.n_segments;
+  double angle = -M_PI + seg_step / 2 + seg_step * start_index;
   for (unsigned int i = start_index; i < end_index; ++i) {
     segments_[i].fitSegmentLines();
     // Convert lines to 3d if we want to.
@@ -132,10 +134,11 @@ void GroundSegmentation::lineFitThread(const unsigned int start_index,
   }
 }
 
-void GroundSegmentation::getMinZPointCloud(PointCloud* cloud) {
+void GroundSegmentation::getMinZPointCloud(PointCloud * cloud)
+{
   cloud->reserve(params_.n_segments * params_.n_bins);
-  const double seg_step = 2*M_PI / params_.n_segments;
-  double angle = -M_PI + seg_step/2;
+  const double seg_step = 2 * M_PI / params_.n_segments;
+  double angle = -M_PI + seg_step / 2;
   for (auto seg_iter = segments_.begin(); seg_iter != segments_.end(); ++seg_iter) {
     for (auto bin_iter = seg_iter->begin(); bin_iter != seg_iter->end(); ++bin_iter) {
       const pcl::PointXYZ min = minZPointTo3d(bin_iter->getMinZPoint(), angle);
@@ -146,14 +149,16 @@ void GroundSegmentation::getMinZPointCloud(PointCloud* cloud) {
   }
 }
 
-void GroundSegmentation::resetSegments() {
-  for (auto &segment : segments_) {
+void GroundSegmentation::resetSegments()
+{
+  for (auto & segment : segments_) {
     segment.reset();
   }
 }
 
-pcl::PointXYZ GroundSegmentation::minZPointTo3d(const Bin::MinZPoint &min_z_point,
-                                                const double &angle) {
+pcl::PointXYZ GroundSegmentation::minZPointTo3d(
+  const Bin::MinZPoint & min_z_point, const double & angle)
+{
   pcl::PointXYZ point;
   point.x = cos(angle) * min_z_point.d;
   point.y = sin(angle) * min_z_point.d;
@@ -161,20 +166,19 @@ pcl::PointXYZ GroundSegmentation::minZPointTo3d(const Bin::MinZPoint &min_z_poin
   return point;
 }
 
-void GroundSegmentation::assignCluster(std::vector<int>* segmentation) {
+void GroundSegmentation::assignCluster(std::vector<int> * segmentation)
+{
   runParallel(
-    segmentation->size(),
-    [this, segmentation](std::size_t start_index, std::size_t end_index) {
+    segmentation->size(), [this, segmentation](std::size_t start_index, std::size_t end_index) {
       assignClusterThread(
-        static_cast<unsigned int>(start_index), static_cast<unsigned int>(end_index),
-        segmentation);
+        static_cast<unsigned int>(start_index), static_cast<unsigned int>(end_index), segmentation);
     });
 }
 
-void GroundSegmentation::assignClusterThread(const unsigned int &start_index,
-                                             const unsigned int &end_index,
-                                             std::vector<int> *segmentation) {
-  const double segment_step = 2*M_PI/params_.n_segments;
+void GroundSegmentation::assignClusterThread(
+  const unsigned int & start_index, const unsigned int & end_index, std::vector<int> * segmentation)
+{
+  const double segment_step = 2 * M_PI / params_.n_segments;
   for (unsigned int i = start_index; i < end_index; ++i) {
     Bin::MinZPoint point_2d = segment_coordinates_[i];
     const int segment_index = bin_index_[i].first;
@@ -206,18 +210,24 @@ void GroundSegmentation::assignClusterThread(const unsigned int &start_index,
       if (dist < params_.max_dist_to_line && dist != -1) {
         segmentation->at(i) = 1;
       }
+    } else {
+      // 落在 r_min/r_max 之外（或坐标非有限）的点不参与 ground/obstacle 判定，
+      // 用独立 label=2 标记「忽略」：调用方（ROS 节点）据此不把它当障碍发布。
+      // label 约定：0=障碍、1=地面、2=忽略（范围外/非有限）。
+      segmentation->at(i) = 2;
     }
   }
 }
 
-void GroundSegmentation::getMinZPoints(PointCloud* out_cloud) {
-  const double seg_step = 2*M_PI / params_.n_segments;
-  const double bin_step = (sqrt(params_.r_max_square) - sqrt(params_.r_min_square))
-      / params_.n_bins;
+void GroundSegmentation::getMinZPoints(PointCloud * out_cloud)
+{
+  const double seg_step = 2 * M_PI / params_.n_segments;
+  const double bin_step =
+    (sqrt(params_.r_max_square) - sqrt(params_.r_min_square)) / params_.n_bins;
   const double r_min = sqrt(params_.r_min_square);
-  double angle = -M_PI + seg_step/2;
+  double angle = -M_PI + seg_step / 2;
   for (auto seg_iter = segments_.begin(); seg_iter != segments_.end(); ++seg_iter) {
-    double dist = r_min + bin_step/2;
+    double dist = r_min + bin_step / 2;
     for (auto bin_iter = seg_iter->begin(); bin_iter != seg_iter->end(); ++bin_iter) {
       pcl::PointXYZ point;
       if (bin_iter->hasPoint()) {
@@ -234,34 +244,43 @@ void GroundSegmentation::getMinZPoints(PointCloud* out_cloud) {
   }
 }
 
-void GroundSegmentation::insertPoints(const PointCloud& cloud) {
-  runParallel(
-    cloud.size(),
-    [this, &cloud](std::size_t start_index, std::size_t end_index) {
-      insertionThread(cloud, start_index, end_index);
-    });
+void GroundSegmentation::insertPoints(const PointCloud & cloud)
+{
+  runParallel(cloud.size(), [this, &cloud](std::size_t start_index, std::size_t end_index) {
+    insertionThread(cloud, start_index, end_index);
+  });
 }
 
-void GroundSegmentation::insertionThread(const PointCloud& cloud,
-                                         const size_t start_index,
-                                         const size_t end_index) {
-  const double segment_step = 2*M_PI / params_.n_segments;
-  const double bin_step = (sqrt(params_.r_max_square) - sqrt(params_.r_min_square))
-      / params_.n_bins;
+void GroundSegmentation::insertionThread(
+  const PointCloud & cloud, const size_t start_index, const size_t end_index)
+{
+  // 参数非法时整段跳过：n_bins/n_segments <= 0 会同时让 bin_step 除零、
+  // segments_ 为空，任何一次 operator[] 都是 UB。节点侧也会校验并抛异常，
+  // 这里再加一层是因为库可以被直接构造使用（gtest / 其它节点）。
+  if (params_.n_bins <= 0 || params_.n_segments <= 0) {
+    return;
+  }
+  const double segment_step = 2 * M_PI / params_.n_segments;
   const double r_min = sqrt(params_.r_min_square);
+  const double r_max = sqrt(params_.r_max_square);
+  const double bin_step = (r_max - r_min) / params_.n_bins;
   for (unsigned int i = start_index; i < end_index; ++i) {
     pcl::PointXYZ point(cloud[i]);
     const double range_square = point.x * point.x + point.y * point.y;
     const double range = sqrt(range_square);
-    if (range_square < params_.r_max_square && range_square > params_.r_min_square) {
+    // 边界/NaN 防护：computeBinIndex 返回 -1 表示不参与分割（等价旧的 else 分支），
+    // 否则保证索引落在 [0, n_bins)。区间判定仍用 range_square，与旧实现逐点一致。
+    const int bin_index = computeBinIndex(range, r_min, r_max, bin_step, params_.n_bins);
+    if (bin_index >= 0) {
       const double angle = std::atan2(point.y, point.x);
-      const unsigned int bin_index = (range - r_min) / bin_step;
-      const unsigned int segment_index = (angle + M_PI) / segment_step;
-      const unsigned int segment_index_clamped = segment_index == params_.n_segments ? 0 : segment_index;
-      segments_[segment_index_clamped][bin_index].addPoint(range, point.z);
-      bin_index_[i] = std::make_pair(segment_index_clamped, bin_index);
-    }
-    else {
+      int segment_index = static_cast<int>((angle + M_PI) / segment_step);
+      // 角度 = +pi 时商正好等于 n_segments（旧代码只处理了 == 的情况）；
+      // 这里改成 clamp，杜绝任何越界。
+      if (segment_index >= params_.n_segments) segment_index -= params_.n_segments;
+      if (segment_index < 0) segment_index = 0;
+      segments_[segment_index][bin_index].addPoint(range, point.z);
+      bin_index_[i] = std::make_pair(segment_index, bin_index);
+    } else {
       bin_index_[i] = std::make_pair<int, int>(-1, -1);
     }
     segment_coordinates_[i] = Bin::MinZPoint(range, point.z);

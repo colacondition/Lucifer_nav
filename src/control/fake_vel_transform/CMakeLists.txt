@@ -47,6 +47,12 @@ if(BUILD_TESTING)
   ament_add_gtest(monotonic_stamp_gate_test
     test/monotonic_stamp_gate_test.cpp)
   target_include_directories(monotonic_stamp_gate_test PRIVATE include)
+
+  # 虚拟云台速度转换纯函数：旋转符号/组合、零速、小陀螺暂停恢复、TF 失败、
+  # 角速度透传、初始恒等偏置。header-only，无 ROS 依赖。
+  ament_add_gtest(velocity_transform_test
+    test/velocity_transform_test.cpp)
+  target_include_directories(velocity_transform_test PRIVATE include)
 endif()
 
 #############

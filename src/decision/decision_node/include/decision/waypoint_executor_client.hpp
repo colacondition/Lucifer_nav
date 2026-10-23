@@ -20,6 +20,16 @@
 namespace decision
 {
 
+// 哪些目标属于"守点型"：它们到达完成后会持续纠偏 —— 漂出 maintain_goal.xy_tolerance
+// 并持续 drift_hold_sec 就重发目标。
+//
+// 抽成自由函数是为了能单测。**中心走位用的 TargetName::Patrol 必须不在这个集合里**：
+// 走位的活动半径最远 1.58 m，而 xy_tolerance 只有 0.35 m，一旦走位被当成守点目标，
+// 纠偏会每 0.8 s 把车拽回 wait_center 锚点一次，走位就废了。
+// 这条隔离现在是"类型上"的，不依赖调用路径恰好绕过了门控。
+bool targetNeedsMaintainGoal(TargetName target);
+
+
 enum class ExecutorResultStatus
 {
   None,
@@ -33,6 +43,15 @@ struct WaypointExecutorState
   std::optional<TargetName> active_target;
   std::optional<TargetName> running_target;
   std::optional<TargetMode> running_mode;
+  // **上次下发的**目标/模式（不管有没有被接受）。
+  //
+  // ⚠️ 去抖必须看这个，不能看 running_target：running_target 只在 goal 被
+  //    **接受**时才置位。目标连接受都没接受就被拒/被立刻 abort 时（典型：
+  //    TF 还没起来，执行器拿不到车体位姿），running_target 一直是 Unknown，
+  //    于是每一拍都被判成"换目标"、去抖永久失效 —— 实测会以 loop_hz(30Hz)
+  //    疯狂重发，刷满 "unknown goal response, ignoring..." 并把真正的病因埋掉。
+  std::optional<TargetName> last_attempt_target;
+  std::optional<TargetMode> last_attempt_mode;
   ExecutorResultStatus result_status{ExecutorResultStatus::None};
   double last_send_time_sec{-1.0e9};
   double last_goal_success_time_sec{-1.0e9};
@@ -83,13 +102,16 @@ public:
   // 返回 true 表示本拍合成了一次超时失败。executor 崩溃重生后 rclcpp_action
   // 客户端不会收到任何回调，没有这条守卫 running_target 会永久占位。
   bool checkGoalTimeout(double now_sec);
+  // stop_at_final=false 让执行器**穿过**最后一个航点不停（也不开接近段）。
+  // 默认 true = 到点停住，是 Home / WaitHp / Center 的语义。
   bool stepExecutorTarget(
     TargetName target,
     TargetMode mode,
     const std::string & waypoint_file,
     const std::vector<Pose> & waypoints,
     bool immediate_preempt,
-    double now_sec);
+    double now_sec,
+    bool stop_at_final = true);
 
   // —— 测试钩子（仅单元测试使用）——
   // 把客户端置入「goal 已下发、等待首个动作事件」的悬挂态。

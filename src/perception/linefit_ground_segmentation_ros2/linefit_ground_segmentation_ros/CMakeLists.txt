@@ -11,9 +11,17 @@ find_package(ament_cmake_auto)
 
 ament_auto_find_build_dependencies()
 
+# 节点直接用 PCL 头；显式依赖，避免换机器/清 build 后找不到。
+if(NOT DEFINED PCL_DIR AND EXISTS "/usr/lib/x86_64-linux-gnu/cmake/pcl/PCLConfig.cmake")
+  set(PCL_DIR "/usr/lib/x86_64-linux-gnu/cmake/pcl" CACHE PATH "PCL config dir")
+endif()
+find_package(PCL REQUIRED COMPONENTS common)
+
 # Build as a composable component (zero-copy in a shared container) while still
 # providing the standalone ground_segmentation_node executable.
 ament_auto_add_library(ground_segmentation_component SHARED src/ground_segmentation_node.cc)
+target_link_libraries(ground_segmentation_component ${PCL_LIBRARIES})
+target_include_directories(ground_segmentation_component PUBLIC ${PCL_INCLUDE_DIRS})
 rclcpp_components_register_node(ground_segmentation_component
   PLUGIN "linefit_ground_segmentation::SegmentationNode"
   EXECUTABLE ground_segmentation_node)

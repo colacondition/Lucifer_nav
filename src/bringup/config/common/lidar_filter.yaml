@@ -2,6 +2,27 @@
   ros__parameters:
     input_topic: "/small_glim/deskewed_cloud"
     output_topic: "/livox/lidar_filtered/pointcloud"
+    # 判定坐标系：base_link 在运行期是**雷达/云台位姿**（small_glim 的约定），
+    # 雷达装在云台上，所以这里的裁剪盒就是"云台自车结构"的裁剪盒。
+    # 注意：它不是底盘系；不要按地面高度填 z。
     navigation_frame: "base_link"
+    marker_frame: "base_link"
     navigation_range: 10.0
     leaf_size: 0.06
+    # —— 云台自车结构裁剪盒（base_link = 雷达系，z 相对雷达平面）——
+    # 目的：去掉装在同一个云台上的其他结构（支架/相机/线缆/云台臂）在点云里
+    # 形成的"假障碍"。因为雷达和这些结构一起随云台 yaw（和可能的 pitch）转动，
+    # 用雷达系下的静态盒子在几何上是自洽的。
+    # 盒子是闭区间；negative=true 表示"挖掉盒内"。
+    # 调法：让车静止、RViz 看 /livox/lidar_filter/crop_box_marker 与原始点云，
+    # 把盒子覆盖到所有自车结构、且不碰到场地障碍。换云台结构后必须重标。
+    min_x: -0.4
+    max_x: 0.4
+    min_y: -0.3
+    max_y: 0.3
+    min_z: -0.1
+    max_z: 0.6
+    negative: true
+    # 盒子覆盖的地面高度带 = [min_z + h, max_z + h]（h=雷达安装高度）：
+    # 实车 h≈0.49 → 0.39~1.09m；仿真 h=0.175 → 0.075~0.775m。
+    # 若发现云台臂/相机在盒子外，优先扩大 x/y；若发现下方结构漏掉，调小 min_z。

@@ -44,6 +44,12 @@ if(BUILD_TESTING)
     test/test_gimbal_posture_packet.cpp
   )
   target_link_libraries(test_gimbal_posture_packet ${PROJECT_NAME})
+
+  # 锁住裁判 v2 帧的线上布局 + 分帧规则 + 「valid 未置位必须给 UNKNOWN 而不是 0」这条语义。
+  ament_add_gtest(test_referee_packet
+    test/test_referee_packet.cpp
+  )
+  target_link_libraries(test_referee_packet ${PROJECT_NAME})
 endif()
 
 ament_auto_package(

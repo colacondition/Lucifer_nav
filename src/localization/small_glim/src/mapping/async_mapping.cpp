@@ -470,7 +470,15 @@ void AsyncMapping::append_pose(const Eigen::Isometry3d& T_world_imu) {
 }
 
 void AsyncMapping::integrate_cloud_into_map(const pcl::PointCloud<pcl::PointXYZ>& cloud_imu, const Eigen::Isometry3d& T_world_imu) {
-    map_cloud_->reserve(map_cloud_->size() + cloud_imu.size());
+    // 预留空间必须几何增长。旧实现每帧 reserve(size + n)：reserve 之后
+    // size == capacity，下一帧的 reserve(size + n') 必然重新分配并把整张累积地图
+    // 拷贝一遍 —— 每帧一次全量拷贝，整体 O(N²)。长时建图（几百万点）时它是内存
+    // 带宽黑洞，还连带 malloc/free 抖动。这里只在容量不够时按 2 倍增长预留，
+    // 随后的 emplace_back 期间不会再触发重分配。
+    const std::size_t needed = map_cloud_->size() + cloud_imu.size();
+    if (map_cloud_->points.capacity() < needed) {
+        map_cloud_->reserve(std::max(needed, map_cloud_->points.capacity() * 2));
+    }
     for (const auto& p_imu : cloud_imu.points) {
         const Eigen::Vector3d p_world = T_world_imu * Eigen::Vector3d(p_imu.x, p_imu.y, p_imu.z);
         map_cloud_->emplace_back(static_cast<float>(p_world.x()), static_cast<float>(p_world.y()), static_cast<float>(p_world.z()));

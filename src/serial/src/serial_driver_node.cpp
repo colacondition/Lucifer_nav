@@ -21,13 +21,7 @@ constexpr auto kReconnectDelay = std::chrono::seconds(1);
 // 云台姿态帧的发送周期。20 Hz：导航侧判定跑 10 Hz，发得比它快一档，最坏情况下的额外
 // 延迟不超过一个判定周期。平时这一帧的内容是 0（不动），5 字节 × 20 Hz 对带宽无影响。
 constexpr auto kGimbalPostureInterval = std::chrono::milliseconds(50);
-constexpr uint8_t kPacketHead0 = static_cast<uint8_t>('H');
-constexpr uint8_t kPacketHead1 = static_cast<uint8_t>('L');
-// 云台姿态回传的帧型字节。上行现在有两种帧，长度不同（裁判 9 字节、姿态 5 字节），
-// 靠第二个字节定帧型、帧型定长度 —— 不能反过来靠长度猜。
-constexpr uint8_t kPostureStateHead1 = static_cast<uint8_t>('P');
-constexpr std::size_t kDecisionPacketSize = sizeof(DecisionPacket);
-constexpr std::size_t kPostureStatePacketSize = sizeof(GimbalPostureStatePacket);
+// 帧头/帧型常量统一放在 packet.hpp（那里也是帧布局的唯一真相），这里不再重复定义。
 
 std::string packetToHex(const uint8_t * data, std::size_t size)
 {
@@ -92,10 +86,15 @@ SerialDriverNode::SerialDriverNode(const rclcpp::NodeOptions & options)
     "gimbal_posture", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
     std::bind(&SerialDriverNode::GimbalPostureCallback, this, std::placeholders::_1));
 
+  // 决策输入是**低频状态**而不是传感器流：用 reliable 发布，和决策节点默认的
+  // reliable 订阅匹配。曾经这里是 SensorDataQoS（best_effort），与决策侧
+  // create_subscription(..., 10, ...)（reliable）静态不兼容 —— DDS 不会建立连接，
+  // 表现是"话题存在、决策一帧都收不到、也不报错"，FSM 会永远停在 WAIT_HOME。
+  // 不能改为让决策侧用 best_effort 来迁就：状态丢一帧就可能误判比赛开始/低血。
   robot_status_pub_ = this->create_publisher<decision_interfaces::msg::RobotStatus>(
-    "robot_status", rclcpp::SensorDataQoS());
+    "robot_status", rclcpp::QoS(rclcpp::KeepLast(10)));
   game_status_pub_ = this->create_publisher<decision_interfaces::msg::GameStatus>(
-    "game_status", rclcpp::SensorDataQoS());
+    "game_status", rclcpp::QoS(rclcpp::KeepLast(10)));
   // 云台实测姿态。跟请求同样是状态型话题，用 transient_local 让晚起的订阅者立刻拿到
   // 当前姿态，而不是等下一帧回传。
   gimbal_posture_state_pub_ = this->create_publisher<decision_interfaces::msg::GimbalPostureState>(
@@ -114,8 +113,9 @@ SerialDriverNode::SerialDriverNode(const rclcpp::NodeOptions & options)
 
   RCLCPP_INFO(
     get_logger(),
-    "Subscribed to cmd_vel_chassis; RX=HL+current_hp+game_progress+stage_remain_time+crc16; chassis scale x=%.1f y=%.1f w=%.1f",
-    chassis_vel_x_scale_, chassis_vel_y_scale_, chassis_vel_w_scale_);
+    "Subscribed to cmd_vel_chassis; RX=HR(len+game_type_progress+stage_remain_time"
+    "+sentry_hp, %zu B)",
+    sizeof(RefereePacketV2));
   RCLCPP_INFO(
     get_logger(),
     "Gimbal posture: sub=gimbal_posture pub=gimbal_posture_state; "
@@ -239,32 +239,26 @@ void SerialDriverNode::processReceiveBuffer()
 {
   std::lock_guard<std::mutex> lock(receive_mutex_);
 
-  // 上行有两种帧：'H''L' 裁判数据、'H''P' 云台姿态回传。长度不同，所以必须先按第二个
-  // 字节定帧型再按帧型取长度。原来的写法假定只有一种帧长，会把姿态帧当垃圾一个字节
-  // 一个字节吃掉 —— 表现是回传永远收不到，而且日志里干干净净。
+  // 上行帧型由第二个字节决定，长度再由帧型决定 —— 不能反过来靠长度猜帧型。
+  // 判定逻辑抽在 scanFrame() 里（纯函数、可测），这里只负责搬运：
+  //   NotAFrame 丢 1 字节重同步 / NeedMore 原地等 / Ok 但没收全也原地等。
   while (receive_buffer_.size() >= 2) {
-    if (receive_buffer_[0] != kPacketHead0) {
+    const auto scan = scanFrame(receive_buffer_.data(), receive_buffer_.size());
+    if (scan.status == FrameScanStatus::NotAFrame) {
+      // 这个 'H' 是数据里碰巧出现的，不是帧头。
       receive_buffer_.erase(receive_buffer_.begin());
       continue;
     }
-
-    std::size_t frame_size = 0;
-    if (receive_buffer_[1] == kPacketHead1) {
-      frame_size = kDecisionPacketSize;
-    } else if (receive_buffer_[1] == kPostureStateHead1) {
-      frame_size = kPostureStatePacketSize;
-    } else {
-      // 'H' 后面跟了个不认识的帧型字节：这个 'H' 是数据里碰巧出现的，不是帧头。
-      receive_buffer_.erase(receive_buffer_.begin());
-      continue;
+    if (scan.status == FrameScanStatus::NeedMore) {
+      // 帧还没收全（v2 的帧长要读到 payload_len 才知道）。留在缓冲里等下一次
+      // receive()，不要丢 —— 丢了就得等对面重发。
+      break;
     }
-
-    if (receive_buffer_.size() < frame_size) {
-      // 帧还没收全。留在缓冲里等下一次 receive()，不要丢 —— 丢了就得等对面重发。
+    if (receive_buffer_.size() < scan.frame_size) {
       break;
     }
 
-    if (!handlePacket(receive_buffer_.data(), frame_size)) {
+    if (!handlePacket(receive_buffer_.data(), scan.frame_size)) {
       // 帧型对但 CRC 不过：丢一个字节重新同步。
       receive_buffer_.erase(receive_buffer_.begin());
       continue;
@@ -272,13 +266,13 @@ void SerialDriverNode::processReceiveBuffer()
 
     receive_buffer_.erase(
       receive_buffer_.begin(),
-      receive_buffer_.begin() + static_cast<std::ptrdiff_t>(frame_size));
+      receive_buffer_.begin() + static_cast<std::ptrdiff_t>(scan.frame_size));
   }
 }
 
 bool SerialDriverNode::handlePacket(const uint8_t * data, std::size_t size)
 {
-  if (data[0] != kPacketHead0) {
+  if (data[0] != kFrameHead0) {
     return false;
   }
 
@@ -287,12 +281,19 @@ bool SerialDriverNode::handlePacket(const uint8_t * data, std::size_t size)
     return false;
   }
 
-  if (data[1] == kPacketHead1 && size == kDecisionPacketSize) {
-    publishDecisionPacket(bufferToStruct<DecisionPacket>(data));
+  if (data[1] == kRefereeHead1) {
+    // scanFrame 已经保证过 payload_len 在 [kRefereePayloadLen, kRefereeMaxPayloadLen]，
+    // 且 size == refereeFrameSize(payload_len)。这里只作为二次防卫。
+    if (size < refereeFrameSize(kRefereePayloadLen) ||
+      size != refereeFrameSize(data[2]))
+    {
+      return false;
+    }
+    publishRefereePacket(data, size);
     return true;
   }
 
-  if (data[1] == kPostureStateHead1 && size == kPostureStatePacketSize) {
+  if (data[1] == kPostureStateHead1 && size == sizeof(GimbalPostureStatePacket)) {
     publishGimbalPostureState(bufferToStruct<GimbalPostureStatePacket>(data));
     return true;
   }
@@ -300,24 +301,23 @@ bool SerialDriverNode::handlePacket(const uint8_t * data, std::size_t size)
   return false;
 }
 
-void SerialDriverNode::publishDecisionPacket(const DecisionPacket & packet)
+void SerialDriverNode::publishRefereePacket(const uint8_t * data, std::size_t size)
 {
-  decision_interfaces::msg::RobotStatus robot_msg;
-  robot_msg.robot_id = 7;
-  robot_msg.current_hp = packet.current_hp;
-  robot_msg.shooter_heat = 0;
-  robot_msg.team_color = false;
+  // 只读我们认识的固定前缀。payload_len 以后变大时，尾部多出来的字段被自然忽略，
+  // 而 crc16 的偏移也不再等于结构体里的偏移 —— 所以绝不能拿 packet.crc16 当校验值用
+  // （校验已经在 handlePacket 里按 len 算出的总长做过了）。这里 memcpy 的只是字段，
+  // 顺带带进来的那个 crc16 成员是垃圾值，不读即可。
+  RefereePacketV2 packet{};
+  std::memcpy(&packet, data, std::min(size, sizeof(packet)));
 
-  const auto previous_hp = last_current_hp_.exchange(packet.current_hp, std::memory_order_relaxed);
-  robot_msg.is_attacked = packet.current_hp < previous_hp;
+  // 血量差分是跨帧的，只能在这里算：拿上一拍的血量和这一拍比。
+  const auto previous_hp = last_current_hp_.exchange(packet.sentry_hp, std::memory_order_relaxed);
+  const auto game_msg = toGameStatus(packet);
+  const auto robot_msg = toRobotStatus(packet, hpDecreased(previous_hp, packet.sentry_hp));
 
-  decision_interfaces::msg::GameStatus game_msg;
-  game_msg.game_progress = packet.game_progress;
-  game_msg.stage_remain_time = packet.stage_remain_time;
-
-  last_game_progress_.store(packet.game_progress, std::memory_order_relaxed);
-  last_stage_remain_time_.store(packet.stage_remain_time, std::memory_order_relaxed);
-  received_decision_count_.fetch_add(1, std::memory_order_relaxed);
+  last_game_progress_.store(game_msg.game_progress, std::memory_order_relaxed);
+  last_stage_remain_time_.store(game_msg.stage_remain_time, std::memory_order_relaxed);
+  received_referee_count_.fetch_add(1, std::memory_order_relaxed);
 
   if (robot_status_pub_) {
     robot_status_pub_->publish(robot_msg);
@@ -328,9 +328,11 @@ void SerialDriverNode::publishDecisionPacket(const DecisionPacket & packet)
 
   RCLCPP_INFO_THROTTLE(
     get_logger(), *get_clock(), 1000,
-    "Published decision packet. current_hp=%u game_progress=%u stage_remain_time=%u is_attacked=%s",
-    static_cast<unsigned int>(packet.current_hp), static_cast<unsigned int>(packet.game_progress),
-    static_cast<unsigned int>(packet.stage_remain_time), robot_msg.is_attacked ? "true" : "false");
+    "Published referee frame. hp=%u game=%u progress=%u remain=%u",
+    static_cast<unsigned int>(robot_msg.current_hp),
+    static_cast<unsigned int>(game_msg.game_type),
+    static_cast<unsigned int>(game_msg.game_progress),
+    static_cast<unsigned int>(game_msg.stage_remain_time));
 }
 
 void SerialDriverNode::ChassisCmdCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
@@ -508,12 +510,13 @@ void SerialDriverNode::logStatus()
 
   RCLCPP_INFO(
     get_logger(),
-    "Serial status: port_open=%s device=%s fd=%d queue_bytes=%llu decision_rx=%llu received=%llu queued=%llu "
+    "Serial status: port_open=%s device=%s fd=%d queue_bytes=%llu referee_rx=%llu "
+    "received=%llu queued=%llu "
     "sent=%llu failed=%llu last_write=%d last_hp=%u last_game=%u last_time=%u "
     "gimbal_want=%s gimbal_is=%s gimbal_toggles=%llu gimbal_rx=%llu",
     port_->isPortOpen() ? "true" : "false", config_->devname.c_str(), port_->fd,
     static_cast<unsigned long long>(queue_bytes),
-    static_cast<unsigned long long>(received_decision_count_.load(std::memory_order_relaxed)),
+    static_cast<unsigned long long>(received_referee_count_.load(std::memory_order_relaxed)),
     static_cast<unsigned long long>(received_cmd_count_.load(std::memory_order_relaxed)),
     static_cast<unsigned long long>(queued_packet_count_.load(std::memory_order_relaxed)),
     static_cast<unsigned long long>(sent_packet_count_.load(std::memory_order_relaxed)),

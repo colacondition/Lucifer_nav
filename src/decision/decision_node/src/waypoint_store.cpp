@@ -74,10 +74,13 @@ WaypointStore::WaypointStore(DecisionConfig config)
 {
   waypoint_files_[TargetName::WaitHome] = config_.targets.wait_home_waypoint_file;
   waypoint_files_[TargetName::Home] = config_.targets.home_waypoint_file;
+  waypoint_files_[TargetName::HomeTunnel] = config_.targets.home_tunnel_waypoint_file;
+  waypoint_files_[TargetName::HomeSafe] = config_.targets.home_safe_waypoint_file;
   waypoint_files_[TargetName::Patrol] = config_.targets.patrol_waypoint_file;
   waypoint_files_[TargetName::Center] = config_.targets.center_waypoint_file;
   waypoint_files_[TargetName::WaitCenter] = config_.targets.wait_center_waypoint_file;
   waypoint_files_[TargetName::WaitHp] = config_.targets.wait_hp_waypoint_file;
+  waypoint_files_[TargetName::Zone] = config_.targets.zone_waypoint_file;
 }
 
 std::string WaypointStore::waypointFile(TargetName target) const

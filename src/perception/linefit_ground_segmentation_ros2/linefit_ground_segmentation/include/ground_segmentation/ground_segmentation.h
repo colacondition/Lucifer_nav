@@ -1,12 +1,43 @@
 #ifndef GROUND_SEGMENTATION_H_
 #define GROUND_SEGMENTATION_H_
 
+#include <cmath>
 #include <functional>
 #include <mutex>
 
 #include "ground_segmentation/segment.h"
 #include "ground_segmentation/typedefs.h"
 #include "ground_segmentation/viewer.h"
+
+// 把 range 映射到径向 bin 索引。返回 -1 表示该点不参与分割（不在 [r_min, r_max)
+// 内，或是 NaN/Inf/参数非法）。返回值保证要么 -1、要么落在 [0, n_bins)。
+//
+// 为什么需要单独一个函数：旧实现直接把 (range - r_min) / bin_step 转成
+// unsigned int，正确性依赖「range < r_max ⇒ 商 < n_bins」这一浮点不变量。
+// 该不变量在正常参数下成立，但一旦参数被改成 r_min/r_max 很接近、n_bins 很大，
+// 或调用方直接构造 GroundSegmentationParams（绕过节点侧校验），浮点舍入就可能
+// 让商落到 [n_bins, n_bins+1)，随后 segments_[seg][n_bins] 是越界写（UB）。
+// 显式 clamp 的代价是一条分支，且对任何合法输入结果与旧实现逐点一致。
+inline int computeBinIndex(const double range, const double r_min,
+                           const double r_max, const double bin_step,
+                           const int n_bins) {
+  if (!std::isfinite(range) || !std::isfinite(r_min) ||
+      !std::isfinite(r_max) || !std::isfinite(bin_step) ||
+      n_bins <= 0 || bin_step <= 0.0) {
+    return -1;
+  }
+  if (range < r_min || range >= r_max) {
+    return -1;
+  }
+  const double bin = (range - r_min) / bin_step;
+  if (!std::isfinite(bin) || bin <= 0.0) {
+    return 0;
+  }
+  if (bin >= static_cast<double>(n_bins)) {
+    return n_bins - 1;
+  }
+  return static_cast<int>(bin);
+}
 
 struct GroundSegmentationParams {
   GroundSegmentationParams() :

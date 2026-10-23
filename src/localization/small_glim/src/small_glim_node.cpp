@@ -252,7 +252,20 @@ void SmallGlimNode::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
         logger::warn("node", "skip an invalid IMU data (stamp={})", imu_stamp);
         return;
     }
-    odometry_estimation->insert_imu(imu_stamp, linear_acc, angular_vel);
+    Eigen::Quaterniond orientation(
+        msg->orientation.w, msg->orientation.x, msg->orientation.y, msg->orientation.z);
+    if (!orientation.coeffs().allFinite() ||
+        std::abs(orientation.norm() - 1.0) > 1e-2 ||
+        msg->orientation_covariance[0] < 0.0)
+    {
+        // 驱动明确报“无姿态”：传 NaN，让 InitialStateEstimation 回退到加速度平均。
+        orientation = Eigen::Quaterniond(
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::quiet_NaN());
+    }
+    odometry_estimation->insert_imu(imu_stamp, linear_acc, angular_vel, orientation);
     if (imu_propagation) {
         imu_propagation->insert_imu(imu_stamp, linear_acc, angular_vel);
         latest_imu_stamp = imu_stamp;

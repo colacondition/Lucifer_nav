@@ -1,3 +1,5 @@
+// Copyright (c) 2026 colacondition
+// Licensed under the MIT License. See LICENSE in the project root.
 #ifndef FAKE_VEL_TRANSFORM__MONOTONIC_STAMP_GATE_HPP_
 #define FAKE_VEL_TRANSFORM__MONOTONIC_STAMP_GATE_HPP_
 

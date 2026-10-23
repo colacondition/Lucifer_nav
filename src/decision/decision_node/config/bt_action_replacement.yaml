@@ -34,13 +34,19 @@ bt_action_replacement:
       low_threshold: 120
       high_threshold: 400
 
+    # ⚠️ 下面这些是**相对路径**，只在"从工作空间根目录直接跑节点"时能解。
+    #    正常启动（decision.launch.py / bringup 的 real.launch.py）会由 launch
+    #    用 sentry_waypoints 的安装路径覆盖掉，不要依赖这里的值。
     targets:
-      patrol_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/patrol.csv"
       center_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/center.csv"
-      wait_center_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/wait_center.csv"
-      home_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/home.csv"
+      # 两类回家路线（占位文件目前同点，必须在 2027 场地重录）：
+      #   home_tunnel：复活后无敌/虚弱期走隧道快线；
+      #   home_safe  ：残血回家绕远路，避开隧道拦截。
+      home_tunnel_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/home_tunnel.csv"
+      home_safe_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/home_safe.csv"
       wait_home_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/wait_home.csv"
-      wait_hp_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/wait_hp.csv"
+      # 中心占领区四个角点（range.csv）。追击和走位都靠它。
+      zone_waypoint_file: "src/interfaces/sentry_waypoints/waypoints/RMUL/range.csv"
 
     waypoint:
       switch_distance: 0.6
@@ -51,3 +57,60 @@ bt_action_replacement:
       robot_base_frame: base_link_fake
       xy_tolerance: 0.35
       drift_hold_sec: 0.8
+
+    # 中心占领区：把追击目标夹在安全区内（见 README §4.7）。
+    # 角点来自 targets.zone_waypoint_file（bringup 传 waypoints/RMUL/range.csv）。
+    #
+    # ⚠️ 那个框是**实际判定区往里缩过**的，所以框里已经含了安全余量 ——
+    # margin_m 只要很小（对冲定位抖动），叠大了就是双重内缩。
+    # 也因此区域内随机点贴框边、甚至微出框几厘米是正常的，不告警；
+    # 只有跑出 warn_outside_m 之外才认为录点/map 出错。
+    center_zone:
+      enable: true
+      # ⚠️ 必须是 base_link（雷达/云台位姿），**不是** base_link_fake。
+      #    super_lio 约定 odom->base_link 装的是雷达位姿，而雷达装在云台上。
+      #    base_link_fake 的 yaw 被改成路径切向了，拿它转云台系坐标会指错方向。
+      lidar_frame: base_link
+      margin_m: 0.10
+      warn_outside_m: 0.30
+
+    # 追击：把敌人位置夹进区域当目标点。判据全在 target_input 里做完。
+    target_chase:
+      enable: true
+      # 自瞄节点发的（sp_vision_25 的 auto_aim_target_pos_publisher）
+      topic: auto_aim_target_pos
+      # 与敌人保持的距离：目标点取"敌人周围这个半径的圆上、离车最近的那一点"，
+      # **不是敌人本身** —— 离太近自瞄打不稳。
+      standoff_m: 1.5
+      # 目标点离车比这还近就不下发（已经在圈上了，不用动），避免原地抖
+      min_goal_move_m: 0.3
+      # 上游是**单帧 PnP、未滤波**，所以必须连续有效一段时间才认
+      min_valid_sec: 0.5
+      # 上游没有目标时照常发全零、不停发，所以超时只能我们自己算
+      lost_timeout_sec: 1.5
+      # 一阶滤波（0..1，越大跟得越快越抖）
+      filter_alpha: 0.35
+      # 目标点比上次下发移动超过这么多就重发
+      reissue_move_m: 0.4
+      # 至少隔这么久才重发（防止把规划器打爆）
+      reissue_sec: 0.5
+      # 0 = 关掉"目标太近就整个不用"的判据：敌人贴脸时我们要的是"退到 1.5m 圈上"，
+      # 而不是放弃这个目标。留这个参数只是为了以后想过滤极近误检时有地方可调。
+      min_range_m: 0.0
+
+    # 中心巡逻：到中心后先 hold 中心；每隔 group_gap_sec，从 range.csv 内缩后的
+    # 区域网格里**随机**取 path_len 个点走一组，走完回中心继续 hold。
+    # **没有激进/保守之分，也不看时间** —— 哪一侧算"激进"取决于场上实际结构
+    # （过道是 S 型的、哪一侧有掩护、敌人从哪个口进来），不是能从坐标推出来的几何量。
+    # 点全部落在 range.csv 内缩后的区域内；不再需要 patrol.csv。
+    center_patrol:
+      enable: true
+      # 区域网格格距（米）。越小点越密、走得越细，但也越琐碎。
+      # 网格只生成在**中心区域内**：实测中心区是整片开阔的，而区域外随便生成的
+      # 格子可能落到墙里（过道是 S 型的）。
+      grid_spacing_m: 0.5
+      # 每组随机取几个在区域内的网格点。
+      path_len: 3
+      # 走完一组后停顿多久再开始下一组（计时从"走完那一刻"起算）；
+      # 也是"隔多久偶尔动一次"的间隔。
+      group_gap_sec: 12.0

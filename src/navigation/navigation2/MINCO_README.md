@@ -41,6 +41,10 @@
 - **两阶段 v/a 精确检测**（`two_stage.exact_dynamics_check`）：用 MINCO 库已有的
   多项式求根替代每段 5 点采样。5 阶多项式的速度是 4 次函数，5 个等距样本会漏掉
   段内尖峰、把峰值低估 10-20%。放大后还会复核一次，超限只告警不改行为
+- **墙钟预算与回退**（`repair.time_budget_ms`）：给「优化 + 两阶段 + 修复循环」
+  加单次回调的墙钟上限（默认 80 ms，是 8 Hz 周期 125 ms 的 64%）。超时后停止
+  追加修复、跳过第二阶段精优化，必要时回退原始路径，避免回调排队把 `/plan`
+  延迟抖到下游。0 = 关闭。见下文「墙钟预算与性能基准」
 
 ## 架构说明
 
@@ -169,6 +173,8 @@ RMUL 当前地图（净宽 0.5 m、车体半径 0.25 m）实测：洞内横向�
 1. **减少路径点数量**：在 global planner 中稀疏化输出
 2. **降低迭代次数**：修改 `lbfgs_params_.max_iterations`（默认 4000）
 3. **关闭优化**：设置 `enable_optimization: false` 作为 fallback
+4. **设置墙钟预算**：`repair.time_budget_ms: 80`（按回调周期取值），超时自动
+   跳过剩余修复/第二阶段并回退原始路径，见下文「墙钟预算与性能基准」
 
 ### 5. 常见问题
 
@@ -226,6 +232,102 @@ for (size_t i = 0; i < pieces.size(); ++i) {
   }
 }
 ```
+
+## 墙钟预算与性能基准
+
+### 参数：`repair.time_budget_ms`
+
+单次平滑调用的墙钟预算（毫秒），覆盖从「几何去重之后」到「优化 + 两阶段精优化 +
+修复循环结束」的整段工作。时间源是 `std::chrono::steady_clock`，量的是真实 CPU
+墙钟而不是仿真时间 —— 8 Hz 回调的截止期本来就是墙钟。实现见
+`include/smoothing_budget.hpp`（header-only、无 ROS 依赖）。
+
+| 取值 | 含义 |
+|---|---|
+| `0`（代码默认） | 关闭。代码路径与没有这项功能完全一致：不检查、不告警、不改变发布结果 |
+| `80.0`（`params/navigation2.yaml` 现值） | 8 Hz 回调周期 125 ms 的 64%，给回调入口排队、消息序列化、发布和下游留出余量 |
+| 其他正值 | 按同一语义生效；**不要**取到接近或超过 125 ms，那等于没有约束 |
+
+超时后的行为分两处，都是「降级」而不是「失败」：
+
+1. **两阶段第二阶段之前**（`runOptimization`）：跳过放大段时间 + 精优化，
+   `WARN` 一条日志，**保留第一阶段结果**。第一阶段本身就是一条合法轨迹，只是
+   动力学保守不足；跳过第二阶段绝不判整次优化失败。此时也不放大 `segment_times`。
+2. **修复循环的后续尝试之前**（`attempt > 0`）：不再追加一次完整 L-BFGS，置
+   `reject_reason = "time_budget"` 并 `WARN`，走已有的「回退原始路径」分支
+   （发布输入折线、清空轨迹快照）。开启 `performance.*` 时该失败原因写入 CSV
+   的 `failure_reason` 列，可直接统计超预算占比。
+
+第 0 次尝试永远不被预算跳过（它是主结果，跳过等于关掉平滑）；预算只约束
+「可选的重试与精优化」。
+
+> 注意：`src/bringup/config/common/navigation2.yaml` 是 `bringup` 的
+> sim/real launch 实际加载的部署配置（与包内 `params/navigation2.yaml` 是两份
+> 文件）。在部署配置里同样补上 `repair.time_budget_ms: 80.0`，预算才会在实车/
+> 仿真链路生效。
+
+### 基准脚本：`tools/bench_planning.py`
+
+rclpy 脚本，不依赖 Gazebo。订阅 `/map`（transient_local，等 map server 的 latched
+消息）、向 `/goal_pose` 发目标、订阅 `/plan` 并以 **`header.stamp` 变化**判定新规划
+结果，统计「发目标 → 收到新 `/plan`」的端到端延迟与路径长度：
+
+```bash
+source install/setup.bash
+
+# 指定目标点（map 系，x,y 分号分隔），每个目标等 2s，整组跑 3 轮
+ros2 run navigation2 bench_planning.py \
+  --goals "1.0,2.0;3.5,-1.5;-2.0,0.5" --timeout 2.0 --repeat 3
+
+# 在 /map 范围内按固定 seed 均匀采样 20 个目标，目标间不重复
+ros2 run navigation2 bench_planning.py --count 20 --seed 7 \
+  --csv /tmp/bench_planning.csv
+
+# 只观察 MINCO 输出（配合完整导航栈或 global planner + rm_minco_path_smoother）
+ros2 run navigation2 bench_planning.py --count 10 --plan-topic /plan
+```
+
+主要参数：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `--goals "x,y;x,y"` | — | 显式目标列表（与 `--count` 二选一，必填） |
+| `--count N` | — | 从 `/map` 范围均匀采样的目标数（固定 seed 可复现） |
+| `--timeout` | `2.0` | 单个目标等新 `/plan` 的超时（秒） |
+| `--repeat` | `1` | 整组目标重复轮数 |
+| `--csv` | `/tmp/bench_planning.csv` | 输出路径，结束时写 |
+| `--plan-topic` / `--goal-topic` | `/plan` / `/goal_pose` | 观察/发布的话题 |
+| `--map-topic` | `/map` | `--count` 采样用的占据栅格 |
+| `--seed` | `0` | 采样随机种子 |
+| `--settle` | `0.2` | 每次试验后等待/排空时间（秒），避免上一拍迟到的 `/plan` 算进下一拍 |
+| `--map-timeout` | `5.0` | 等 `/map` latched 消息的超时；超时或没有地图直接报错退出 |
+
+CSV 列：`epoch_s,goal_x,goal_y,repeat,latency_ms,path_length_m,ok`。超时行
+`latency_ms`/`path_length_m` 留空、`ok=0`；统计只对成功样本算 p50/p95/p99。
+`--count` 的采样点可能落在障碍/未知区，这属于随机目标的真实分布；要精确控制
+可通行目标用 `--goals`。
+
+### 如何据此定预算
+
+1. 打开性能观测（`rm_minco_path_smoother` 段）：
+   `performance.enable: true`、`performance.csv_enable: true`，CSV 记录每拍的
+   `cycle_ms` 与 `failure_reason`。
+2. 跑基准：`--count 20 --repeat 3`，先看端到端 `latency_ms` 的 p50/p95/p99。
+   回调周期是 125 ms；p99 已接近 125 ms 时，预算压不到端到端延迟 —— 先查
+   `performance.csv` 里 `cycle_ms` 的分布和 `failure_reason` 构成（是
+   `global_clearance`/`safety_reject` 触发修复，还是 `optimize_failed`）。
+3. 预算取「正常成功样本 `cycle_ms` 的 p95 之上、周期 125 ms 的 60-70%」：
+   本仓库取 **80 ms**（125 ms 的 64%）。它大于典型 10 m 路径的 35-60 ms 两阶段
+   耗时，又给排队和发布留出约 45 ms。
+4. 复跑基准，看 `failure_reason=time_budget` 的占比：
+   - 偶发（<1%，且集中在长路径/隧道口）可接受；
+   - 持续 >2% 说明修复/两阶段常态性超预算，应减少 `repair.max_attempts` 或
+     `two_stage.max_iterations`，或缩短前端路径点，而不是简单抬预算；
+   - 端到端 p99 明显下降而成功率不变，说明预算在正确的量级上。
+
+> `bench_planning.py` 量的是**端到端**链路（含上游目标分发、排队、下游发布），
+> 而预算只管平滑节点内部的那一段。两者对不上时，用 `performance.csv` 的
+> `cycle_ms` 和 rosbag/`ros2 topic delay` 定位时间花在哪一跳。
 
 ## 性能基准
 

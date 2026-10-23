@@ -84,6 +84,7 @@ def generate_launch_description():
     mapper_params = os.path.join(common_config_dir, 'mapper.yaml')
     lidar_filter_params = os.path.join(common_config_dir, 'lidar_filter.yaml')
     cloud_to_scan_params = os.path.join(common_config_dir, 'pointcloud_to_laserscan.yaml')
+    cloud_to_scan_env_params = os.path.join(simulation_config_dir, 'pointcloud_to_laserscan.yaml')
     waypoint_executor_params = os.path.join(common_config_dir, 'waypoint_executor.yaml')
     simulated_gimbal_params = os.path.join(simulation_config_dir, 'simulated_gimbal.yaml')
     small_glim_common_params = os.path.join(common_config_dir, 'small_glim.yaml')
@@ -149,6 +150,12 @@ def generate_launch_description():
     #    的文件只会落在 install/ 里，下次 colcon build 就没了，要自己拷回源码。
     declare_map_save_dir = DeclareLaunchArgument(
         'map_save_dir', default_value=os.path.join(bringup_dir, 'PCD'))
+    # 建图时把每个关键帧的 IMU 系点云 + 位姿（frame_<idx>.pcd / poses.txt）落到
+    # map_save_dir，供离线清动态残影工具 tools/clean_map_dynamic.py 使用。
+    # 只在 mode:=mapping 下有意义；默认关，避免平时建图多写一堆文件。
+    declare_save_keyframes = DeclareLaunchArgument(
+        'save_keyframes', default_value='False',
+        description='建图时保存关键帧点云+位姿，供离线清残影')
 
     # 无 GPU 环境下用软件渲染，避免 RViz/Gazebo 段错误
     enable_software_gl = SetEnvironmentVariable(
@@ -180,6 +187,11 @@ def generate_launch_description():
         package='small_glim',
         executable='small_glim_node',
         output='log',
+        # 与 real.launch 同一条 workaround（那边注释更全）：本机 LD_LIBRARY_PATH 里
+        # /opt/MVS/lib/64 的旧 libusb 会被 libpcl_io 优先解析，dlopen 时报
+        # "undefined symbol: libusb_set_option" → SIGABRT。预加载系统 libusb 绕开。
+        # 仿真同样会中招（PCL 和雷达无关），缺这行 sim.launch 起不来 LIO。
+        additional_env=system_libusb_env,
         parameters=[
             small_glim_common_params,
             small_glim_params,
@@ -188,6 +200,8 @@ def generate_launch_description():
                 'node.enable_mapping': lio_save_map,
                 'mapping.output_dir': LaunchConfiguration('map_save_dir'),
                 'mapping.map_name': lio_map_name,
+                'mapping.save_raw_mapping_frames':
+                    LaunchConfiguration('save_keyframes'),
             },
         ],
         arguments=common_log_arguments)
@@ -231,7 +245,7 @@ def generate_launch_description():
             ('cloud_in', '/segmentation/obstacle'),
             ('scan', '/scan'),
         ],
-        parameters=[cloud_to_scan_params, {'use_sim_time': use_sim_time}],
+        parameters=[cloud_to_scan_params, cloud_to_scan_env_params, {'use_sim_time': use_sim_time}],
         arguments=common_log_arguments)
 
     slam_mapping_node = Node(
@@ -338,6 +352,7 @@ def generate_launch_description():
         declare_perception_threads, declare_sim_lidar_downsample,
         declare_gazebo_clock_rate,
         declare_software_rendering, declare_waypoint_file, declare_map_save_dir,
+        declare_save_keyframes,
         enable_software_gl,
         start_simulation,
         lio_node,

@@ -21,6 +21,10 @@ find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED)
+# Eigen 必须自己 find_package：${PCL_INCLUDE_DIRS} 只带 PCL 自己的头，**不带** eigen3。
+# 下面的测试目标只用 ${PCL_INCLUDE_DIRS} 拿依赖头，所以少了这段会报
+# "fatal error: Eigen/Dense: 没有那个文件或目录"（本包头文件里 include 了 Eigen）。
+find_package(Eigen3 REQUIRED)
 find_package(fast_gicp REQUIRED)
 find_package(CUDA QUIET)
 
@@ -46,6 +50,30 @@ target_link_libraries(global_search
   ${PCL_LIBRARIES}
 )
 
+# Scan Context 重定位：离线建库 + 在线候选召回（只给位置/yaw 初值，
+# 精配准仍走 global_search + GICP）。
+add_library(scan_context
+  src/scan_context.cpp
+)
+target_include_directories(scan_context PUBLIC
+  include
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(scan_context
+  ${PCL_LIBRARIES}
+  Eigen3::Eigen
+)
+
+# 离线建库工具：先验 PCD + 网格采样 → .scdb（与建库参数强绑定）。
+add_executable(build_scan_context_map
+  tools/build_scan_context_map.cpp
+)
+target_link_libraries(build_scan_context_map
+  scan_context
+  ${PCL_LIBRARIES}
+  Eigen3::Eigen
+)
+
 add_executable(robot_localization_node
   src/robot_localization.cpp
 )
@@ -53,6 +81,7 @@ add_executable(robot_localization_node
 # ========== 链接库 ==========
 target_link_libraries(robot_localization_node
   global_search
+  scan_context
   ${PCL_LIBRARIES}
 )
 
@@ -85,6 +114,7 @@ ament_target_dependencies(robot_localization_node
 # ========== 安装 ==========
 install(TARGETS
   robot_localization_node
+  build_scan_context_map
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -123,6 +153,7 @@ if(BUILD_TESTING)
     include
     ${PCL_INCLUDE_DIRS}
   )
+  target_link_libraries(frame_transforms_test Eigen3::Eigen)
 
   ament_add_gtest(alignment_quality_test
     test/alignment_quality_test.cpp
@@ -131,6 +162,7 @@ if(BUILD_TESTING)
     include
     ${PCL_INCLUDE_DIRS}
   )
+  target_link_libraries(alignment_quality_test Eigen3::Eigen)
 
   ament_add_gtest(global_search_test
     test/global_search_test.cpp
@@ -139,9 +171,23 @@ if(BUILD_TESTING)
     include
     ${PCL_INCLUDE_DIRS}
   )
+  target_link_libraries(global_search_test Eigen3::Eigen)
   target_link_libraries(global_search_test
     global_search
     ${PCL_LIBRARIES}
+  )
+
+  ament_add_gtest(scan_context_test
+    test/scan_context_test.cpp
+  )
+  target_include_directories(scan_context_test PRIVATE
+    include
+    ${PCL_INCLUDE_DIRS}
+  )
+  target_link_libraries(scan_context_test
+    scan_context
+    ${PCL_LIBRARIES}
+    Eigen3::Eigen
   )
 
   add_test(

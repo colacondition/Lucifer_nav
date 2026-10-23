@@ -26,6 +26,9 @@
       localization_downsample_resolution: 0.1
     odometry_estimation:
       num_threads: 2           # 8-core budget: LIO 2
+      # Gazebo IMU 发布有效 orientation；用它定初始 roll/pitch，避免 spawn/下落
+      # 的加速度把初始重力方向带偏（走 8m 会"飞"起 0.5m）。
+      initial_attitude_source: "imu"
       # 3.0 -> 1.5：后台 ISAM2 修正滞后减半，odom 的 IMU 预测参考状态更"新鲜"。
       smoother_lag: 1.5
       # 0.1 -> 0.05：target 体素图点更少，配准更快。

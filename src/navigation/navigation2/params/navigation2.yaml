@@ -238,6 +238,13 @@ rm_minco_path_smoother:
     # 插点修复的最小偏离阈值（m）：最差采样点离前端路径折线小于此值时不再插点，
     # 避免在偏离可忽略的位置白白增加路标数。
     repair.waypoint_spacing: 0.15
+    # 单次平滑的墙钟预算（毫秒），覆盖「优化 + 两阶段精优化 + 修复循环」。
+    # 8 Hz 回调周期是 125 ms，取 80 ms = 周期的 64%，给回调入口排队、消息
+    # 序列化、发布和下游留出余量。超预算后：不再追加修复尝试、跳过两阶段
+    # 精优化（保留第一阶段结果）；若第 0 次尝试本身已被校验拒绝，则直接
+    # 回退原始路径（perf 失败原因记为 time_budget）。0 = 关闭，行为与旧版
+    # 完全一致。实车/仿真用 tools/bench_planning.py 的 p95/p99 反推取值。
+    repair.time_budget_ms: 80.0
 
 
 rm_local_costmap:
@@ -321,6 +328,29 @@ rm_velocity_smoother:
     max_accel: [4.0, 4.0, 6.0]        # 仍声明以免旧配置报未声明；当前不做斜坡
     max_decel: [-4.0, -4.0, -6.0]
     deadband_velocity: [0.0, 0.0, 0.0]  # 死区：绝对值小于此值强制归零（抑制微抖）
+
+# 虚拟云台速度转换（fake_vel_transform 组件，与导航组件同容器、共用本 params_file）。
+# 数据流：MPC 在 base_link_fake（虚拟云台，yaw 跟 /plan 的 XY 切向）系下发
+# /cmd_vel_nav -> rm_velocity_smoother 限幅为 /cmd_vel -> 本节点按
+# R(yaw(base_link_fake)-yaw(base_link)) 旋转并发布 /cmd_vel_chassis
+# -> serial_driver（实车）/ planar_move 插件（仿真）。
+# 旧实现的小陀螺参数（spin_* / angular_deadband / min_translate_speed_for_spin）
+# 已全部废弃：本工程模型是可平移运动云台，不做底盘自旋。节点仍声明旧参数仅为
+# 兼容手工配置，显式设置会 WARN 并忽略；角速度只做原样透传。
+fake_vel_transform:
+  ros__parameters:
+    use_sim_time: true
+    # 本工程模型：整车简化成一个**可在地面平移的运动云台**，不做底盘小陀螺/物理
+    # 轮组 yaw。本节点只把虚拟云台系（base_link_fake）速度换算到实际云台/雷达系
+    # （base_link）：线速度按路径切向偏置旋转，角速度原样透传，不注入任何自旋。
+    #
+    # —— 路径切向 / 偏置滤波 ——
+    # 从车体最近路径点沿弧长前瞻的距离（m），用前瞻点连线方向当 map 系路径航向。
+    # 不能直接用 /plan 的 orientation：MINCO 输出的是单位四元数，当航向用会把 fake
+    # 锁到 map +X 并在重规划时跳变。
+    path_lookahead_distance: 0.8
+    # 路径航向 EMA 系数 [0,1]。越小 fake 航向越稳、转向越滞后。
+    yaw_filter_alpha: 0.25
 
 rm_nav2_compat:
   ros__parameters:

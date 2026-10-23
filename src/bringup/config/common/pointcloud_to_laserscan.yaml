@@ -1,3 +1,7 @@
+# min_height/max_height 是 pointcloud_to_laserscan 在 target_frame（base_link =
+# 雷达/云台位姿）下的 z 边界，不是地面高度。这里的值是兜底；real/sim launch 会再加载
+# reality|simulation/pointcloud_to_laserscan.yaml 覆盖成"地面以上"的值。
+# 只加载本文件会把 20cm 高台（实车 z≈-0.29、仿真 z≈+0.025）整片滤掉。
 pointcloud_to_laserscan:
   ros__parameters:
     target_frame: "base_link"

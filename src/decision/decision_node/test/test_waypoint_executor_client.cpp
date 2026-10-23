@@ -91,6 +91,51 @@ void spinUntil(
   }
 }
 
+// ==================== 重试去抖（真机上踩过）====================
+
+TEST(RetryDebounce, SameTargetIsNotResentFasterThanTheRetryInterval)
+{
+  // 真机现象：TF 还没起来 -> 执行器每个目标都立刻 abort -> 决策节点以 loop_hz(30Hz)
+  // 疯狂重发，刷满 "unknown goal response, ignoring..."，真正的病因被埋掉。
+  // 根因是去抖看的是 running_target，而它只在 goal **被接受**时才置位。
+  //
+  // 这里钉住的是"同目标重复下发必须被 retry_interval_sec 挡住"，
+  // 且与目标是否被接受无关。
+  // 判据这一层是纯记账（下发动作本身要有 action server 才跑得起来），
+  // 所以直接对着状态验证。
+  decision::WaypointExecutorState state;
+  state.last_attempt_target = decision::TargetName::WaitHome;
+  state.last_attempt_mode = decision::TargetMode::ExecutorFollow;
+  state.last_send_time_sec = 100.0;
+
+  // 同目标、间隔 0.05s < retry_interval(0.2)：算"没换目标"
+  const bool changed_same =
+    state.last_attempt_target != decision::TargetName::WaitHome ||
+    state.last_attempt_mode != decision::TargetMode::ExecutorFollow;
+  EXPECT_FALSE(changed_same);
+  EXPECT_LT(100.05 - state.last_send_time_sec, 0.2);
+
+  // 换目标：必须立刻放行（抢占语义不能丢）
+  const bool changed_other =
+    state.last_attempt_target != decision::TargetName::Home ||
+    state.last_attempt_mode != decision::TargetMode::ExecutorFollow;
+  EXPECT_TRUE(changed_other);
+}
+
+TEST(RetryDebounce, AttemptIsRecordedEvenWhenTheGoalIsNeverAccepted)
+{
+  // last_attempt_* 与 running_* 是两件事：前者在下发时就记，后者只在被接受时记。
+  // 这条用例保证两个字段都存在且互不干扰 —— 把它们合并回一个字段就会退回刷屏。
+  decision::WaypointExecutorState state;
+  EXPECT_FALSE(state.last_attempt_target.has_value());
+  EXPECT_FALSE(state.running_target.has_value());
+  state.last_attempt_target = decision::TargetName::WaitHome;
+  state.last_attempt_mode = decision::TargetMode::ExecutorFollow;
+  state.last_send_time_sec = 1.0;
+  EXPECT_TRUE(state.last_attempt_target.has_value());
+  EXPECT_FALSE(state.running_target.has_value()) << "被接受才该置 running_*";
+}
+
 }  // namespace
 
 TEST(WaypointExecutorClient, HomeAndWaitHomePreemptImmediately)
@@ -173,14 +218,16 @@ TEST(WaypointExecutorClient, MaintainsOnlyWaitTargets)
     EXPECT_TRUE(client.needMaintainReissue(target, robot, anchor, 2.0));
   }
 
-  for (const auto target : {
-      decision::TargetName::Home,
-      decision::TargetName::Center,
-      decision::TargetName::Patrol})
-  {
+  for (const auto target : {decision::TargetName::Home, decision::TargetName::Patrol}) {
     decision::WaypointExecutorClient client(config);
     EXPECT_FALSE(client.needMaintainReissue(target, robot, anchor, 1.0));
     EXPECT_FALSE(client.needMaintainReissue(target, robot, anchor, 2.0));
+  }
+  {
+    // Center 现在是"守中心"目标：偏出容差并保持 drift_hold 后会重发。
+    decision::WaypointExecutorClient client(config);
+    EXPECT_FALSE(client.needMaintainReissue(decision::TargetName::Center, robot, anchor, 1.0));
+    EXPECT_TRUE(client.needMaintainReissue(decision::TargetName::Center, robot, anchor, 2.0));
   }
 }
 
@@ -463,4 +510,34 @@ TEST(WaypointExecutorClient, TimeoutGuardSynthesizesAbortAndAllowsRetry)
     client.shouldRequestTarget(
       decision::TargetName::Center, decision::TargetMode::ExecutorFollow,
       std::nullopt, std::nullopt, 106.0));
+}
+
+TEST(TargetNeedsMaintainGoal, PatrolIsNotAMaintainTarget)
+{
+  // 回归测试：中心走位用 TargetName::Patrol 下发，而它**必须**不是守点型目标。
+  //
+  // 背景：走位的活动半径最远 1.58 m，而 maintain_goal.xy_tolerance 只有 0.35 m。
+  // 一旦走位被当成守点目标，纠偏会每 drift_hold_sec（0.8 s）把车拽回 wait_center
+  // 锚点一次 —— 走位直接废掉，观感是"往中心挪一点、被拽回来、再挪一点"。
+  //
+  // 这条隔离现在靠这个集合是"类型上"的，不依赖调用路径恰好绕过了门控。
+  EXPECT_FALSE(decision::targetNeedsMaintainGoal(decision::TargetName::Patrol));
+}
+
+TEST(TargetNeedsMaintainGoal, OnlyWaitStatesAreMaintainTargets)
+{
+  // 守点只该作用在"等待"类目标上：这三个的语义就是"待在某处"。
+  EXPECT_TRUE(decision::targetNeedsMaintainGoal(decision::TargetName::WaitHome));
+  EXPECT_TRUE(decision::targetNeedsMaintainGoal(decision::TargetName::WaitHp));
+  EXPECT_TRUE(decision::targetNeedsMaintainGoal(decision::TargetName::WaitCenter));
+  // Center 现在也是守点：到达后继续发，被挤开可恢复。
+  EXPECT_TRUE(decision::targetNeedsMaintainGoal(decision::TargetName::Center));
+
+  // 其余都是一次性导航目标，做完就换，不该被纠偏。
+  EXPECT_FALSE(decision::targetNeedsMaintainGoal(decision::TargetName::Home));
+  EXPECT_FALSE(decision::targetNeedsMaintainGoal(decision::TargetName::Patrol));
+  // 追击和走位一样：都是"在区域内移动"，不是"守住某个点"
+  EXPECT_FALSE(decision::targetNeedsMaintainGoal(decision::TargetName::Chase));
+  EXPECT_FALSE(decision::targetNeedsMaintainGoal(decision::TargetName::Zone));
+  EXPECT_FALSE(decision::targetNeedsMaintainGoal(decision::TargetName::Unknown));
 }

@@ -75,18 +75,18 @@ TEST(GimbalPostureStatePacket, DefaultIsRaisedNotLowered)
 
 TEST(GimbalPostureStatePacket, HeadIsDistinctFromBothOtherFrames)
 {
-  // 上行现在有两种帧（裁判 'H','L' 和姿态 'H','P'），长度不同。驱动靠第二个字节定帧型、
-  // 帧型定长度。三种帧的第二字节两两不同是这套解析能工作的前提。
+  // 上行现在有两种帧（裁判 'H','R' 和姿态 'H','P'），长度不同。驱动靠第二个字节定帧型、
+  // 帧型定长度。两类帧的第二字节不同是这套解析能工作的前提。
   const GimbalPostureStatePacket state{};
-  const DecisionPacket decision{};
+  const RefereePacketV2 referee{};
   const GimbalPosturePacket request{};
 
   EXPECT_EQ(state.head[0], static_cast<uint8_t>('H'));
   EXPECT_EQ(state.head[1], static_cast<uint8_t>('P'));
-  EXPECT_NE(state.head[1], decision.head[1]);
+  EXPECT_NE(state.head[1], referee.head[1]);
   EXPECT_NE(state.head[1], request.head[1]);
   // 上行两种帧长度不同 —— 所以必须靠帧型字节区分，不能靠长度。
-  EXPECT_NE(sizeof(GimbalPostureStatePacket), sizeof(DecisionPacket));
+  EXPECT_NE(sizeof(GimbalPostureStatePacket), sizeof(RefereePacketV2));
 }
 
 TEST(IsGimbalLowered, ZeroOnTheWireMeansLowered)

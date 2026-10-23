@@ -236,3 +236,60 @@ fov_far: 12.0, localization_rate_hz: 10.0, gicp_num_threads: 2, map_publish_rate
   防错锁的最终把关是 margin + 时序校验 + `first_localization_th`，三者都不通过就不写 TF。
 - **对外不广播中间态**：写门留在定位内部。下游只要「当前锁还能不能信」；`OBS_DEGRADED` / `SUSPECT` / `NORMAL`
   没有消费者按名字做事，已撤。也不要改成「只盯 `map→odom` 跳变」——跳变门看不到走廊投影、NIS 拒写、已锁错角。
+
+## 配准验收升级（3D Schur + χ² NIS）
+
+在原有 2D 条件数投影之上，`runICP` 现在对 FastGICP 的 6×6 Hessian 做**平移/旋转 Schur 子空间分析**：
+
+- `alignment_quality.hpp` 的 `analyzeSixDofObservability()`：分别算 `S_tt = H_tt - H_tr H_rr⁻¹ H_rt`
+  与 `S_rr`，给特征值/弱方向/观测秩/条件数；秩按相对阈值 `λ_i > ratio·λ_max` 判。
+- **退化时不再跳过一致性检验**：`computeScanToMapNisProjected()` 只保留 H3 的可观测子空间，
+  退化方向不参与白化也不参与判拒，dof=可观测秩，门限用自实现的 `chiSquareThreshold(dof, p)`
+  （regularized upper incomplete gamma，无 boost 依赖）。
+- **首配/重定位完整位姿门**：`require_full_pose_on_init=true` 时，首配/全局重定位必须
+  平移秩≥2 且 yaw 可观测才写 TF，否则 `LOST init_partial_pose` 继续等下一帧。
+  NIS 一致性检验只在**跟踪期**做：首配/重定位的 `pose_guess` 可能是出生点或漂移后的错锚点，
+  拿它当先验做 NIS 会拒掉正确候选（`lost_escape` 的教训），这部分交给完整位姿门。
+- **回退开关**：`nis_use_chi2: false` 精确回到旧行为（首配不做 NIS、退化跳过、固定阈值 12）；
+  `require_full_pose_on_init: false` 关闭完整位姿门。
+
+| 参数 | 默认 | 说明 |
+| :- | :- | :- |
+| `nis_use_chi2` | true | false = 旧固定阈值行为，现场一键回退 |
+| `nis_rejection_probability` | 1e-3 | χ² 上尾概率门限（越小越严） |
+| `nis_observable_eigen_ratio` | 1e-3 | 观测秩相对特征值阈值（同时用于 6DoF Schur 秩） |
+| `min_observable_rank` | 2 | 首配/重定位平移秩下限（实际取 max(2, 值)） |
+| `require_full_pose_on_init` | true | 首配/重定位完整位姿门 |
+
+新增 reason：`LOST init_partial_pose`（首配/重定位观测不足，未写 TF）。
+单测覆盖：`test/alignment_quality_test.cpp`（良态/走廊 rank2/单方向 rank1/旋转退化/χ² 数值/投影 NIS 正反例/完整位姿门）。
+
+## Scan Context 重定位（可选，默认关）
+
+LOST 后的全场重定位原本是 AABB×360° 网格穷举；打开 Scan Context 后先用描述子召回
+top-k 位置 + yaw 初值，再走**现有** top-k GICP 精化 + margin + 时序校验；召回不足自动回退网格搜索。
+候选语义与网格搜索一致：`T_map_base(yaw, xy) * T_base_odom`。
+
+用法：
+
+```sh
+# 1) 从与 fast_location 同一张先验 PCD 建库（参数与 .scdb 文件头绑定）
+ros2 run fast_location build_scan_context_map \
+  --input src/bringup/PCD/RMUL.pcd --output /abs/path/RMUL.scdb --step 1.0
+
+# 2) 在 fast_location 参数里打开（yaml 或命令行覆盖）
+#    enable_scan_context: true
+#    scan_context_map_path: /abs/path/RMUL.scdb
+#    scan_context_top_k: 15
+#    scan_context_min_candidates: 2
+ros2 run fast_location robot_localization_node --ros-args \
+  -p enable_scan_context:=true -p scan_context_map_path:=/abs/path/RMUL.scdb
+```
+
+注意事项：
+
+- 描述子按"最大 z（相对传感器）"编码，要求点云**重力对齐**；Lucifer 的 odom 系已对齐，
+  PCD 的 z=0 在开机雷达平面（`map_sensor_z=0`）。换用以地面为 z=0 的 PCD 时要相应改建库参数。
+- `.scdb` 与建库参数（rings/sectors/max_radius/map_sensor_z）强绑定；换图/精修地图后要重建。
+- 对称场地仍可能出现多个同分候选，最终防错锁靠现有 margin + 时序校验 + `first_localization_th`。
+- 已知边界：SC 库加载失败/路径为空只 WARN 并回退网格搜索，不影响主链路。

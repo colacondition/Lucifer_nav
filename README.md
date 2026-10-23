@@ -342,9 +342,96 @@ python3 src/bringup/tools/lidar_extrinsic_calibration.py lidar_calib --mount-z 0
 - x/y 是脚本从圆拟合里**估出来的**，不用手填；z（离地高度）和 yaw 手填。
 - 订阅 `/lio/robo/odom`：small_glim 把雷达位姿当 `base_link` 发出来（child=base_link
   实为雷达位姿），脚本据此恢复雷达相对 base_link 的偏移。
-- roll/pitch 是「绕垂直轴旋转 + 固定倾角」下的 circular mean。倾角绕 y 轴（pitch）
-  时结果精确；实车 URDF 现在写的是 `rpy="0.7854 0 0"`（绕 x 轴 roll=45°），绕 x 轴
-  的倾角在原地打转时 roll/pitch 会随 yaw 一起变，标出来的 roll/pitch 要结合雷达实际
-  安装朝向人工核对，别直接照抄。
+- **倾角（roll/pitch）原地打转测不出来**（旋转不改变倾角对圆轨迹的影响），上面的
+  脚本只给 x/y。倾角要用**静止时雷达 IMU 的重力方向**测，并用
+  `src/bringup/tools/lidar_mount_extrinsic.py` 把 x/y + 倾角 + 手填的 z/yaw 合成一份
+  完整外参（见 4.6 末尾的「三步标定」）：
+
+  ```sh
+  python3 src/bringup/tools/lidar_mount_extrinsic.py \
+      --spin-report lidar_extrinsic_result.json --imu-topic /livox/imu --imu-seconds 10
+  ```
+
+  它会打印可直接粘贴的 `xyz/rpy`，也能 `--write` 写回 yaml（自动备份），并自检
+  「z 与 segmentation.yaml 的 sensor_height 是否一致」。
 - 输出是 `base_link2livox_frame`，不是 small_glim 的 `sensors.T_lidar_imu`，别覆盖
   内部 IMU 外参。
+
+### 4.6 双雷达（驱动层融合，可选）
+
+> **配套的测试/标定工作空间**：[gitee.com/colacondition/dual_lidar_test](https://gitee.com/colacondition/dual_lidar_test)
+> —— 双雷达的指标测试（丢包/抖动/时间同步/融合/覆盖）、A↔B 一键标定、PTP 工具、
+> 两雷达位置可视化、BEV 俯视图、无硬件仿真都在那里。本仓库只负责上车后的运行，
+> 标定与体检一律用那个工作空间。
+
+补盲雷达接进来时，**导航链路一行配置都不用改**：融合做在 `mid360_driver` 内部，
+对外仍然是 `lidar_topic` 一个话题、`frame_id` 仍是 `livox_frame`，所以
+`cpp_lidar_filter` / `small_glim` / 两套 costmap 全部按原样工作。
+
+```sh
+# 单雷达（默认，行为与以前完全一致）
+ros2 launch bringup real.launch.py world:=RMUL mode:=nav
+
+# 双雷达（驱动层融合）
+ros2 launch bringup real.launch.py world:=RMUL mode:=nav dual_lidar:=true
+```
+
+| 项 | 单雷达 | 双雷达 |
+| :- | :- | :- |
+| 参数文件 | `config/reality/mid360_driver_real.yaml` | `config/reality/mid360_driver_dual.yaml` |
+| 话题 | `/livox/lidar/pointcloud` + `/livox/imu` | **同名**（下游零改动） |
+| 额外 TF | — | `base_link → livox_frame_b`（仅可视化/排障用） |
+
+**坐标系约定**：合并云在**主雷达 A 的雷达系**里（`merge_primary_ip` 那台，默认
+`.101`）。B 的点已用 `merge_extrinsic_secondary_to_primary` 变换到 A 系，所以 B 的
+倾角/位置都包含在这一个外参里，**不需要** `base_link→B` 参与任何计算。
+
+**主雷达选择的连带影响**（换主雷达时必须同步检查）：`merge_frame_id` 是固定字符串，
+换 `merge_primary_ip` 后合并云的物理含义就变了；`small_glim` 的 `sensors.T_lidar_imu`
+和 `measurement_params_*.yaml` 都按 A 配的，要一起确认。
+
+工程要点（细节见 `docs/dual_lidar.md` 与
+`src/driver/mid360_driver/INTERNAL_LIDAR_MERGE.md`）：
+
+- **融合窗口 20 ms**（不是上游的 5 ms）：我们是共用 100 ms 定时器发布，两路累积
+  窗口的最小时间戳天然差几毫秒，5 ms 会误杀一半帧。
+- **超窗只丢更旧的那一路**，否则会"丢一帧、错一拍"地死循环。
+- **降级模式**：某颗雷达掉线超过 1 s，就只用活着的那几路继续发（否则 LIO 和代价地图
+  全盲），并节流告警提示检查网线/供电（设备 HMS `0x0401` = 链路曾断开）。
+- **`merge_min_point_range: 0.3`** 裁自车近点：合并帧 38.7k → 13.7k 点，省渲染和算力。
+- **主雷达的 IMU 走无后缀话题** `/livox/imu`（副雷达仍带 IP 后缀），否则 `small_glim`
+  会一直 `drop LiDAR frame while waiting for IMU data`。
+
+**PTP 时间同步**（双雷达强烈建议开：能把两路雷达的相对漂移从 10 ppm 量级压到 1 ppm
+以内，且不再随时间累积）：
+
+```sh
+sudo apt install -y linuxptp
+sudo src/bringup/tools/ptp_master.sh start        # 软件时间戳（无 PHC 的网卡）
+src/bringup/tools/ptp_status.sh
+# 开机自启：sudo cp src/bringup/tools/ptp-master.service /etc/systemd/system/
+#           （NUC11PAHi5 的 i225 有 PHC：把 -S 改成 -H，网口改 enp86s0）
+```
+
+雷达侧**不需要任何配置**：接入带 PTP 主钟的网络后设备会自动同步。判据只看只读状态
+`time_sync_type = 1`（`python3 src/bringup/tools/livox_discover.py` 或 dual_lidar_test
+里的 `tools/livox_set_ip.py --query 0x800B,0x800C`）。
+
+**三步标定**（倾斜安装同样适用）：
+
+```sh
+# ① A↔B：产出 extrinsic_b（含 B 的倾角），在配套工作空间里
+#    仓库：https://gitee.com/colacondition/dual_lidar_test
+git clone https://gitee.com/colacondition/dual_lidar_test.git
+cd dual_lidar_test && source setup_env.sh && ./run.sh build && ./run.sh calib
+
+# ② A↔车体：原地打转拿 x/y → 静止 IMU 拿 roll/pitch → 手填 z/yaw → 合成写回
+python3 src/bringup/tools/lidar_extrinsic_calibration.py <spin.bag> --mount-z 0.49 --output /tmp/mount_spin
+python3 src/bringup/tools/lidar_mount_extrinsic.py \
+    --spin-report /tmp/mount_spin.json --imu-topic /livox/imu \
+    --extrinsic-b-from src/bringup/config/reality/mid360_driver_dual.yaml \
+    --write src/bringup/config/reality/measurement_params_real.yaml
+
+# ③ 改完 yaml 必须重新编译（launch 读 install/share 里的副本）
+colcon build --packages-select bringup
+```

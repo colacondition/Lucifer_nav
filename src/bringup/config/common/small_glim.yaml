@@ -61,6 +61,9 @@
       num_threads: 2
       min_points_after_filter: 100
     odometry_estimation:
+      # accel=旧行为（1s 加速度平均）；imu=直接用 IMU 姿态定初始 roll/pitch。
+      # 机器人启动时若还在下落/晃动，accel 会被水平加速度带偏，导致整条 odom 倾斜。
+      initial_attitude_source: "accel"
       use_init_world_imu: false
       init_pose_damping_scale: 1.0e+9
       initialization_window_size: 1.0

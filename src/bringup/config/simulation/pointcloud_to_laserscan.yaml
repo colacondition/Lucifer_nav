@@ -1,0 +1,8 @@
+# 仿真覆盖：min_height/max_height 是 target_frame（base_link = 雷达位姿）下的 z，
+# 不是地面高度。仿真雷达 h=0.175 m；common 的 min_height=0.05 会把 20 cm 台面
+# （z=+0.025）滤掉。改成"地面以上 5 cm"：min_height = -(0.175 - 0.05) = -0.125。
+# 输入已经是 /segmentation/obstacle（地面已分割掉），负值不会把地面带回来。
+pointcloud_to_laserscan:
+  ros__parameters:
+    min_height: -0.125
+    max_height: 1.2

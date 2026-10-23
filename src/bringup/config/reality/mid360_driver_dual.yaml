@@ -1,0 +1,49 @@
+# ============================================================================
+# 双 MID360 驱动参数（驱动层融合）—— 实车默认用 mid360_driver_real.yaml（单雷达）
+#
+# 用法：ros2 launch bringup real.launch.py dual_lidar:=true
+#
+# 设计要点（细节见 src/driver/mid360_driver/INTERNAL_LIDAR_MERGE.md）：
+#   * 融合做在驱动里，**对外仍然是 lidar_topic 这一个话题**，frame_id 仍是 livox_frame
+#     → cpp_lidar_filter / small_glim / 两套 costmap **一行配置都不用改**。
+#   * A（192.168.1.101，Mid-360S）是主雷达，合并帧的坐标系就是它的坐标系，
+#     small_glim 既有的 T_imu_lidar 因此仍然成立（B 的杠杆臂在驱动里已经补掉）。
+#   * 单路话题默认不发（merge_publish_individual: false）；需要离线标定/排障时改成 true。
+# ============================================================================
+/**:
+  ros__parameters:
+    lidar_topic: /livox/lidar/pointcloud   # 与单雷达配置**完全一致**，下游零改动
+    lidar_frame: livox_frame
+    imu_topic: /livox/imu
+    imu_frame: livox_frame
+    lidar_publish_time_interval: 0.1
+    host_ip: 192.168.1.50
+    validate_crc: true
+    max_packet_time_jump: 0.5
+    max_packet_time_span: 0.15
+    max_point_range: 30.0   # 原来 300：晃车/过弯时会扫到窗外几十米的点，对导航无用
+    max_imu_acc: 100.0
+    max_imu_gyro: 100.0
+    min_drop_log_interval: 0.1
+
+    # ---- 多设备分流（必须 true，否则无法按 IP 区分两颗雷达）----
+    is_topic_name_with_lidar_ip: true
+
+    # ---- 驱动内部双雷达融合 ----
+    enable_internal_lidar_merge: true
+    merge_primary_ip: "192.168.1.101"          # A = 主雷达（进 LIO 的那颗）
+    merge_output_topic: "/livox/lidar/pointcloud"
+    merge_frame_id: "livox_frame"
+    merge_max_interval_ms: 20.0                # 我们共用一个 100 ms 定时器，20 ms 才合适
+    merge_min_point_range: 0.3                 # 裁自车/工装近点：合并帧 38.7k → 13.4k
+    merge_publish_individual: false
+
+    # ---- 副雷达 → 主雷达 外参（2026-10-22 多轴旋转 + 双 IMU 正式标定，
+    #      48 对帧/10 接受，σ_t 11.3 mm / σ_r 0.53°；与 10-19 那次差 <5 mm、<0.6°，
+    #      两次正规标定互相验证。
+    #      原始多轴标定见 docs/dual_lidar.md。外参漂了就用 dual_lidar_test 的
+    #      quick_icp.py 重零，再用 extrinsic_check 的 nn_median 验证）----
+    # 平移 (-2.8, +124.7, -10.6) mm，旋转 (-0.58°, +0.25°, +0.50°)
+    # 独立验证：extrinsic_check 的 NN 中位 61 mm（标定前占位值 237 mm）
+    merge_extrinsic_secondary_to_primary:
+      [-0.000862, 0.118963, -0.006151, -0.019228, 0.011934, 0.006318]

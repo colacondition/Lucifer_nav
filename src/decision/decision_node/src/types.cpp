@@ -12,31 +12,25 @@ std::string toString(const TargetName target)
       return "wait_hp";
     case TargetName::Home:
       return "home";
+    case TargetName::HomeTunnel:
+      return "home_tunnel";
+    case TargetName::HomeSafe:
+      return "home_safe";
     case TargetName::Patrol:
       return "patrol";
     case TargetName::Center:
       return "center";
     case TargetName::WaitCenter:
       return "wait_center";
+    case TargetName::Chase:
+      return "chase";
+    case TargetName::Zone:
+      return "zone";
     case TargetName::Unknown:
       return "unknown";
   }
 
   return "unknown";
-}
-
-std::string toString(const EngagementState state)
-{
-  switch (state) {
-    case EngagementState::Calm:
-      return "calm";
-    case EngagementState::Engaging:
-      return "engaging";
-    case EngagementState::Suppressed:
-      return "suppressed";
-  }
-
-  return "calm";
 }
 
 TargetName targetNameFromString(const std::string & value)
@@ -50,6 +44,12 @@ TargetName targetNameFromString(const std::string & value)
   if (value == "home") {
     return TargetName::Home;
   }
+  if (value == "home_tunnel") {
+    return TargetName::HomeTunnel;
+  }
+  if (value == "home_safe") {
+    return TargetName::HomeSafe;
+  }
   if (value == "patrol") {
     return TargetName::Patrol;
   }
@@ -58,6 +58,12 @@ TargetName targetNameFromString(const std::string & value)
   }
   if (value == "wait_center") {
     return TargetName::WaitCenter;
+  }
+  if (value == "chase") {
+    return TargetName::Chase;
+  }
+  if (value == "zone") {
+    return TargetName::Zone;
   }
   return TargetName::Unknown;
 }

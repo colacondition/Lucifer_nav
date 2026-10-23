@@ -117,8 +117,9 @@ class Fixture(unittest.TestCase):
                 return True
         return False
 
-    def send_waypoints(self, waypoints):
+    def send_waypoints(self, waypoints, stop_at_final=True):
         goal = FollowWaypoints.Goal()
+        goal.stop_at_final = stop_at_final
         goal.waypoints.header.frame_id = 'map'
         for (x, y) in waypoints:
             ps = PoseStamped()
@@ -194,3 +195,46 @@ class TestFollowSemantics(Fixture):
         h = self.send_waypoints([WP2])
         status = self.await_result(h, timeout_s=14.0)
         self.assertEqual(status, 6, "MPC 卡死时应由 status_timeout 熔断并 ABORTED")
+
+class TestStopAtFinal(Fixture):
+    """stop_at_final=false：终点也按 switch_distance 切换，机器人**穿过**它不停。
+
+    这是中心走位用的模式 —— 走位是"在区域内连续移动"，不是"到某点停住"。
+    没有它的话每组点末尾都要减速停一次（接近段 + 终点容差），走位变成一顿一顿的。
+    """
+
+    def setUp(self):
+        self.base_goals = len(self.published_goals)
+
+    def _park_within_switch_but_outside_final_tolerance(self):
+        """停在 0.45m 处：> final_goal_tolerance(0.4)，<= switch_distance(0.5)。
+
+        这个位置是两条路径的分水岭 —— 只有"不停"模式才会在这里就收尾。
+        """
+        self.robot_x = WP2[0] - 0.45
+        end = time.monotonic() + 0.8
+        while time.monotonic() < end:
+            self.broadcast_robot_at(self.robot_x)
+            rclpy.spin_once(self.node, timeout_sec=0.05)
+
+    def test_01_passes_through_final_within_switch_distance(self):
+        """不停模式：终点在 switch_distance 内即完成，不等 final_goal_tolerance。"""
+        self._park_within_switch_but_outside_final_tolerance()
+        h = self.send_waypoints([WP2], stop_at_final=False)
+        status = self.await_result(h, timeout_s=8.0)
+        self.assertEqual(
+            status, 4,
+            "stop_at_final=false 时终点应在 switch_distance 内直接完成（不等容差）")
+
+    def test_02_default_still_waits_for_final_tolerance(self):
+        """默认（stop_at_final 缺省 true）：同样位置要等 GOAL_REACHED / 容差。
+
+        位置在 final_goal_tolerance 之外、MPC 又不发 GOAL_REACHED，所以必然走到
+        status_timeout 熔断 —— 这正是"到点停住"的语义，不能被新字段改掉。
+        """
+        self._park_within_switch_but_outside_final_tolerance()
+        h = self.send_waypoints([WP2])          # 不传 stop_at_final => 默认 true
+        status = self.await_result(h, timeout_s=14.0)
+        self.assertEqual(
+            status, 6,
+            "默认 stop_at_final=true 时不该在容差外提前完成，应由 status_timeout 熔断")

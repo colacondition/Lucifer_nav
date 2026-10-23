@@ -178,6 +178,7 @@ Visualization Manager:
       Size (Pixels): 2
       Size (m): 0.019999999552965164
       Style: Points
+      Queue Size: 1
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -239,8 +240,9 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.05000000074505806
-      Style: Boxes
+      Size (m): 0.03
+      Style: Points  
+      Queue Size: 1
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -275,6 +277,7 @@ Visualization Manager:
       Size (Pixels): 2
       Size (m): 0.019999999552965164
       Style: Points
+      Queue Size: 1
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -290,7 +293,7 @@ Visualization Manager:
     Background Color: 48; 48; 48
     # 建图模式下没有 map 帧。/Laser_map 发在 world 系里，所以取 world。
     Fixed Frame: odom
-    Frame Rate: 30
+    Frame Rate: 15
   Name: root
   # 没有 SetInitialPose / GoalTool / WaypointEditorTool：建图模式下 nav2 和
   # waypoint_editor 都没启动，那些工具点了只会往没人听的话题上发消息。

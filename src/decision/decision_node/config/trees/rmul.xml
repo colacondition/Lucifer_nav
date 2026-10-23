@@ -1,0 +1,113 @@
+<?xml version="1.0"?>
+<!--
+  RMUL（3v3，哨兵）决策树 —— **唯一生产树**（旧 FSM 已删除）。
+
+  根节点是自定义的 PriorityFallback（见 include/decision/bt_nodes.hpp）：
+    - 每拍从最高优先级子节点重新求值；
+    - 第一个 RUNNING 的分支被选中，低优先级分支不再 tick；
+    - 高优先级条件成立 ⇒ 抢占并触发上一分支动作的 onHalted；
+    - 任何时刻只有一个子树 RUNNING（内置 ReactiveFallback 做不到：它会继续 tick
+      低优先级兄弟节点，并禁止多个异步子节点同时 RUNNING）。
+
+  优先级（与旧 FSM 的可见行为等价，映射见 docs/decision/bt-scaffold.md §3）：
+    ① 定位 LOST  → Holding       旧 node 的完整性门在任何下发之前拦，故放最高优先级
+    ② 游戏未进行 → 回家/等待家    GameActive=false
+    ③ 低血       → 回家/等待回血  HpLow（120/400 迟滞，在 MissionRuntime 里算）
+    ④ 还没收到血量数据 → 等待家   旧 FSM 的 HOME.WAIT_HOME "waiting_for_hp"
+    ⑤ 正常       → 先 GoCenter（center.csv 成功）→ 到中心后才追敌/走位：
+                   有目标且可追（ChaseReady）→ ChaseStandoff（standoff + clampToZone）
+                   否则                    → PatrolCenter（中心区网格走位）
+
+  改优先级只改这个文件；节点名必须与 registerDecisionNodes() 里的 ID 一致。
+-->
+<root main_tree_to_execute="RMULDecision">
+  <BehaviorTree ID="RMULDecision">
+    <PriorityFallback name="root">
+
+      <!-- ① 定位 LOST：不新发 map 系目标，也不取消执行器里正在跑的目标。
+           用 ReactiveSequence：LOST 解除的下一拍立刻重新求值。
+           放最高优先级：旧 node 里完整性门先于所有状态动作下发。 -->
+      <ReactiveSequence name="localization_lost_hold">
+        <LocalizationLost/>
+        <Holding/>
+      </ReactiveSequence>
+
+      <!-- ② 游戏未进行：不在家就回家，到家后 WaitHome。 -->
+      <ReactiveSequence name="game_inactive">
+        <Inverter>
+          <GameActive/>
+        </Inverter>
+        <Fallback name="game_inactive_home_phase">
+          <Sequence name="game_inactive_already_home">
+            <HomeReached/>
+            <WaitHome/>
+          </Sequence>
+          <Sequence name="game_inactive_go_home">
+            <GoHome/>
+            <WaitHome/>
+          </Sequence>
+        </Fallback>
+      </ReactiveSequence>
+
+      <!-- ③ 血量 0：死亡等待复活，不再下发新目标（复活读条无协议字段，只能等）。
+           复活后 hp>0，落到下一分支，由 Revived 决定走隧道快线。 -->
+      <ReactiveSequence name="dead_waiting_revive">
+        <HpZero/>
+        <Holding/>
+      </ReactiveSequence>
+
+      <!-- ④ 低血（120/400 迟滞）：不在家就回家，到家后 WaitHp；HP 恢复后
+           HpLow 失效 → 自动落到"回中心"分支。
+           两条回家路线：
+             - 刚复活（Revived，20% 血/无敌 30s/虚弱）→ tunnel 快线，尽快到补给区；
+             - 残血但没死过 → safe 绕远路线，避免在隧道被拦截打死。 -->
+      <ReactiveSequence name="low_hp_recovery">
+        <HpLow/>
+        <Fallback name="low_hp_home_phase">
+          <Sequence name="low_hp_already_home">
+            <HomeReached/>
+            <WaitHp/>
+          </Sequence>
+          <Sequence name="low_hp_revived_tunnel">
+            <Revived/>
+            <GoHomeTunnel/>
+            <WaitHp/>
+          </Sequence>
+          <Sequence name="low_hp_go_home_safe">
+            <GoHomeSafe/>
+            <WaitHp/>
+          </Sequence>
+        </Fallback>
+      </ReactiveSequence>
+
+      <!-- ⑤ 比赛已开始但还没收到机器人状态：旧 FSM 停 HOME.WAIT_HOME 等血量。 -->
+      <ReactiveSequence name="waiting_for_hp_data">
+        <Inverter>
+          <HpKnown/>
+        </Inverter>
+        <HomeReached/>
+        <WaitHome/>
+      </ReactiveSequence>
+
+      <!-- ⑥a 还没到中心：先走 center.csv 到中心。center_reached 一旦置位（执行器
+           成功事件回调里锁存），下一拍守卫失效、动作被 halt，自然进入 ⑤b。 -->
+      <ReactiveSequence name="go_center_first">
+        <Inverter>
+          <CenterReached/>
+        </Inverter>
+        <GoCenter/>
+      </ReactiveSequence>
+
+      <!-- ⑥b 中心段行为：追击优先于走位，用 PriorityFallback 每拍重新求值，
+           目标出现立刻抢占走位、目标消失/下发失败回到走位。 -->
+      <PriorityFallback name="center_behavior">
+        <ReactiveSequence name="center_chase">
+          <ChaseReady/>
+          <ChaseStandoff/>
+        </ReactiveSequence>
+        <PatrolCenter/>
+      </PriorityFallback>
+
+    </PriorityFallback>
+  </BehaviorTree>
+</root>

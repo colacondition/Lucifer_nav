@@ -1,0 +1,40 @@
+# ============================================================================
+# PTP 主钟（systemd 单元模板）—— 让两颗 MID-360 上电就进 PTP 从钟模式
+#
+# 更省事的装法（自动探测 PHC 决定 -S/-H、自动填网口名）：
+#   sudo ./ptp_master.sh install enp86s0
+#
+# 或者手工：
+#   sudo cp tools/ptp-master.service /etc/systemd/system/
+#   # 先改界面名（本机 enp7s0；NUC11PAHi5 的 i225 一般是 enp86s0）：
+#   sudo sed -i 's/enp86s0/enp7s0/' /etc/systemd/system/ptp-master.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ptp-master
+#   systemctl status ptp-master --no-pager
+#
+# 时间戳模式：
+#   -S = 软件时间戳（网卡没有 PHC，如 Realtek RTL8111）
+#   -H = 硬件时间戳（NUC11PAHi5 的 Intel i225 有 PHC，精度好一个数量级）
+# 传输层：
+#   -2 = IEEE 802.3 二层（推荐：不受交换机 IGMP snooping 影响）
+#   -4 = UDP/IPv4 多播 224.0.1.129
+# ============================================================================
+[Unit]
+Description=Livox MID-360 PTP grandmaster (dual lidar time sync)
+After=network-online.target
+Wants=network-online.target
+# 关掉系统对时：NTP 步进/回拨会让 PTP 时间戳倒退（录包时间轴断裂）
+Conflicts=systemd-timesyncd.service
+
+[Service]
+Type=simple
+Environment=PTP_IFACE=enp86s0
+ExecStartPre=-/usr/bin/timedatectl set-ntp false
+ExecStart=/usr/sbin/ptp4l -i ${PTP_IFACE} -S -2 --utc_offset=0 -m
+Restart=always
+RestartSec=2
+# 实时优先级：不设也能跑，设了能明显减小 PTP 抖动
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

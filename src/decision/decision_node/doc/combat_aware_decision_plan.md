@@ -1,5 +1,17 @@
 # 战斗感知决策 (Combat-Aware Decision) 改造计划
 
+> ⚠️ **本文已被取代，留作历史背景。**
+>
+> 这里设计的 `CENTER` 交战子状态（`HOLD` / `ENGAGE` / `REPOSITION`）与
+> `DecisionContext::combatAssessment()`（`CombatConfig` / `EngagementState` /
+> `CombatAssessment`）**已经整体删除**。
+>
+> 删除的原因：核心动作 "被打 → REPOSITION 换位" 会**每次挨打都离开占领区**，
+> 按现在"占领权归先进入的一方、且区域内不能清空"的规则是有害动作。
+>
+> 现在 `CENTER` 段没有子状态，只有一套按时间驱动的中心走位 ——
+> 见 `README.md` §4 与 `sentry_tactics_rmul.md`。
+
 ## 1. 目标
 
 消除哨兵在中心区的"机械感":当前逻辑只看**比赛时间**和**绝对血量**，

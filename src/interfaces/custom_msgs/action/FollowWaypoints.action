@@ -2,6 +2,16 @@
 # 话题与 CSV——客户端到执行器的数据流收敛为一个 action。
 
 nav_msgs/Path waypoints
+
+# 最后一个航点是否要"停到位"。
+#
+# true（默认）：终点等 GOAL_REACHED 或 final_goal_tolerance，并只在终点启用接近段
+#   （减速/对准）。这是"到某个地方并停住"的语义，Home / WaitHp / Center 都用它。
+# false：终点也按 switch_distance 切换，**全程不开接近段** —— 机器人穿过所有点不停。
+#   中心走位用它，否则每组点末尾都要减速停一次，走位变成一顿一顿的。
+#
+# 默认 true 是为了让这个字段不影响既有调用方：不显式设置就是原来的行为。
+bool stop_at_final true
 ---
 bool success
 string message

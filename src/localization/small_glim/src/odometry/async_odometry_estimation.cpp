@@ -32,10 +32,12 @@ bool AsyncOdometryEstimation::latest_imu_bias(Eigen::Matrix<double, 6, 1>* out) 
 void AsyncOdometryEstimation::insert_imu(
     const double stamp,
     const Eigen::Vector3d& linear_acc,
-    const Eigen::Vector3d& angular_vel
+    const Eigen::Vector3d& angular_vel,
+    const Eigen::Quaterniond& orientation
 ) {
-    Eigen::Matrix<double, 7, 1> imu_data;
-    imu_data << stamp, linear_acc, angular_vel;
+    Eigen::Matrix<double, 11, 1> imu_data;
+    imu_data << stamp, linear_acc, angular_vel,
+        orientation.x(), orientation.y(), orientation.z(), orientation.w();
     input_imu_queue.push_back(imu_data);
 }
 
@@ -105,7 +107,9 @@ void AsyncOdometryEstimation::run() {
             const double stamp = imu[0];
             const Eigen::Vector3d linear_acc = imu.block<3, 1>(1, 0);
             const Eigen::Vector3d angular_vel = imu.block<3, 1>(4, 0);
-            odometry_estimation->insert_imu(stamp, linear_acc, angular_vel);
+            const Eigen::Quaterniond orientation(
+                imu(10), imu(7), imu(8), imu(9));  // w,x,y,z
+            odometry_estimation->insert_imu(stamp, linear_acc, angular_vel, orientation);
             last_imu_time = stamp;
         }
 

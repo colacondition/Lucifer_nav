@@ -20,9 +20,12 @@ install(DIRECTORY
 # 换场地时离线跑的工具，装成可执行方便 ros2 run 之外直接调用。
 #   pgm_to_navmap       —— slam_toolbox/map_saver_cli 存出的 pgm+yaml 转 msgpack（主链）
 #   semantic_map_editor —— msgpack 语义地图标注 GUI，人工补围栏、标隧道
+#   clean_map_dynamic   —— 建图关键帧多视角可见性清理动态残影（离线，PCD 进/PCD 出）
 install(PROGRAMS
   tools/pgm_to_navmap.py
   tools/semantic_map_editor.py
+  tools/clean_map_dynamic.py
+  tools/enhance_map_with_cloud.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -46,6 +49,10 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_pcd_reader test/test_pcd_reader.py
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
   ament_add_pytest_test(test_pgm_to_navmap test/test_pgm_to_navmap.py
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
+  ament_add_pytest_test(test_clean_map_dynamic test/test_clean_map_dynamic.py
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
+  ament_add_pytest_test(test_enhance_map_with_cloud test/test_enhance_map_with_cloud.py
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
 endif()
 

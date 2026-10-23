@@ -1,20 +1,19 @@
 <?xml version="1.0" ?>
-<!-- RMUL2026 场地 world（用户保存的摆放，别改场地位姿）。
+<!-- RMUL 2027 场地 world（仿真里 world:=RMUL 用的就是这份；RMUC 用 RMUC2024_world）。
 
-     场地布局直接照搬 /home/cola/RMUL27.world（用户在 Gazebo 里摆好/翻转后保存的）：
-       * 场地模型位姿 (0, 0, 0) 无旋转；
-       * meshes/RMUL27_world/model.sdf 里 link pose z=+0.320105，把行驶面抬到
-         世界 z=+0.005（支撑架在下面，埋到地面平面以下，看不见）；
-       * 用户相机视角原样保留。
+     场地位姿是"用户保存的摆放 + 新导出原点补偿"：
+       * meshes/RMUL27_world/model.sdf 里 link pose z=+0.447159，把光面抬到局部 +0.005；
+       * 本 world 里 include 位姿 (1.221072, -9.6, 0.005) + roll=180°，见下面 include 注释。
 
-     注意（和老的 world/RMUL2024_world/rmul27.world 对比）：
-       老 rmul27.world 用的是"立着导出"的 rmul27.STL，roll=-90° 放平后行驶面朝下、
-       支撑架悬在上方（世界 z 0.1~0.52），足迹 x∈[-6.964,5.636]、y∈[-4.3,4.3]；
-       本 world 是新导出的平铺版，行驶面朝上，场地在原点（足迹 x∈[-7.283,5.317]、
-       y∈[-8.6,0]）。
-       所以 bringup 里 map/RMUL*.msgpack、PCD/RMUL*.pcd 那套 map 系跟本 world 不重合，
-       要正经跑导航请用 mode:=mapping 重新建图（见 README 4.2），或自己把场地摆到
-       和旧足迹重合的位置。
+     为什么 include 的 x/y 不是 (0, -8.6)：新导出（2027赛季地图urdf.SLDASM/meshes/1.STL）
+     在 SolidWorks 里把装配体原点挪了 (-1.221, -1.0, -0.127)，直接摆 (0,-8.6) 会让整块
+     场地世界坐标平移。这里用 +1.221072 / -9.6 把平移补回来，场地世界足迹仍是上一版
+     RMUL27_world 的 x∈[-7.283, 5.317]、y∈[-8.6, 0]。
+
+     足迹必须保持不变：bringup 的 RMUL 出生点 (3.78, -6.55, yaw=1.57) 是按「map 系 =
+     开机瞬间机器人位姿」反推出来的，只有场地足迹跟上一版一致，map/RMUL*.msgpack、
+     PCD/RMUL.pcd 那套 map 系的 XY 才还对得上（推导见
+     pb_rm_simulation/launch/rm_simulation.launch.py 里 RMUL 的注释）。
 -->
 <sdf version='1.7'>
   <world name='RMUL27'>
@@ -86,24 +85,25 @@
     <!-- 场地：模型在 meshes/RMUL27_world，GAZEBO_MODEL_PATH 由
          rm_simulation.launch.py 追加 share/pb_rm_simulation/meshes。
 
-         位姿 (0, -8.6, 0.005) + roll=180°：
-           STL 是"光面朝上、带花纹面朝下"导出的（光面在局部 z=-0.3151，
-           花纹面在 z=-0.4151，支撑结构再往下），model.sdf 里 link pose
-           z=+0.320105 又把光面抬到局部 +0.005。这里绕 X 翻 180°：
+         位姿 (1.221072, -9.6, 0.005) + roll=180°：
+           STL 是"光面朝上、带花纹面朝下"导出的（光面在局部 z=-0.4422，
+           花纹面在 z=-0.5422，支撑结构再往下），model.sdf 里 link pose
+           z=+0.447159 又把光面抬到局部 +0.005。这里绕 X 翻 180°：
              花纹面（行驶面）→ 世界 z = 0.1 朝上
              光面           → 世界 z = 0.0（贴地）
              支撑结构       → 世界 z 0.1~0.52（在行驶面上方，即场地的墙/架）
-           足迹仍是 x∈[-7.283, 5.317]、y∈[-8.6, 0]，和用户保存的摆放一致（没挪地方）。
+           足迹 x∈[-7.283, 5.317]、y∈[-8.6, 0]。
+           x/y 的 +1.221072 / -9.6 是新导出原点平移的补偿（见文件头注释）。
     -->
     <include>
       <uri>model://RMUL27_world</uri>
-      <pose>0 -8.6 0.005 3.14159265 0 0</pose>
+      <pose>1.221072 -9.6 0.005 3.14159265 0 0</pose>
       <name>RMUL27_world</name>
     </include>
 
     <gui fullscreen='0'>
       <camera name='user_camera'>
-        <!-- 用户保存的视角（/home/cola/RMUL27.world 原样）。 -->
+        <!-- 用户之前保存的视角（/home/cola/RMUL27.world 原样），场地足迹没变，视角仍适用。 -->
         <pose>25.7396 -2.5426 26.8185 0 0.940001 3.00959</pose>
         <view_controller>orbit</view_controller>
         <projection_type>perspective</projection_type>

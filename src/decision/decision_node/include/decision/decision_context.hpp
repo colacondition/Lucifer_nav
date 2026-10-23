@@ -28,8 +28,6 @@ inline bool integrityStateIsLost(const std::string & payload)
 class DecisionContext
 {
 public:
-  explicit DecisionContext(CombatConfig combat_config = CombatConfig{});
-
   void setRobotStatus(const decision_interfaces::msg::RobotStatus & msg, double stamp_sec);
   void setGameStatus(const decision_interfaces::msg::GameStatus & msg, double stamp_sec);
   void setLocalizationStatus(const std::string & payload);
@@ -44,11 +42,7 @@ public:
   bool localizationLost() const;
   std::string localizationStatusPayload() const;
 
-  // 依据 is_attacked / shooter_heat 直接推断当前交战态势，不做掉血率推断。
-  CombatAssessment combatAssessment() const;
-
 private:
-  CombatConfig combat_config_;
   std::optional<std::string> localization_status_payload_;
 
   struct TimedRobotStatus

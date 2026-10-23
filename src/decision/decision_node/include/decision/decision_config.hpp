@@ -2,6 +2,9 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
+
+#include "decision/target_input.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -26,6 +29,11 @@ struct IntegrityGateConfig
 
 struct WaypointExecutorConfig
 {
+  // 执行器的节点名。用来做"是不是起了两个执行器"的自诊断 ——
+  // 两个同名 action server 会让客户端收到**两份**响应（第二份被 rclcpp_action
+  // 记为 "unknown goal/result response, ignoring..."），而且两个执行器会各自
+  // 驱动底盘互相打架。这个名字由 launch 的 `name=` 决定。
+  std::string node_name{"waypoint_follow_executor"};
   std::string saved_waypoint_file_topic{"/waypoint_editor/saved_waypoint_file"};
   std::string executor_waypoints_topic{"/waypoint_editor/executor_waypoints"};
   // action 接口（decision → 执行器的数据通路；旧 Trigger 服务/状态话题已废弃）
@@ -53,8 +61,39 @@ struct TargetConfig
   std::string center_waypoint_file;
   std::string wait_center_waypoint_file;
   std::string home_waypoint_file;
+  // 两类回家路线：
+  //   home_tunnel —— 复活后无敌/虚弱期走隧道快线，尽快到补给区解除虚弱；
+  //   home_safe   —— 残血回家绕远路，避免在隧道被拦截打死。
+  std::string home_tunnel_waypoint_file;
+  std::string home_safe_waypoint_file;
   std::string wait_home_waypoint_file;
   std::string wait_hp_waypoint_file;
+  // 中心占领区四个角点（range.csv），沿用同一套航点 CSV 格式
+  std::string zone_waypoint_file;
+};
+
+// 中心占领区：场地上的一个凸四边形，用来把追击目标夹在安全区内。
+//
+// ⚠️ 录点约定：range.csv 里的框是**实际判定区往里缩过**的，所以框里就含有安全余量。
+// 这带来两个好处：
+//   1. 框 ⊂ 真实区 ⇒ 夹到框里天然不会越出真实占领区
+//   2. patrol.csv 的点贴框边、甚至微出框几厘米都是正常的，**不是错误**
+// 因此 margin 只要很小（对冲定位抖动），叠大了就是双重内缩、白白浪费本来就不大的区域。
+struct CenterZoneConfig
+{
+  bool enable{true};
+  // 用来把自瞄的"云台系"坐标转到 map 的位姿取自哪个 frame。
+  //
+  // ⚠️ 必须是 **base_link**，不能是 maintain_goal.robot_base_frame(base_link_fake)。
+  //    super_lio 约定：`odom->base_link` 这个 TF 装的是**雷达位姿**
+  //    （small_glim_node.cpp:345 "the base_link odometry actually carries the lidar pose"），
+  //    而雷达装在云台上 ⇒ 它就是云台在 map 里的位姿，正是自瞄需要的那个旋转。
+  //    base_link_fake 的 yaw 被人为改成"路径切向"，拿它旋转会得到完全错误的方向。
+  std::string lidar_frame{"base_link"};
+  // 在四个角点基础上再往内缩多少米。默认 0.10：框本身已含余量，这只对冲定位抖动。
+  double margin_m{0.10};
+  // 某个巡逻点跑到框外超过这么多米就告警 —— 那才是录点/map 出错，而不是有意的内缩。
+  double warn_outside_m{0.30};
 };
 
 struct WaypointConfig
@@ -71,27 +110,37 @@ struct MaintainGoalConfig
   double drift_hold_sec{0.8};
 };
 
-// 战斗感知参数：把中心区行为从"定时巡逻"改为"按交战态势反应"。
-// 只依据两个直接信号判定，不做掉血率推断：
-//   shooter_heat 在开火（热量高） → 正面交火 ENGAGING，站定输出
-//   is_attacked   在挨打           → 被压制/被偷 SUPPRESSED，换位脱离
-//   两者皆无                       → 平静 CALM，守中心
-// 切换防抖由 engage_hold / reposition_hold 最小保持时长承担。
-struct CombatConfig
+// 追击：把敌人位置夹进区域当目标点。
+//
+// 判据全在 target_input.hpp 里做完了（防抖/迟滞/滤波/重发），这里只放参数。
+struct TargetChaseConfig
 {
   bool enable{true};
-  // shooter_heat 高于此值视为"我正在开火"（热量非零即视为最近在射击）。
-  int firing_heat_threshold{1};
-  // 进入 ENGAGE 后至少保持多久，避免交火状态抖动。
-  double engage_hold_sec{0.4};
-  // REPOSITION（被压制换位）后至少保持多久再重新评估。
-  double reposition_hold_sec{0.5};
-  // REPOSITION 换位路径长度：从点池随机挑 N 个不重复的点连成路径依次走完。
-  int reposition_path_len{3};
-  // 换位脱离进行中暂缓低血回家撤退的宽限时长：给换位动作时间完成，
-  // 避免"刚切到 REPOSITION 就被扣血拽回家、路径都还没出来"。
-  // 宽限结束仍低血才回家保命。
-  double reposition_grace_sec{3.0};
+  // 与敌人保持的距离（米）。目标点取"敌人周围这个半径的圆上、离车最近的那一点"，
+  // 而不是敌人本身 —— 离太近自瞄打不稳。
+  double standoff_m{1.5};
+  // 目标点离车比这还近就不下发（已经在圈上了，不用动）。避免原地抖。
+  double min_goal_move_m{0.3};
+  // 自瞄的话题名。上游 QoS 是 RELIABLE，订阅端**必须**也用 reliable，
+  // 否则一条都收不到、而且不报错。
+  std::string topic{"auto_aim_target_pos"};
+  TargetInputConfig input;
+};
+
+// 中心走位：在中心区域里按顺序走网格点，走完一组停一会儿再走下一组。
+//
+// 刻意**没有**激进度、也**不看时间**：哪一侧算"激进"取决于场上实际结构
+// （过道是 S 型的、哪一侧有掩护、敌人从哪个口进来），不是能从坐标推出来的量。
+// 走位本身也不改变占领权，它只是"别站着不动"。
+struct CenterPatrolConfig
+{
+  bool enable{true};
+  // 区域网格的格距（米）。越小点越密、走得越细，但也越琐碎。
+  double grid_spacing_m{0.5};
+  // 一条路径取几个网格点。
+  int path_len{3};
+  // 一组走完之后停顿多久再走下一组（从"走完那一刻"起算）。
+  double group_gap_sec{4.5};
 };
 
 struct DecisionConfig
@@ -112,7 +161,9 @@ struct DecisionConfig
   TargetConfig targets;
   WaypointConfig waypoint;
   MaintainGoalConfig maintain_goal;
-  CombatConfig combat;
+  CenterZoneConfig center_zone;
+  TargetChaseConfig target_chase;
+  CenterPatrolConfig center_patrol;
 };
 
 void declareDecisionParameters(rclcpp::Node & node);

@@ -84,7 +84,7 @@ WaypointExecutorState WaypointExecutorClient::applyExecutorResult(
 bool WaypointExecutorClient::shouldPreemptImmediately(TargetName target) const
 {
   (void)state_;
-  return target == TargetName::Home || target == TargetName::WaitHome;
+  return isHomeTarget(target) || target == TargetName::WaitHome;
 }
 
 bool WaypointExecutorClient::needMaintainReissue(
@@ -195,7 +195,8 @@ bool WaypointExecutorClient::stepExecutorTarget(
   const std::string & waypoint_file,
   const std::vector<Pose> & waypoints,
   bool immediate_preempt,
-  double now_sec)
+  double now_sec,
+  bool stop_at_final)
 {
   if (mode != TargetMode::ExecutorFollow && mode != TargetMode::ExecutorThrough) {
     return false;
@@ -214,9 +215,18 @@ bool WaypointExecutorClient::stepExecutorTarget(
   // 挡在这里会让非 Home 目标永远无法打断正在执行的任务（决策卡死）。
   //
   // 防抖只作用于「同目标的重复重试」：切目标（抢占）必须立刻发出。
+  //
+  // ⚠️ 判据用 last_attempt_*（上次**下发**的目标）而不是 running_target：
+  //    running_target 只在 goal 被接受时才置位，目标连接受都没接受就被 abort
+  //    （例如 TF 还没起来）时它一直是 Unknown ⇒ 每拍都算"换目标" ⇒ 去抖失效 ⇒
+  //    以 loop_hz 疯狂重发。用"上次尝试"就与是否被接受无关了。
+  //
+  // ⚠️ immediate_preempt **不再**绕过去抖：它的含义是"别等上一个目标收尾，
+  //    并且把首点直接发给导航"，不是"忽略重试间隔"。绕过的话 Home/WaitHome
+  //    一旦被拒就会同样刷屏。
   const bool target_changed =
-    state_.running_target != target || state_.running_mode != mode;
-  if (!immediate_preempt && !target_changed &&
+    state_.last_attempt_target != target || state_.last_attempt_mode != mode;
+  if (!target_changed &&
     now_sec - state_.last_send_time_sec < config_.retry_interval_sec)
   {
     return false;
@@ -239,12 +249,15 @@ bool WaypointExecutorClient::stepExecutorTarget(
   }
 
   state_.last_send_time_sec = now_sec;
+  state_.last_attempt_target = target;
+  state_.last_attempt_mode = mode;
   state_.active_target = target;
   state_.result_status = ExecutorResultStatus::None;
   last_goal_progress_sec_ = now_sec;
 
   auto goal = FollowWaypoints::Goal();
   goal.waypoints = path_msg;
+  goal.stop_at_final = stop_at_final;
 
   auto options = rclcpp_action::Client<FollowWaypoints>::SendGoalOptions();
   options.goal_response_callback =
@@ -359,10 +372,15 @@ double WaypointExecutorClient::distance(const Pose & a, const Pose & b) const
   return std::sqrt(dx * dx + dy * dy);
 }
 
-bool WaypointExecutorClient::isWaitTarget(TargetName target) const
+bool targetNeedsMaintainGoal(TargetName target)
 {
   return target == TargetName::WaitHome || target == TargetName::WaitHp ||
-         target == TargetName::WaitCenter;
+         target == TargetName::WaitCenter || target == TargetName::Center;
+}
+
+bool WaypointExecutorClient::isWaitTarget(TargetName target) const
+{
+  return targetNeedsMaintainGoal(target);
 }
 
 void WaypointExecutorClient::clearMaintainDrift()

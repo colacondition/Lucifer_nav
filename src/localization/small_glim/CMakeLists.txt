@@ -32,6 +32,10 @@ target_link_libraries(${PROJECT_NAME} OpenMP::OpenMP_CXX)
 find_package(Eigen3 REQUIRED)
 target_link_libraries(${PROJECT_NAME} Eigen3::Eigen)
 
+# 同 linefit：本机 /lib 下的 PCLConfig 反推 PCL_ROOT 会丢 /usr，clean build 失败。
+if(NOT DEFINED PCL_DIR AND EXISTS "/usr/lib/x86_64-linux-gnu/cmake/pcl/PCLConfig.cmake")
+  set(PCL_DIR "/usr/lib/x86_64-linux-gnu/cmake/pcl" CACHE PATH "PCL config dir")
+endif()
 find_package(PCL REQUIRED)
 target_include_directories(${PROJECT_NAME} PRIVATE ${PCL_INCLUDE_DIRS})
 target_compile_definitions(${PROJECT_NAME} PRIVATE ${PCL_DEFINITIONS})

@@ -30,7 +30,10 @@ public:
     * @param linear_acc    Linear acceleration
     * @param angular_vel   Angular velocity
     */
-    void insert_imu(const double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel);
+    void insert_imu(
+        const double stamp, const Eigen::Vector3d& linear_acc,
+        const Eigen::Vector3d& angular_vel,
+        const Eigen::Quaterniond& orientation = Eigen::Quaterniond::Identity());
     /// 最新一帧原始陀螺（body 系）。内部 IMU 队列为空时返回 false。
     /// 线程安全性同 insert_imu（经内部队列锁/单写者纪律）。
     bool latest_angular_velocity(Eigen::Vector3d* out) const;
@@ -85,7 +88,8 @@ private:
     std::thread thread;
 
     // Input queues
-    ConcurrentQueue<Eigen::Matrix<double, 7, 1>> input_imu_queue {DataStorePolicy::UPTO(100)};
+    // [stamp, acc(3), gyro(3), q(4)] = 11
+    ConcurrentQueue<Eigen::Matrix<double, 11, 1>> input_imu_queue {DataStorePolicy::UPTO(100)};
     ConcurrentQueue<PreprocessedFrame::Ptr> input_frame_queue {DataStorePolicy::UPTO(100)};
 
     // Output queues

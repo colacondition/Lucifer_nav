@@ -31,6 +31,10 @@ slam_toolbox:
     # /scan 的 range_max 是 10（见 launch 里 pointcloud_to_laserscan 的参数），
     # HL 原值 20 只是雷达量程上限，这里对齐成 10。
     max_laser_range: 10.0
+    # /scan 来自 pointcloud_to_laserscan，range_min 是 0.4 m。原来这里没写，
+    # slam_toolbox 默认 0.0 → 启动时告警 "minimum laser range setting (0.0 m)
+    # exceeds the capabilities of the used Lidar (0.4 m)"。填 0.4 与传感器一致。
+    min_laser_range: 0.4
     minimum_time_interval: 0.5
     transform_timeout: 0.2
     tf_buffer_duration: 30.

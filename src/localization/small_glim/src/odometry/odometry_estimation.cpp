@@ -183,10 +183,11 @@ void OdometryEstimationCPU::update_target(
 void OdometryEstimationCPU::insert_imu(
     const double stamp,
     const Eigen::Vector3d& linear_acc,
-    const Eigen::Vector3d& angular_vel
+    const Eigen::Vector3d& angular_vel,
+    const Eigen::Quaterniond& orientation
 ) {
     if (init_estimation) {
-        init_estimation->insert_imu(stamp, linear_acc, angular_vel);
+        init_estimation->insert_imu(stamp, linear_acc, angular_vel, orientation);
     }
     imu_integration->insert_imu(stamp, linear_acc, angular_vel);
 }

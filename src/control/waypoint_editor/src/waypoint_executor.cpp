@@ -358,10 +358,12 @@ private:
     executor_status_pub_->publish(msg);
   }
 
+  // must_stop：这个点是否要"停到位"。为 true 时等 GOAL_REACHED / final_goal_tolerance；
+  // 为 false 时按 switch_distance 切换（穿过不停）。
   bool waitUntilWaypoint(
     const geometry_msgs::msg::PoseStamped & goal,
     std::size_t index,
-    bool is_final_goal)
+    bool must_stop)
   {
     const auto start_time = now();
     auto last_publish_time = now() - rclcpp::Duration::from_seconds(goal_republish_interval_);
@@ -395,8 +397,9 @@ private:
       }
 
       if (mode_ == Mode::Follow) {
-        // follow：非终点距离到了就切下一个；终点等 GOAL_REACHED 或距离容差。
-        if (is_final_goal) {
+        // follow：要停的点等 GOAL_REACHED 或距离容差；其余距离到了就切下一个
+        // （stop_at_final=false 时终点也走这一支，于是机器人穿过它不停）。
+        if (must_stop) {
           if (latest_status == "GOAL_REACHED" || remaining <= final_goal_tolerance_) {
             RCLCPP_INFO(get_logger(), "Final waypoint reached");
             return true;
@@ -443,16 +446,17 @@ private:
         latest_status_.clear();
       }
 
-      const bool is_final_goal = (i + 1 == waypoints.size());
-      publishApproachEnabled(approach_always_on || is_final_goal);
+      // 服务通路没有 goal，等价于 stop_at_final=true（终点要停到位），保持原行为。
+      const bool must_stop = (i + 1 == waypoints.size());
+      publishApproachEnabled(approach_always_on || must_stop);
       publishGoal(waypoints[i]);
       RCLCPP_INFO(
         get_logger(), "Sent waypoint %zu / %zu%s: x=%.2f y=%.2f frame=%s",
-        i + 1, waypoints.size(), is_final_goal ? " (final)" : "",
+        i + 1, waypoints.size(), must_stop ? " (final)" : "",
         waypoints[i].pose.position.x, waypoints[i].pose.position.y,
         waypoints[i].header.frame_id.c_str());
 
-      if (!waitUntilWaypoint(waypoints[i], i + 1, is_final_goal)) {
+      if (!waitUntilWaypoint(waypoints[i], i + 1, must_stop)) {
         publishApproachEnabled(true);
         worker_running_ = false;
         publishExecutorStatus(stop_requested_ ? "IDLE" : "ABORTED");
@@ -564,6 +568,8 @@ private:
     if (approach_always_on) {
       publishApproachEnabled(true);
     }
+    // 最后一次求值需要 goal，这里取一次即可（goal 在本次执行期间不可变）。
+    const bool stop_at_final = goal_handle->get_goal()->stop_at_final;
 
     auto result = std::make_shared<FollowWaypoints::Result>();
     auto feedback = std::make_shared<FollowWaypoints::Feedback>();
@@ -585,17 +591,20 @@ private:
       }
 
       const bool is_final_goal = (i + 1 == waypoints.size());
-      publishApproachEnabled(approach_always_on || is_final_goal);
+      // stop_at_final=false 时终点也不停，接近段自然全程关闭 —— 接近段的作用就是
+      // "最后一段减速对准"，不停就不需要它。
+      const bool must_stop = is_final_goal && stop_at_final;
+      publishApproachEnabled(approach_always_on || must_stop);
       publishGoal(waypoints[i]);
       feedback->current_index = static_cast<int32_t>(i + 1);
       feedback->status = "RUNNING";
       safeFeedback(goal_handle, feedback, get_logger());
       RCLCPP_INFO(
         get_logger(), "Action waypoint %zu / %zu%s: x=%.2f y=%.2f",
-        i + 1, waypoints.size(), is_final_goal ? " (final)" : "",
+        i + 1, waypoints.size(), must_stop ? " (final)" : "",
         waypoints[i].pose.position.x, waypoints[i].pose.position.y);
 
-      if (!waitUntilWaypoint(waypoints[i], i + 1, is_final_goal)) {
+      if (!waitUntilWaypoint(waypoints[i], i + 1, must_stop)) {
         result->success = false;
         result->message = stop_requested_ ? "canceled" : "aborted";
         publishApproachEnabled(true);

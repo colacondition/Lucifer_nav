@@ -13,7 +13,12 @@ waypoint_follow_executor:
     approach_enabled_topic: "/goal_approach_controller/enabled"
     robot_base_frame: "base_link_fake"
     global_frame: "map"
-    switch_distance: 0.6
+    # 非终点航点距此值以内即切下一个。**必须明显小于航点间距**，否则机器人"刚开始
+    # 走"就算到点了 —— 中心走位的点间距只有 0.37~1.88 m（多数 ~0.5 m），原来 0.6 比
+    # 多数间距还大，导致每组 3 个点实际只走 0.4~0.8 m 就整组完成。
+    # 下限受导航栈的 goal_tolerance(0.25) 约束：低于它就永远等不到，follow 会超时中止。
+    # 0.3 留了 0.05 的余量。
+    switch_distance: 0.3
     final_goal_tolerance: 0.35
     fallback_tolerance: 0.35
     goal_republish_interval: 1.0

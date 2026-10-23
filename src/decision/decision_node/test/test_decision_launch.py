@@ -55,6 +55,7 @@ class StandaloneDecisionLaunchTest(unittest.TestCase):
 
         decision_share = Path(get_package_share_directory("decision"))
         bringup_share = Path(get_package_share_directory("bringup"))
+        sentry_waypoints_share = Path(get_package_share_directory("sentry_waypoints"))
         installed_launch = decision_share / "launch" / "decision.launch.py"
         self.assertTrue(
             installed_launch.exists(), f"missing installed launch file: {installed_launch}"
@@ -62,13 +63,20 @@ class StandaloneDecisionLaunchTest(unittest.TestCase):
 
         self.assertEqual(
             [type(entity) for entity in description.entities],
-            [DeclareLaunchArgument, DeclareLaunchArgument, DeclareLaunchArgument, Node, Node],
+            [
+                DeclareLaunchArgument,
+                DeclareLaunchArgument,
+                DeclareLaunchArgument,
+                DeclareLaunchArgument,
+                Node,
+                Node,
+            ],
         )
 
-        arguments = description.entities[:3]
+        arguments = description.entities[:4]
         self.assertEqual(
             [argument.name for argument in arguments],
-            ["params_file", "log_level", "node_output"],
+            ["params_file", "log_level", "node_output", "start_waypoint_executor"],
         )
         context = LaunchContext()
         self.assert_argument_default(
@@ -79,12 +87,12 @@ class StandaloneDecisionLaunchTest(unittest.TestCase):
         self.assert_argument_default(arguments[1], context, "info")
         self.assert_argument_default(arguments[2], context, "screen")
 
-        nodes = description.entities[3:]
+        nodes = description.entities[4:]
         self.assertEqual(
             [(node.node_package, node.node_executable) for node in nodes],
             [
                 ("waypoint_editor", "waypoint_executor"),
-                ("decision", "bt_action_replacement_node"),
+                ("decision", "bt_decision_node"),
             ],
         )
         self.assertEqual(
@@ -101,23 +109,38 @@ class StandaloneDecisionLaunchTest(unittest.TestCase):
         executor_parameters = _node_field(nodes[0], "parameters")
         self.assertEqual(executor_parameters, [])
 
+        # ⚠️ 执行器默认**不启动**：执行器属于导航栈，sim.launch.py / real.launch.py
+        # 都已经起了一个。这里再起一个就是两个同名 action server，客户端会收到两份
+        # 响应（第二份被 rclcpp_action 记为 "unknown goal/result response"），
+        # 而且两个执行器会各自驱动底盘互相打架。
+        # launch_ros 的 Node 把 condition 存在 _Action__condition，有公开的 condition 属性
+        self.assertIsNotNone(
+            nodes[0].condition, "执行器应当带 IfCondition(start_waypoint_executor)")
+
         decision_parameters = _node_field(nodes[1], "parameters")
         self.assertEqual(len(decision_parameters), 2)
         self.assertIsInstance(decision_parameters[0], ParameterFile)
         self.assert_launch_configuration(decision_parameters[0].param_file, "params_file")
+        # 航点单一真源是 sentry_waypoints（和 bringup/launch/real.launch.py 一致）。
+        # 以前这里断言的是 bringup/config/waypoints/RMUL —— 那个目录**已经不存在了**，
+        # 于是这个测试一直在为一条读不到任何航点的配置背书（单独起决策节点时
+        # 表现就是 "读不到中心区域角点 / CENTER 段会原地不动"）。
         expected_waypoint_files = {
             f"targets.{target}_waypoint_file": str(
-                bringup_share / "config" / "waypoints" / "RMUL" / f"{target}.csv"
+                sentry_waypoints_share / "waypoints" / "RMUL" / f"{target}.csv"
             )
             for target in (
-                "patrol",
                 "center",
-                "wait_center",
-                "home",
                 "wait_home",
-                "wait_hp",
+                "home_tunnel",
+                "home_safe",
             )
         }
+        # 中心区域四角：参数名是 zone_waypoint_file，文件名却是 range.csv ——
+        # 显式对上，不要按目标名去推（推出来是 zone.csv，读不到）。
+        expected_waypoint_files["targets.zone_waypoint_file"] = str(
+            sentry_waypoints_share / "waypoints" / "RMUL" / "range.csv"
+        )
         self.assertEqual(
             self.evaluated_parameters(decision_parameters[1], context),
             expected_waypoint_files,

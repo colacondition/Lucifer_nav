@@ -1,0 +1,13 @@
+# 实车覆盖：min_height/max_height 是 pointcloud_to_laserscan 在 target_frame
+# （base_link = 雷达/云台位姿）下的 z 边界，不是地面高度。
+#
+# 实车雷达安装高度 h≈0.49 m。原来 common 的 min_height=0.05 表示"雷达平面以上
+# 5 cm"，换算到地面是 0.54 m —— 20 cm 高台的台面 z≈-0.29 会被整片滤掉，
+# 建图只剩零星噪点。这里改成"地面以上 5 cm"：
+#   min_height = -(h - 0.05) = -0.44
+# 输入已经是 /segmentation/obstacle（地面已分割掉），这个负值不会把地面带回来；
+# 它只用于保留低矮障碍（20 cm 台面、坡沿）。
+pointcloud_to_laserscan:
+  ros__parameters:
+    min_height: -0.44
+    max_height: 1.2

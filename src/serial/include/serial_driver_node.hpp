@@ -20,6 +20,7 @@
 
 #include "crc.hpp"
 #include "packet.hpp"
+#include "referee_conversion.hpp"
 #include "serial_port.hpp"
 
 namespace serial_driver
@@ -36,7 +37,8 @@ private:
   void receive();
   void processReceiveBuffer();
   bool handlePacket(const uint8_t * data, std::size_t size);
-  void publishDecisionPacket(const DecisionPacket & packet);
+  // 裁判帧是变长的（帧内带 payload_len），所以按裸字节 + 实际帧长传入，不按 struct 长度。
+  void publishRefereePacket(const uint8_t * data, std::size_t size);
   void publishGimbalPostureState(const GimbalPostureStatePacket & packet);
   void ChassisCmdCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
   void GimbalPostureCallback(const decision_interfaces::msg::GimbalPosture::SharedPtr msg);
@@ -97,7 +99,8 @@ private:
   std::atomic<int> write_fail_streak_{0};
   bool allow_fallback_{true};
   int write_fail_reopen_threshold_{20};
-  std::atomic<uint64_t> received_decision_count_{0};
+  // 裁判帧收帧计数。「一帧都没收到」是电控那边没接通的最直接证据（状态日志里的 referee_rx）。
+  std::atomic<uint64_t> received_referee_count_{0};
   std::atomic<int> last_write_size_{0};
 
   // 导航侧想要的姿态。存当前值、按周期跟回传比对，不进 transmit_buffer 排队 —— 排队的话

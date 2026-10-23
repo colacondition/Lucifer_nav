@@ -2,13 +2,19 @@
 """手动发布决策节点输入话题的测试 GUI。
 
 发布：
-  - robot_status (RobotStatus): current_hp / shooter_heat / is_attacked / robot_id / team_color
-  - game_status  (GameStatus):  game_progress / stage_remain_time
+  - robot_status (RobotStatus): robot_id / current_hp / is_attacked
+  - game_status  (GameStatus):  game_type / game_progress / stage_remain_time
 订阅：
   - /decision/state (std_msgs/String): 实时回显当前决策状态
 
-用于在仿真中验证战斗感知决策：拨动 shooter_heat / is_attacked / 让 hp 变化，
-观察 CENTER 段在 HOLD / ENGAGE / REPOSITION 之间的切换。
+用途：
+  - 让哨兵出门（game_progress=4 + 给它一个有意义的血量）
+  - 拨 stage_remain_time 看中心走位换位置（它决定走位的激进度，见 README §4）
+  - 扣血到低阈值以下，看它回家
+
+注意 RobotStatus 里 shooter_heat / team_color 已经不再填充（那两路数据不在上行帧里），
+所以本 GUI 也不发它们。想让"出门→到达中心→走位"这条链路跑通，还需要真实的定位与
+航点 CSV（或者仿真）。
 """
 
 import sys
@@ -57,8 +63,6 @@ class TestTopicsPublisherGUI:
         # RobotStatus 字段
         self.robot_id_var = tk.StringVar(value="7")
         self.current_hp_var = tk.StringVar(value="400")
-        self.shooter_heat_var = tk.StringVar(value="0")
-        self.team_color_var = tk.BooleanVar(value=False)
         self.is_attacked_var = tk.BooleanVar(value=False)
         # 持续掉血：每帧（0.1s）扣 10 点血，模拟持续被打（会一路扣到低血触发撤退）。
         self.drain_hp_var = tk.BooleanVar(value=False)
@@ -100,18 +104,12 @@ class TestTopicsPublisherGUI:
         ttk.Button(hp_btns, text="+50", width=4, command=lambda: self._bump_hp(50)).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(hp_btns, text="重置400", width=6, command=lambda: self._set_hp(400)).pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Label(robot_frame, text="Shooter Heat").grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=2)
-        ttk.Entry(robot_frame, textvariable=self.shooter_heat_var, width=12).grid(row=2, column=1, sticky=tk.W, pady=2)
-
-        ttk.Checkbutton(robot_frame, text="team_color (蓝=勾选)", variable=self.team_color_var).grid(
-            row=3, column=0, columnspan=2, sticky=tk.W, pady=2
-        )
         ttk.Checkbutton(robot_frame, text="is_attacked (正在挨打)", variable=self.is_attacked_var).grid(
-            row=4, column=0, columnspan=2, sticky=tk.W, pady=2
+            row=2, column=0, columnspan=2, sticky=tk.W, pady=2
         )
         ttk.Checkbutton(
-            robot_frame, text="持续掉血 (模拟被偷)", variable=self.drain_hp_var
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=2)
+            robot_frame, text="持续掉血 (模拟被打)", variable=self.drain_hp_var
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=2)
 
         # ---- GameStatus ----
         game_frame = ttk.LabelFrame(main, text="GameStatus", padding=8)
@@ -126,10 +124,8 @@ class TestTopicsPublisherGUI:
         # ---- 场景快捷键 ----
         scenario = ttk.LabelFrame(main, text="快捷场景", padding=8)
         scenario.pack(fill=tk.X, pady=(0, 10))
-        ttk.Button(scenario, text="平静占区", command=self._scene_calm).pack(side=tk.LEFT)
-        ttk.Button(scenario, text="正面交火", command=self._scene_engage).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(scenario, text="被压制/偷", command=self._scene_suppressed).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(scenario, text="低血量", command=self._scene_low_hp).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(scenario, text="平静", command=self._scene_calm).pack(side=tk.LEFT)
+        ttk.Button(scenario, text="低血量(回家)", command=self._scene_low_hp).pack(side=tk.LEFT, padx=(6, 0))
 
         # ---- 回显 ----
         echo = ttk.LabelFrame(main, text="决策回显", padding=8)
@@ -153,23 +149,11 @@ class TestTopicsPublisherGUI:
         self.current_hp_var.set(str(max(0, min(65535, hp))))
 
     def _scene_calm(self) -> None:
-        self.shooter_heat_var.set("0")
         self.is_attacked_var.set(False)
         self.drain_hp_var.set(False)
 
-    def _scene_engage(self) -> None:
-        # 开火 + 挨打：正面交火（持续掉血关闭，靠 shooter_heat 驱动）
-        self.shooter_heat_var.set("120")
-        self.is_attacked_var.set(True)
-        self.drain_hp_var.set(False)
-
-    def _scene_suppressed(self) -> None:
-        # 挨打但没开火：被压制/被偷。判定只看 is_attacked，不看掉血。
-        self.shooter_heat_var.set("0")
-        self.is_attacked_var.set(True)
-        self.drain_hp_var.set(False)
-
     def _scene_low_hp(self) -> None:
+        # 低阈值是 120（见 yaml 的 hp_recovery.low_threshold）：低于它就该回家。
         self.current_hp_var.set("80")
 
     # ---- ROS 回调 ----
@@ -197,7 +181,6 @@ class TestTopicsPublisherGUI:
         try:
             robot_id = int(self.robot_id_var.get().strip())
             current_hp = int(self.current_hp_var.get().strip())
-            shooter_heat = int(self.shooter_heat_var.get().strip())
             game_progress = int(self.game_progress_var.get().strip())
             stage_remain_time = int(self.stage_remain_time_var.get().strip())
         except ValueError:
@@ -211,8 +194,6 @@ class TestTopicsPublisherGUI:
         robot_msg = RobotStatus()
         robot_msg.robot_id = max(0, min(255, robot_id))
         robot_msg.current_hp = max(0, min(65535, current_hp))
-        robot_msg.shooter_heat = max(0, min(65535, shooter_heat))
-        robot_msg.team_color = bool(self.team_color_var.get())
         robot_msg.is_attacked = bool(self.is_attacked_var.get())
         self._pub_robot_status.publish(robot_msg)
 

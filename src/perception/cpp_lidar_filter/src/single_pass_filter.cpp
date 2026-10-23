@@ -110,13 +110,22 @@ bool filterSinglePass(
   }
 
   const std::size_t point_step = static_cast<std::size_t>(input.point_step);
-  if (point_step == 0 || input.width == 0 || input.height == 0) {
+  if (point_step == 0) {
     return false;
   }
-  const std::size_t packed_row_step = static_cast<std::size_t>(input.width) * point_step;
-  if (input.row_step != packed_row_step ||
-    static_cast<std::size_t>(input.row_step) * input.height > input.data.size())
-  {
+  // PointCloud2 合法布局允许 row_step >= width*point_step（行尾 padding，驱动/中间件
+  // 常见：例如 16 字节点的组织化云按 32 字节对齐）。旧实现要求严格等于 packed，
+  // 会把这种完全合法的云整帧丢掉；这里只要求数据区足够放下 height 行
+  //（最后一行的 padding 允许缺省，按 packed 长度算）。
+  // 空云（width==0 或 height==0）在布局合法的前提下是有效输入：输出空、返回 true，
+  // 不再当成解析失败报错。
+  const std::size_t width = static_cast<std::size_t>(input.width);
+  const std::size_t height = static_cast<std::size_t>(input.height);
+  const std::size_t packed_row_step = width * point_step;
+  const std::size_t row_step = static_cast<std::size_t>(input.row_step);
+  const std::size_t required_data_size =
+    height == 0 ? 0 : (height - 1) * row_step + packed_row_step;
+  if (row_step < packed_row_step || required_data_size > input.data.size()) {
     return false;
   }
 

@@ -64,6 +64,8 @@ TEST(DecisionTypes, ConvertsTargetNames)
   EXPECT_EQ(decision::targetNameFromString("patrol"), decision::TargetName::Patrol);
   EXPECT_EQ(decision::targetNameFromString("center"), decision::TargetName::Center);
   EXPECT_EQ(decision::targetNameFromString("wait_center"), decision::TargetName::WaitCenter);
+  EXPECT_EQ(decision::targetNameFromString("chase"), decision::TargetName::Chase);
+  EXPECT_EQ(decision::toString(decision::TargetName::Chase), "chase");
   EXPECT_EQ(decision::targetNameFromString("unknown"), decision::TargetName::Unknown);
   EXPECT_EQ(decision::targetNameFromString("not_a_target"), decision::TargetName::Unknown);
 }

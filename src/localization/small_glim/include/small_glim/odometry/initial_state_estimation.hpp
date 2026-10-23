@@ -31,7 +31,8 @@ public:
     void insert_imu(
         double stamp,
         const Eigen::Vector3d& linear_acc,
-        const Eigen::Vector3d& angular_vel
+        const Eigen::Vector3d& angular_vel,
+        const Eigen::Quaterniond& orientation = Eigen::Quaterniond::Identity()
     );
     EstimationFrame::ConstPtr initial_pose();
     void set_init_state(
@@ -53,6 +54,12 @@ private:
     Eigen::Isometry3d init_T_world_imu;
     bool naive_mode;
     bool align_initial_odom_to_imu;
+    // 初始 roll/pitch 来源：accel=1s 加速度平均（旧行为）；imu=直接采用 IMU 姿态。
+    // 机器人启动时若还在下落/晃动，accel 平均会被水平加速度带偏，之后整条 odom
+    // 都沿这个倾斜系积分（走 8m 会"飞"起 0.5m）。IMU 姿态本身是重力对齐的。
+    bool initial_attitude_from_imu;
+    bool has_init_orientation;
+    Eigen::Quaterniond init_orientation;
 
     std::unique_ptr<CloudCovarianceEstimation> covariance_estimation;
     std::shared_ptr<gtsam_points::iVox> target_ivox;

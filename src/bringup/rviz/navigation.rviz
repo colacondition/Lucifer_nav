@@ -217,8 +217,9 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.05000000074505806
-      Style: Boxes
+      Size (m): 0.03
+      Style: Points  
+      Queue Size: 1
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -253,6 +254,7 @@ Visualization Manager:
       Size (Pixels): 3
       Size (m): 0.07999999821186066
       Style: Spheres
+      Queue Size: 1
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -590,7 +592,7 @@ Visualization Manager:
   Global Options:
     Background Color: 48; 48; 48
     Fixed Frame: map
-    Frame Rate: 30
+    Frame Rate: 15
   Name: root
   Tools:
     - Class: rviz_default_plugins/MoveCamera

@@ -150,6 +150,16 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_minco_optimizer ${PROJECT_NAME})
 
+  # 墙钟预算：header-only、无 ROS 依赖，但仍显式加 include 目录，避免测试
+  # 只能靠链接库的 PUBLIC include 传递（这层耦合不该被测试依赖）。
+  ament_add_gtest(test_smoothing_budget
+    test/test_smoothing_budget.cpp
+  )
+  target_include_directories(test_smoothing_budget PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(test_smoothing_budget ${PROJECT_NAME})
+
   ament_add_gtest(test_distance_field_query
     test/test_distance_field_query.cpp
   )
@@ -230,6 +240,9 @@ endif()
 add_executable(sfc_corridor_dump tools/sfc_corridor_dump.cpp)
 target_link_libraries(sfc_corridor_dump ${PROJECT_NAME} Eigen3::Eigen)
 install(TARGETS sfc_corridor_dump DESTINATION lib/${PROJECT_NAME})
+# 性能基准脚本：以可执行程序装到 lib/ 下，`ros2 run navigation2 bench_planning.py`
+# 可直接跑；同时保留 share/ 下的源码副本（render_corridor.py 等离线工具的既有约定）。
+install(PROGRAMS tools/bench_planning.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY tools/ DESTINATION share/${PROJECT_NAME}/tools
   FILES_MATCHING PATTERN "*.py")
 

@@ -42,6 +42,11 @@ InitialStateEstimation::InitialStateEstimation(
     window_size = config->param<double>("odometry_estimation.initialization_window_size");
     align_initial_odom_to_imu = config->param<bool>("odometry_estimation.align_initial_odom_to_imu");
     naive_mode = config->param<bool>("odometry_estimation.naive_initialization");
+    const std::string attitude_source =
+        config->param<std::string>("odometry_estimation.initial_attitude_source");
+    initial_attitude_from_imu = (attitude_source == "imu");
+    has_init_orientation = false;
+    init_orientation.setIdentity();
     ready = false;
     init_stamp = 0.0;
     stamp = 0.0;
@@ -97,8 +102,20 @@ void InitialStateEstimation::insert_frame(const PreprocessedFrame::ConstPtr raw_
     T_odom_lidar.emplace_back(raw_frame->stamp, Eigen::Isometry3d(estimated_T_odom_lidar.matrix()));
 }
 
-void InitialStateEstimation::insert_imu(double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel) {
+void InitialStateEstimation::insert_imu(
+    double stamp, const Eigen::Vector3d& linear_acc, const Eigen::Vector3d& angular_vel,
+    const Eigen::Quaterniond& orientation) {
     imu_integration->insert_imu(stamp, linear_acc, angular_vel);
+
+    if (initial_attitude_from_imu) {
+        // 只接受单位四元数；实时驱动的 orientation_covariance[0] < 0 表示无姿态，
+        // 这里交给节点侧过滤（无效时保持 has_init_orientation=false，回退 accel）。
+        const double norm = orientation.norm();
+        if (std::isfinite(norm) && std::abs(norm - 1.0) < 1e-2) {
+            init_orientation = orientation.normalized();
+            has_init_orientation = true;
+        }
+    }
 
     if (naive_mode && !ready && !force_init) {
         if (init_stamp <= 0.0) {
@@ -137,7 +154,13 @@ EstimationFrame::ConstPtr InitialStateEstimation::initial_pose() {
 
         // estimate initial orientation by gravity leveling using accumulated accel
         Eigen::Isometry3d init_T_world_imu = Eigen::Isometry3d::Identity();
-        init_T_world_imu.linear() = align_vector_to_z_axis(sum_acc);
+        if (initial_attitude_from_imu && has_init_orientation) {
+            // IMU 姿态已经是重力对齐的：直接用它定 roll/pitch，避免 1s 加速度
+            // 平均把启动时的运动/下落当成重力方向。
+            init_T_world_imu.linear() = init_orientation.toRotationMatrix();
+        } else {
+            init_T_world_imu.linear() = align_vector_to_z_axis(sum_acc);
+        }
 
         if (align_initial_odom_to_imu) {
             // rotate around z so that imu x-axis horizontal projection aligns with world x-axis
