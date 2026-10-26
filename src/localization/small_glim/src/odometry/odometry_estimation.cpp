@@ -54,6 +54,9 @@ OdometryEstimationCPUParams::OdometryEstimationCPUParams(const Config::Ptr confi
     isam2_relinearize_skip = config->param<int>("odometry_estimation.isam2_relinearize_skip");
     isam2_relinearize_thresh = config->param<double>("odometry_estimation.isam2_relinearize_thresh");
     num_threads = config->param<int>("odometry_estimation.num_threads");
+    // [perf] 对应距离 = ivox_resolution * mult。原来硬编码 2.0（0.5m 体素 -> 1.0m），
+    // KNN 候选数随该距离立方增长，是 LIO 的第一热点（perf: knn_search 32%）。
+    gicp_max_corr_mult = config->param<double>("odometry_estimation.gicp_max_corr_mult");
 
     // Registration (only GICP is supported; keep the key read for fail-fast config validation)
     const std::string reg_type = config->param<std::string>("odometry_estimation.registration_type");
@@ -119,7 +122,7 @@ gtsam::NonlinearFactorGraph OdometryEstimationCPU::create_factors(const size_t c
             frames[current]->frame,
             target_ivox_copy
         );
-        gicp_factor->set_max_correspondence_distance(params->ivox_resolution * 2.0);
+        gicp_factor->set_max_correspondence_distance(params->ivox_resolution * params->gicp_max_corr_mult);
         gicp_factor->set_num_threads(params->num_threads);
         factors.add(gicp_factor);
     }

@@ -20,11 +20,42 @@ GroundSegmentation::GroundSegmentation(const GroundSegmentationParams & params)
       params.long_threshold, params.max_long_height, params.max_start_height, params.sensor_height))
 {
   if (params.visualize) viewer_.reset(new Viewer());
+
+  // [NUC_infra] 参数映射到算子配置（平方量在旧结构体里，算子用线性量）
+  if (!params_.visualize) {
+    nuc_infra::GroundSegParams np;
+    np.r_min = static_cast<float>(std::sqrt(std::max(0.0, params_.r_min_square)));
+    np.r_max = static_cast<float>(std::sqrt(std::max(0.0, params_.r_max_square)));
+    np.n_bins = params_.n_bins;
+    np.n_segments = params_.n_segments;
+    np.max_dist_to_line = static_cast<float>(params_.max_dist_to_line);
+    np.min_slope = static_cast<float>(params_.min_slope);
+    np.max_slope = static_cast<float>(params_.max_slope);
+    np.max_error = static_cast<float>(params_.max_error_square);
+    np.long_threshold = static_cast<float>(params_.long_threshold);
+    np.max_long_height = static_cast<float>(params_.max_long_height);
+    np.max_start_height = static_cast<float>(params_.max_start_height);
+    np.sensor_height = static_cast<float>(params_.sensor_height);
+    np.line_search_angle = static_cast<float>(params_.line_search_angle);
+    nuc_engine_ = std::make_unique<nuc_infra::GroundSeg>(np);
+  }
 }
 
 void GroundSegmentation::segment(const PointCloud & cloud, std::vector<int> * segmentation)
 {
   // std::cout << "Segmenting cloud with " << cloud.size() << " points...\n";
+  // [NUC_infra] 委托给并行算子；旧实现保留在下面（visualize=true 时才会走到）。
+  if (nuc_engine_) {
+    nuc_labels_.resize(cloud.size());
+    nuc_engine_->segmentStrided(
+      reinterpret_cast<const std::uint8_t *>(cloud.points.data()), cloud.size(),
+      sizeof(pcl::PointXYZ), 0, 4, 8, nuc_labels_.data());
+    segmentation->resize(cloud.size());
+    for (std::size_t i = 0; i < cloud.size(); ++i) {
+      (*segmentation)[i] = nuc_labels_[i];
+    }
+    return;
+  }
   segmentation->clear();
   segmentation->resize(cloud.size(), 0);
   bin_index_.resize(cloud.size());

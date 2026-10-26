@@ -56,6 +56,9 @@ public:
     double target_downsampling_rate; ///< Downsampling rate for points to be inserted into the target
     double ivox_resolution; ///< iVox resolution (for GICP)
     double ivox_min_dist; ///< Minimum distance between points in an iVox cell (for GICP)
+    /// GICP 对应距离 = ivox_resolution * 该系数。KNN 候选数随它立方增长，
+    /// 是 LIO 的第一热点（perf: knn_search 32%）。默认 2.0 沿用旧行为。
+    double gicp_max_corr_mult = 2.0;
 
     // iVox delayed update & impact pause
     double ivox_update_delay; ///< Time delay before inserting frames into target map [sec]

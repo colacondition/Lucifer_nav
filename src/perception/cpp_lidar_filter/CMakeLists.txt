@@ -9,12 +9,14 @@ find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 # 单遍化后只用手写字节遍历 + pcl_common 的类型定义，不再需要 filters/io
 # （旧版拉 pcl_filters/pcl_io/VTK 一堆无用库）。
+find_package(nuc_infra REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common)
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/filter_node.cpp
   src/single_pass_filter.cpp
 )
+target_link_libraries(${PROJECT_NAME} nuc_infra::nuc_infra)
 target_link_libraries(${PROJECT_NAME} ${PCL_LIBRARIES})
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

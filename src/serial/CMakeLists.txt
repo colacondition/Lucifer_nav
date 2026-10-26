@@ -24,6 +24,13 @@ rclcpp_components_register_node(${PROJECT_NAME}
   EXECUTABLE ${PROJECT_NAME}_node
 )
 
+# NUC_infra 的统一串口桥（单进程单串口，上下行各一帧）
+find_package(nuc_serial REQUIRED)
+add_executable(nuc_serial_bridge src/nuc_serial_bridge_node.cpp)
+target_link_libraries(nuc_serial_bridge nuc_serial::nuc_serial)
+ament_target_dependencies(nuc_serial_bridge rclcpp geometry_msgs decision_interfaces)
+install(TARGETS nuc_serial_bridge DESTINATION lib/${PROJECT_NAME})
+
 
 
 if(BUILD_TESTING)

@@ -8,6 +8,10 @@
 #include "ground_segmentation/segment.h"
 #include "ground_segmentation/typedefs.h"
 #include "ground_segmentation/viewer.h"
+// [NUC_infra]
+#include <memory>
+#include <vector>
+#include <nuc_infra/ground_seg.hpp>
 
 // 把 range 映射到径向 bin 索引。返回 -1 表示该点不参与分割（不在 [r_min, r_max)
 // 内，或是 NaN/Inf/参数非法）。返回值保证要么 -1、要么落在 [0, n_bins)。
@@ -105,6 +109,10 @@ class GroundSegmentation {
 
   // 2D coordinates (d, z) of every point in its respective segment.
   std::vector<Bin::MinZPoint> segment_coordinates_;
+
+  // [NUC_infra] 算子化内核（visualize=true 时不启用，保留旧路径）
+  std::unique_ptr<nuc_infra::GroundSeg> nuc_engine_;
+  std::vector<std::uint8_t> nuc_labels_;
 
   // Visualizer.
   std::unique_ptr<Viewer> viewer_;

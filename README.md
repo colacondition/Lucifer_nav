@@ -15,7 +15,7 @@ MPC 控制器、隧道云台请求、云台可视化等）编进同一个 shared
 用 `rclcpp_components` 注册，全部加载进一个固定线程数容器。Humble 下
 `/map`、costmap、云台等 latch 话题是 `transient_local`，不能开 intra-process；
 感知容器里的 volatile 点云才走进程内指针投递。
-线程预算按 8 核写死：LIO 2、定位 GICP 2、导航容器 2、感知 executor 1、剩余 1。
+线程预算按 8 个逻辑 CPU 写死（NUC11PAHi5 是 **4 物理核 / 8 线程**，不是 8 核）：LIO 2、定位 GICP 2、导航容器 2、感知 executor 1、剩余 1。SMT 兄弟核对内存型算子只多 10~30% 吞吐却显著抬高 p95，预算要按物理核算。
 linefit 用 OpenMP 静态分片，不要再自建线程池或每帧 `std::thread` spawn/join。
 
 坐标与电控契约：导航把整车抽象成一个可直接在平面平移的“虚拟云台”；本工程中的
