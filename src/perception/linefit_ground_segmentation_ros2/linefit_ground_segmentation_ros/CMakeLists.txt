@@ -17,10 +17,17 @@ if(NOT DEFINED PCL_DIR AND EXISTS "/usr/lib/x86_64-linux-gnu/cmake/pcl/PCLConfig
 endif()
 find_package(PCL REQUIRED COMPONENTS common)
 
+# linefit_ground_segmentation 的公开头文件里直接 #include <nuc_infra/ground_seg.hpp>，
+# 链接时必须把 nuc_infra 的 include 目录一起带过来；否则清 build 后这个 wrapper
+# 编译不过（b2b8e62 只改了核心库，漏了这里的 find_package）。
+find_package(nuc_infra REQUIRED)
+
 # Build as a composable component (zero-copy in a shared container) while still
 # providing the standalone ground_segmentation_node executable.
 ament_auto_add_library(ground_segmentation_component SHARED src/ground_segmentation_node.cc)
-target_link_libraries(ground_segmentation_component ${PCL_LIBRARIES})
+target_link_libraries(ground_segmentation_component
+  ${PCL_LIBRARIES}
+  nuc_infra::nuc_infra)
 target_include_directories(ground_segmentation_component PUBLIC ${PCL_INCLUDE_DIRS})
 rclcpp_components_register_node(ground_segmentation_component
   PLUGIN "linefit_ground_segmentation::SegmentationNode"

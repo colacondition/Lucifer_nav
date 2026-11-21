@@ -31,9 +31,13 @@ rm_global_planner:
     map_topic: /global_costmap/costmap
     goal_topic: /goal_pose
     path_topic: /plan_raw
-    # 8Hz：实测整机 24 核 busy<8%，A* 单次 <5ms —— 用空闲核把「状态变了到
-    # 路径更新」的等待从最坏 200ms 压到 125ms。失败冷却不受影响。
-    planning_frequency: 8.0
+    # 8Hz 定时器保留为「感知断流兜底」；正常情况下由 /global_costmap/costmap
+    # 的每次发布触发（replan_on_source_update），慢速/静止时也能立刻响应新障碍，
+    # 不再依赖「移动 0.2m 才重规划」或等下一拍定时器。
+    # 实测（12 次注入试验，生产参数）：障碍注入 -> /plan_raw 均值 130ms -> 6.5ms，
+    # p95 271ms -> 21ms；/plan 均值 154ms -> 28ms；CPU 增量在噪声内。
+    # 详见 docs/nav-reaction-latency.md。
+    planning_frequency: 2.0
     allow_unknown: true
     unknown_cost: 1.4
     obstacle_threshold: 100
@@ -48,7 +52,7 @@ rm_global_planner:
     clearance_desired_distance: 0.4
     clearance_cost_weight: 3.0
     replan_on_timer: true
-    replan_on_source_update: false
+    replan_on_source_update: true
     min_replan_distance: 0.20
     replan_request_topic: /navigation2/replan_request
     # 转向惩罚：turn_cost = turn_penalty * (1 - cos(转向角))。越大路径越直（少
@@ -99,6 +103,10 @@ rm_global_costmap:
     marked_cloud_topic: /global_costmap/voxel_marked_cloud
     voxel_grid_topic: /global_costmap/voxel_grid
     publish_frequency: 8.0
+    # 新障碍点云到达即更新并发布一次全局代价图（限速 4*8Hz=32Hz，10Hz 感知可逐帧），
+    # 定时器退化为感知断流兜底。实测障碍进图延迟均值 79ms -> 20ms（含 20ms 采样
+    # 粒度），配合 replan_on_source_update 把整条「障碍 -> /plan」压到 p95 31ms。
+    publish_on_observation: true
     robot_radius: 0.25
     inflation_radius: 0.65
     inflation_cost_scaling_factor: 3.0

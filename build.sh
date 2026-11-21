@@ -122,11 +122,22 @@ python3 "$PWD/src/bringup/tools/check_nav_contract.py" "$PWD" || {
   exit 1
 }
 
+# PCL 的 PCLConfig.cmake 在 Debian/Ubuntu 上位于 /usr/lib/<arch>/cmake/pcl。
+# CMake 的系统前缀包含 "/"，会先命中 /lib/<arch>/cmake/pcl（/lib -> /usr/lib 的
+# 合并 usr 布局），而 PCLConfig 用「配置目录向上 4 级」推 PCL_ROOT，得到 "/"，
+# 随后判定 "PCL can not be found"。只影响清 build 后的全新 configure（缓存里有
+# PCL_DIR 时不会踩到），但换机/清缓存必然复现。显式指定一次即可，路径不存在时
+# 不加参数，不改变其他发行版的行为。
+CMAKE_EXTRA_ARGS=()
+if [ -f /usr/lib/x86_64-linux-gnu/cmake/pcl/PCLConfig.cmake ]; then
+  CMAKE_EXTRA_ARGS+=(-DPCL_DIR=/usr/lib/x86_64-linux-gnu/cmake/pcl)
+fi
+
 # set -e 下失败会直接退出；colcon 的摘要里会标出失败包名。
 nice -n 10 ionice -c3 colcon build --symlink-install \
   --executor sequential \
   --packages-select "${BUILD_LIST[@]}" \
-  --cmake-args -DCMAKE_BUILD_TYPE=Release
+  --cmake-args -DCMAKE_BUILD_TYPE=Release "${CMAKE_EXTRA_ARGS[@]}"
 
 echo ""
 echo "=== 编译完成 ==="

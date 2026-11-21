@@ -48,6 +48,7 @@ target_include_directories(global_search PUBLIC
 )
 target_link_libraries(global_search
   ${PCL_LIBRARIES}
+  Eigen3::Eigen
 )
 
 # Scan Context 重定位：离线建库 + 在线候选召回（只给位置/yaw 初值，

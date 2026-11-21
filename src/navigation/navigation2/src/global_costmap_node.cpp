@@ -84,6 +84,7 @@ public:
         pointcloud_topic_, rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
           latest_pointcloud_ = std::move(msg);
+          publishOnObservation(latest_pointcloud_->header.stamp);
         },
         sub_options);
     }
@@ -92,6 +93,7 @@ public:
         scan_topic_, rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::LaserScan::ConstSharedPtr msg) {
           latest_scan_ = std::move(msg);
+          publishOnObservation(latest_scan_->header.stamp);
         },
         sub_options);
     }
@@ -107,13 +109,22 @@ public:
     voxel_grid_pub_ =
       create_publisher<sensor_msgs::msg::PointCloud2>(voxel_grid_topic_, rclcpp::QoS(1));
 
-    // 周期发布给下游规划器用。
+    // 周期发布给下游规划器用。开启 publish_on_observation 后，新观测会先触发
+    // 一次发布（见 publishOnObservation），定时器退化为「感知断流兜底」：
+    // 距上次发布不足一个发布周期就跳过，避免和观测触发重复发布。
     if (publish_frequency_ > 0.0) {
       const auto period =
         std::chrono::duration<double>(1.0 / std::max(0.1, publish_frequency_));
+      const auto fallback_period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.0 / std::max(0.1, publish_frequency_)));
       timer_ = create_wall_timer(
         std::chrono::duration_cast<std::chrono::nanoseconds>(period),
-        [this]() {
+        [this, fallback_period]() {
+          if (publish_on_observation_ && published_once_ &&
+            std::chrono::steady_clock::now() - last_publish_time_ < fallback_period)
+          {
+            return;
+          }
           publishCostmap();
         },
         cb_group_);
@@ -149,6 +160,15 @@ private:
     subscribe_scan_ = declare_parameter<bool>("subscribe_scan", false);
     scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
     publish_frequency_ = declare_parameter<double>("publish_frequency", 2.0);
+    // 感知触发发布：新观测到达时立刻更新+发布一次代价图，而不是干等下一拍
+    // 定时器（最坏要等一个 publish 周期）。代价是发布频率不再严格等间隔，
+    // 因此单独限速：
+    //   observation_publish_rate <= 0 时按 4 * publish_frequency 限速
+    //   （8 Hz 配置下最多 32 Hz，10 Hz 感知可以逐帧触发）；
+    //   定时器在开启后退化为「感知断流兜底」，距上次发布不足一个发布周期就跳过。
+    // 默认关，保持与历史行为一致；靠 YAML 显式开启。
+    publish_on_observation_ = declare_parameter<bool>("publish_on_observation", false);
+    observation_publish_rate_ = declare_parameter<double>("observation_publish_rate", 0.0);
     robot_radius_ = declare_parameter<double>("robot_radius", 0.25);
     inflation_radius_ = declare_parameter<double>("inflation_radius", 0.7);
     inflation_cost_scaling_factor_ =
@@ -470,11 +490,54 @@ private:
     return inflation_radius_limit_;
   }
 
+  // 感知触发发布：新观测到达时立刻更新+发布一次代价图，把「障碍进图」的
+  // 等待从「等下一拍定时器」（8 Hz 下最坏 125 ms）压到「观测到达即处理」。
+  //
+  // 两条限流规则，缺一不可：
+  //   1) 按观测时间戳去重：同一帧（或更旧的帧）不重复触发，定时器发布的
+  //      老帧也不会把新帧挡掉；
+  //   2) 观测触发单独计时（last_obs_publish_time_），不和定时器发布共用。
+  //      否则定时器刚发完、新观测随后到达时会被「距上次发布太近」误挡，
+  //      要再等 100 ms 的下一帧——实测会让一半试验退化回定时器延迟。
+  // 默认上限 4 * publish_frequency（8 Hz 配置下 32 Hz），10 Hz 感知可逐帧触发；
+  // observation_publish_rate 可显式覆盖。回调与定时器同在一个 MutuallyExclusive
+  // 回调组，不会并发进 publishCostmap。
+  void publishOnObservation(const builtin_interfaces::msg::Time & stamp)
+  {
+    if (!publish_on_observation_ || !latest_map_) {
+      return;
+    }
+    const int64_t obs_ns = rclcpp::Time(stamp).nanoseconds();
+    if (obs_ns <= 0) {
+      return;
+    }
+    if (published_obs_once_ && obs_ns <= last_obs_stamp_ns_) {
+      return;
+    }
+    double rate = observation_publish_rate_;
+    if (rate <= 0.0) {
+      rate = 4.0 * std::max(0.1, publish_frequency_);
+    }
+    const auto min_interval = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(1.0 / std::max(1e-3, rate)));
+    if (published_obs_once_ &&
+      std::chrono::steady_clock::now() - last_obs_publish_time_ < min_interval)
+    {
+      return;
+    }
+    publishCostmap();
+    last_obs_publish_time_ = std::chrono::steady_clock::now();
+    last_obs_stamp_ns_ = obs_ns;
+    published_obs_once_ = true;
+  }
+
   void publishCostmap()
   {
     if (!latest_map_) {
       return;
     }
+    last_publish_time_ = std::chrono::steady_clock::now();
+    published_once_ = true;
 
     const auto now_time = now();
     nav_msgs::msg::OccupancyGrid raw_grid = *latest_map_;
@@ -539,6 +602,13 @@ private:
   bool subscribe_scan_{false};
   std::string scan_topic_;
   double publish_frequency_{2.0};
+  bool publish_on_observation_{false};
+  double observation_publish_rate_{0.0};
+  std::chrono::steady_clock::time_point last_publish_time_{};
+  std::chrono::steady_clock::time_point last_obs_publish_time_{};
+  bool published_once_{false};
+  bool published_obs_once_{false};
+  int64_t last_obs_stamp_ns_{0};
   double robot_radius_{0.25};
   double inflation_radius_{0.7};
   double inflation_cost_scaling_factor_{8.0};
